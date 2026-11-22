@@ -102,19 +102,14 @@ fn source_root(root: &Path) -> PathBuf {
     window_language::spring_source_root(root)
 }
 
-/// The name of a source file, whose extension this neutral crate does not spell.
-fn source_file(name: &str) -> String {
-    format!("{name}.{}{}", "ja", "va")
-}
-
 /// A project with the entity and the repository of the test.
 fn project(name: &str, repository: &str) -> (PathBuf, PathBuf) {
     let root = scratch(name);
     let folder = source_root(&root).join("demo");
     fs::create_dir_all(&folder).unwrap();
-    let owner = folder.join(source_file("Owner"));
+    let owner = folder.join(window_language::source_name("Owner"));
     fs::write(&owner, OWNER).unwrap();
-    let path = folder.join(source_file("OwnerRepository"));
+    let path = folder.join(window_language::source_name("OwnerRepository"));
     fs::write(&path, repository).unwrap();
     (root, path)
 }
@@ -377,7 +372,9 @@ fn a_query_is_completed_with_its_entities_and_the_properties_of_an_alias(cx: &mu
 #[ui_kit::gpui::test]
 fn ctrl_b_on_a_property_of_a_query_opens_the_field_of_the_entity(cx: &mut TestAppContext) {
     let (root, path) = project("spring-data-nav", QUERY);
-    let owner = source_root(&root).join("demo").join(source_file("Owner"));
+    let owner = source_root(&root)
+        .join("demo")
+        .join(window_language::source_name("Owner"));
     let support = window_language::spring_data(&root);
     let window = open_window(cx, root.clone(), support);
     cx.run_until_parked();
@@ -402,7 +399,9 @@ fn ctrl_b_on_a_property_of_a_query_opens_the_field_of_the_entity(cx: &mut TestAp
 #[ui_kit::gpui::test]
 fn ctrl_b_on_an_entity_of_a_query_opens_its_class(cx: &mut TestAppContext) {
     let (root, path) = project("spring-data-nav-entity", QUERY);
-    let owner = source_root(&root).join("demo").join(source_file("Owner"));
+    let owner = source_root(&root)
+        .join("demo")
+        .join(window_language::source_name("Owner"));
     let support = window_language::spring_data(&root);
     let window = open_window(cx, root.clone(), support);
     cx.run_until_parked();
@@ -442,7 +441,7 @@ fn a_repository_that_inherits_a_project_interface_finds_the_properties_of_its_en
     fs::write(
         source_root(&root)
             .join("demo")
-            .join(source_file("BaseRepo")),
+            .join(window_language::source_name("BaseRepo")),
         BASE_REPOSITORY,
     )
     .unwrap();

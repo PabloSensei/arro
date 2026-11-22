@@ -470,6 +470,7 @@ fn safe_delete_of_a_parameter_uses_the_signature(cx: &mut TestAppContext) {
             exceptions: Vec::new(),
         }),
         error: None,
+        ..Default::default()
     });
     let declaration_start = text.find(", int b").unwrap();
     let call_start = text.find("f(1, 2)").unwrap();

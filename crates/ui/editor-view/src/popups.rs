@@ -241,8 +241,10 @@ impl EditorView {
         }
     }
 
-    /// Every popup goes away: the tab leaves the screen or the window loses the focus.
+    /// Every popup goes away: the tab leaves the screen or the window loses the focus. A
+    /// refactoring that waits for the language goes with them.
     pub fn dismiss_popups(&mut self, cx: &mut Context<Self>) {
+        self.leave_refactor(cx);
         self.dismiss_list_popups(cx);
         if self.popup_open(Popup::QuickDoc) {
             self.close_quick_doc(cx);

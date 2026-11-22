@@ -3070,9 +3070,11 @@ impl Render for ShowUsagesPopup {
             .map(|(at, row_at)| {
                 let row = &self.rows[row_at];
                 let selected = at == self.selected;
-                let before = row.text[..row.highlight.start].to_owned();
-                let found = row.text[row.highlight.clone()].to_owned();
-                let after = row.text[row.highlight.end..].to_owned();
+                let style = HighlightStyle {
+                    color: Some(theme.match_text),
+                    background_color: Some(theme.match_bg),
+                    ..HighlightStyle::default()
+                };
                 div()
                     .id(("usages-row", at))
                     .debug_selector(move || format!("usages-row-{at}"))
@@ -3112,15 +3114,11 @@ impl Render for ShowUsagesPopup {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .child(before)
-                            .child(
-                                div()
-                                    .bg(theme.match_bg)
-                                    .text_color(theme.match_text)
-                                    .rounded(px(2.))
-                                    .child(found),
-                            )
-                            .child(after),
+                            .child(highlighted_text(
+                                row.text.clone(),
+                                [row.highlight.clone()],
+                                style,
+                            )),
                     )
             })
             .collect();

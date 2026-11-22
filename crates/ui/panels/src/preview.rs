@@ -83,6 +83,9 @@ pub(crate) struct PreviewTarget {
     pub spot: Option<Spot>,
     /// The line of a match, from one, and its bytes in that line.
     pub found: Option<(usize, Range<usize>)>,
+    /// Every match of the search in the file, as the lines, from one, and the bytes in
+    /// them. `found` is drawn brighter than these.
+    pub matches: Vec<(usize, Range<usize>)>,
 }
 
 impl PreviewTarget {
@@ -92,6 +95,7 @@ impl PreviewTarget {
             path,
             spot: None,
             found: None,
+            matches: Vec::new(),
         }
     }
 
@@ -101,15 +105,23 @@ impl PreviewTarget {
             path,
             spot: Some(spot),
             found: None,
+            matches: Vec::new(),
         }
     }
 
-    /// The row of a search: the line and the bytes of its match in that line.
-    pub(crate) fn found(path: PathBuf, line: usize, found: Range<usize>) -> Self {
+    /// The row of a search: the line and the bytes of its match in that line, with every
+    /// match of the search in the file.
+    pub(crate) fn found(
+        path: PathBuf,
+        line: usize,
+        found: Range<usize>,
+        matches: Vec<(usize, Range<usize>)>,
+    ) -> Self {
         Self {
             path,
             spot: None,
             found: Some((line, found)),
+            matches,
         }
     }
 }
@@ -131,8 +143,10 @@ pub(crate) struct FilePreview {
     path: Option<PathBuf>,
     target: Option<PreviewTarget>,
     text: Option<String>,
-    /// The bytes of the match in `text`, painted over its row.
+    /// The bytes of the match of the selected row in `text`, painted over its row.
     highlight: Option<Range<usize>>,
+    /// The bytes of every match of the search in `text`, painted with the search colour.
+    matches: Vec<Range<usize>>,
     state: State,
     /// The serial of the read in flight, so that a late one is dropped.
     serial: u64,
@@ -146,6 +160,7 @@ impl Default for FilePreview {
             target: None,
             text: None,
             highlight: None,
+            matches: Vec::new(),
             state: State::Empty,
             serial: 0,
         }
@@ -167,6 +182,7 @@ impl FilePreview {
             self.target = None;
             self.text = None;
             self.highlight = None;
+            self.matches.clear();
             self.state = State::Empty;
             cx.notify();
             return;
@@ -186,6 +202,7 @@ impl FilePreview {
         self.path = Some(target.path.clone());
         self.text = None;
         self.highlight = None;
+        self.matches.clear();
         self.target = Some(target.clone());
         self.state = State::Reading;
         // An open tab has the text the user sees, which may be newer than the disk.
@@ -215,6 +232,19 @@ impl FilePreview {
         let text = self.text.as_deref()?;
         let range = self.highlight.as_ref()?;
         Some(text.get(range.clone())?.to_owned())
+    }
+
+    /// The text of every match of the search the preview paints, in the order of the text,
+    /// for a test.
+    #[cfg(test)]
+    pub(crate) fn match_highlight_texts(&self) -> Vec<String> {
+        let Some(text) = self.text.as_deref() else {
+            return Vec::new();
+        };
+        self.matches
+            .iter()
+            .filter_map(|range| text.get(range.clone()).map(str::to_owned))
+            .collect()
     }
 
     /// Whether the text of the target is on screen.
@@ -275,17 +305,21 @@ impl FilePreview {
         cx.notify();
     }
 
-    /// Scrolls the view to the place of `target` and works out the match to paint.
+    /// Scrolls the view to the place of `target` and works out the matches to paint.
     fn place(&mut self, target: &PreviewTarget, cx: &mut Context<Self>) {
         let (Some(text), Some(editor)) = (&self.text, &self.editor) else {
             return;
         };
-        let highlight = target.found.as_ref().and_then(|(line, range)| {
-            let start = line_start(text, *line)?;
-            let start = start + range.start;
-            let end = start + range.len();
-            (end <= text.len()).then_some(start..end)
-        });
+        let matches: Vec<Range<usize>> = target
+            .matches
+            .iter()
+            .filter_map(|(line, range)| range_in_text(text, *line, range))
+            .collect();
+        let highlight = target
+            .found
+            .as_ref()
+            .and_then(|(line, range)| range_in_text(text, *line, range));
+        self.matches = matches;
         self.highlight = highlight.clone();
         let spot = match (highlight, &target.spot) {
             (Some(found), _) => Spot::Offset(found.start),
@@ -316,8 +350,19 @@ impl Render for FilePreview {
                 .into_any_element();
         };
         let mut decor = PaneDecor::default();
+        let style = EditorStyle::from_theme(&theme);
+        decor.ranges.extend(
+            self.matches
+                .iter()
+                .filter(|range| {
+                    !self
+                        .highlight
+                        .as_ref()
+                        .is_some_and(|current| current == *range)
+                })
+                .map(|range| (range.clone(), style.find_match)),
+        );
         if let Some(range) = &self.highlight {
-            let style = EditorStyle::from_theme(&theme);
             decor.ranges.push((range.clone(), style.find_current));
         }
         let pane = editor.update(cx, |editor, cx| editor.pane(decor, None, window, cx));
@@ -363,6 +408,15 @@ fn cut(mut text: String) -> String {
         text.truncate(end);
     }
     text
+}
+
+/// The bytes of `range` in the line `line` of `text`, counted from one, or `None` when
+/// the text ends before the match, as a big file cut in the preview does.
+fn range_in_text(text: &str, line: usize, range: &Range<usize>) -> Option<Range<usize>> {
+    let start = line_start(text, line)?.checked_add(range.start)?;
+    let end = start.checked_add(range.len())?;
+    (end <= text.len() && text.is_char_boundary(start) && text.is_char_boundary(end))
+        .then_some(start..end)
 }
 
 /// The byte offset of the line `line`, counted from one.

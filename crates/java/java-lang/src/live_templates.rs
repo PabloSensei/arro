@@ -17,7 +17,10 @@ const DECLARATION: &[&str] = &["declaration"];
 const VALUE: &[&str] = &["statement", "expression"];
 
 /// `statement` inside method bodies, `declaration` in class bodies, `expression` inside
-/// arguments and parentheses.
+/// arguments, parentheses and the expressions of a statement. The innermost node around
+/// the caret wins, so a call chain or an operand inside a block is an expression: a
+/// statement cannot go into the middle of an expression. A block inside a lambda or an
+/// anonymous class is smaller than the expression around it, so it stays a statement.
 const CONTEXTS: &str = r#"
 (class_body) @declaration
 (interface_body) @declaration
@@ -28,6 +31,20 @@ const CONTEXTS: &str = r#"
 (switch_block_statement_group) @statement
 (argument_list) @expression
 (parenthesized_expression) @expression
+(method_invocation) @expression
+(field_access) @expression
+(array_access) @expression
+(object_creation_expression) @expression
+(binary_expression) @expression
+(assignment_expression) @expression
+(ternary_expression) @expression
+(cast_expression) @expression
+(unary_expression) @expression
+(update_expression) @expression
+(instanceof_expression) @expression
+(lambda_expression) @expression
+(method_reference) @expression
+(string_literal) @expression
 "#;
 
 const fn abbreviation(
@@ -1075,6 +1092,19 @@ mod tests {
         assert_eq!(context(source, "sout"), "statement");
         assert_eq!(context(source, "g(St"), "expression");
         assert_eq!(context("psvm", "psvm"), "other");
+    }
+
+    #[test]
+    fn the_caret_inside_a_call_chain_is_an_expression_not_a_statement() {
+        let source = "class A {\n    void f(Owner owner) {\n        String lastName = owner.getLastName();\n    }\n}\n";
+        assert_eq!(context(source, "owner.getLa"), "expression");
+        assert_eq!(context(source, "getLastName"), "expression");
+        assert_eq!(context(source, "getLastName();"), "statement");
+        assert!(
+            language()
+                .find(Kind::Abbreviation, "sout", "expression")
+                .is_none()
+        );
     }
 
     #[test]

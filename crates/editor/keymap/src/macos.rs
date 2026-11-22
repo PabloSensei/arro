@@ -163,6 +163,7 @@ pub const OVERRIDES: &[(&str, &[&str])] = &[
     ("PreviousOccurence", &["ctrl-alt-up"]),
     ("QuickImplementations", &["ctrl-shift-i"]),
     ("QuickJavaDoc", &["f1"]),
+    ("RecentChanges", &["alt-shift-c"]),
     ("RecentFiles", &["cmd-e"]),
     ("RecentLocations", &["cmd-shift-e"]),
     ("Refactorings.QuickListPopupAction", &["ctrl-alt-shift-t"]),

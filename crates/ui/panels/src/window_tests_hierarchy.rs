@@ -36,6 +36,8 @@ use crate::{AgentOptions, LanguageServer, connect, install};
 
 const SOURCE: SourceId = SourceId::new("fake-hierarchy");
 
+const OWNER_PACKAGE: &str = "org.springframework.samples.petclinic.owner";
+
 unsafe extern "C" fn no_grammar() -> *const () {
     std::ptr::null()
 }
@@ -658,19 +660,9 @@ fn structure_shows_the_signatures_the_server_sends(cx: &mut TestAppContext) {
 // The ignored tests below run on the real server and a copy of PetClinic:
 // `cargo test -p panels window_tests_hierarchy -- --ignored --test-threads=1`.
 
-/// The source folder of the copied project, without spelling its language in this
-/// neutral crate.
-fn source_root(root: &Path) -> PathBuf {
-    root.join(format!("src/main/{}{}", "ja", "va"))
-}
-
-fn source_file(name: &str) -> String {
-    format!("{name}.{}{}", "ja", "va")
-}
-
 fn real_project_ready(
     cx: &mut TestAppContext,
-    files: &[(&str, &str)],
+    files: &[(PathBuf, &str)],
 ) -> (
     PathBuf,
     window_language::RealLanguage,
@@ -710,25 +702,10 @@ fn implement_methods_adds_a_method_to_a_class_that_implements_an_interface(
 ) {
     let source = "package org.springframework.samples.petclinic.owner;\n\npublic class Circle implements Shape {\n}\n";
     let interface = "package org.springframework.samples.petclinic.owner;\n\npublic interface Shape {\n\tdouble area();\n}\n";
-    let circle = format!(
-        "src/main/{}{}/org/springframework/samples/petclinic/owner/{}",
-        "ja",
-        "va",
-        source_file("Circle")
-    );
-    let shape = format!(
-        "src/main/{}{}/org/springframework/samples/petclinic/owner/{}",
-        "ja",
-        "va",
-        source_file("Shape")
-    );
-    let (root, language, window) = real_project_ready(
-        cx,
-        &[(circle.as_str(), source), (shape.as_str(), interface)],
-    );
-    let path = source_root(&root)
-        .join("org/springframework/samples/petclinic/owner")
-        .join(source_file("Circle"));
+    let circle = window_language::main_source(OWNER_PACKAGE, "Circle");
+    let shape = window_language::main_source(OWNER_PACKAGE, "Shape");
+    let (root, language, window) = real_project_ready(cx, &[(circle, source), (shape, interface)]);
+    let path = window_language::main_class(&root, OWNER_PACKAGE, "Circle");
     open_path(cx, window, &path);
     let view = editor_of(cx, window, &path);
     view.update(cx, |view, cx| view.restore_caret(2, 13, cx));
@@ -748,9 +725,7 @@ fn implement_methods_adds_a_method_to_a_class_that_implements_an_interface(
 #[ignore = "needs IDE_CORPUS and a filled package cache"]
 fn incoming_calls_of_a_petclinic_method(cx: &mut TestAppContext) {
     let (root, language, window) = real_project_ready(cx, &[]);
-    let path = source_root(&root)
-        .join("org/springframework/samples/petclinic/owner")
-        .join(source_file("OwnerController"));
+    let path = window_language::main_class(&root, OWNER_PACKAGE, "OwnerController");
     open_path(cx, window, &path);
     let view = editor_of(cx, window, &path);
     let text = buffer_of(cx, &view);
@@ -774,9 +749,7 @@ fn incoming_calls_of_a_petclinic_method(cx: &mut TestAppContext) {
 #[ignore = "needs IDE_CORPUS and a filled package cache"]
 fn type_declaration_of_a_variable(cx: &mut TestAppContext) {
     let (root, language, window) = real_project_ready(cx, &[]);
-    let path = source_root(&root)
-        .join("org/springframework/samples/petclinic/owner")
-        .join(source_file("OwnerController"));
+    let path = window_language::main_class(&root, OWNER_PACKAGE, "OwnerController");
     open_path(cx, window, &path);
     let view = editor_of(cx, window, &path);
     let text = buffer_of(cx, &view);
@@ -786,8 +759,9 @@ fn type_declaration_of_a_variable(cx: &mut TestAppContext) {
         .expect("the field is in the file");
     view.update(cx, |view, cx| view.restore_caret(line, 24, cx));
     press(cx, window, "ctrl-shift-b");
+    let expected = window_language::main_class(&root, OWNER_PACKAGE, "OwnerRepository");
     real_wait(cx, "the type of the variable", |cx| {
-        active_path(cx, window).is_some_and(|path| path.ends_with(source_file("OwnerRepository")))
+        active_path(cx, window).is_some_and(|path| path == expected)
     });
     crate::window_tests_real::close(cx, window, language, true);
 }
@@ -796,9 +770,7 @@ fn type_declaration_of_a_variable(cx: &mut TestAppContext) {
 #[ignore = "needs IDE_CORPUS and a filled package cache"]
 fn the_structure_shows_the_signature_of_a_method(cx: &mut TestAppContext) {
     let (root, language, window) = real_project_ready(cx, &[]);
-    let path = source_root(&root)
-        .join("org/springframework/samples/petclinic/owner")
-        .join(source_file("OwnerController"));
+    let path = window_language::main_class(&root, OWNER_PACKAGE, "OwnerController");
     open_path(cx, window, &path);
     draw(cx, window);
     let panel = cx.update(|cx| cx.global::<ActiveStructure>().0.clone());

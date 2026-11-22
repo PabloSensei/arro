@@ -27,6 +27,8 @@ const SHOWN: usize = 12;
 const SURROUND_SHOWN: usize = 16;
 /// The keys the standard Surround With entries answer to, in the order of the list.
 const SURROUND_KEYS: &[&str] = &["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "A"];
+/// The note at the caret when no live template fits the place Ctrl+J is pressed at.
+const NO_APPLICABLE_TEMPLATES: &str = "No applicable live templates";
 
 /// The list Ctrl+J or Ctrl+Alt+T opened, or the expressions a postfix template can
 /// follow when its type is not enough to choose one.
@@ -42,17 +44,50 @@ pub struct TemplateList {
     pub template: Option<Template>,
     /// The items go in at the caret and leave the word around it alone.
     pub at_caret: bool,
+    /// The letters typed into the list, which keep the abbreviations and the descriptions
+    /// they match. Only an abbreviation list takes them.
+    pub filter: String,
+}
+
+/// Whether the abbreviation of `template` contains the typed letters.
+fn key_matches(template: &Template, typed: &str) -> bool {
+    template.key.to_lowercase().contains(typed)
+}
+
+/// Whether a word of the description of `template` starts with the typed letters.
+fn word_matches(template: &Template, typed: &str) -> bool {
+    template
+        .description
+        .split(|character: char| !character.is_alphanumeric())
+        .any(|word| word.to_lowercase().starts_with(typed))
 }
 
 impl TemplateList {
-    /// How many items the list shows.
-    fn shown(&self) -> usize {
+    /// The items the list shows, as indexes into `items`, in the order it shows them. An
+    /// abbreviation list keeps what the filter matches: first the abbreviations that
+    /// contain the typed letters, then the templates with a description word that starts
+    /// with them.
+    fn rows(&self) -> Vec<usize> {
         let cap = if self.kind == Kind::Surround {
             SURROUND_SHOWN
         } else {
             SHOWN
         };
-        self.items.len().min(cap)
+        let typed = self.filter.to_lowercase();
+        let items = self.items.iter().enumerate();
+        if self.kind != Kind::Abbreviation || typed.is_empty() {
+            return items.map(|(index, _)| index).take(cap).collect();
+        }
+        let by_key = items
+            .clone()
+            .filter(|(_, template)| key_matches(template, &typed))
+            .map(|(index, _)| index);
+        let by_word = items
+            .filter(|(_, template)| {
+                !key_matches(template, &typed) && word_matches(template, &typed)
+            })
+            .map(|(index, _)| index);
+        by_key.chain(by_word).take(cap).collect()
     }
 }
 
@@ -77,6 +112,8 @@ pub struct LiveTemplates {
     started: bool,
     /// The name of the open file, for the variables of a template.
     file_name: String,
+    /// Ctrl+J found no template that fits the place; the view says so at the caret.
+    no_applicable: bool,
 }
 
 /// The text of the caret's line up to the caret, and where that line starts.
@@ -104,6 +141,15 @@ fn lone_caret(state: &EditorState) -> Option<usize> {
     let selections = state.selections();
     let primary = selections.primary();
     (selections.len() == 1 && primary.is_empty()).then_some(primary.head)
+}
+
+/// A letter or a digit that an abbreviation list takes into its filter. A digit typed with
+/// Shift is a symbol and stays out of it.
+fn is_filter_key(stroke: &Keystroke) -> bool {
+    match stroke.key.as_bytes() {
+        [byte] => byte.is_ascii_alphabetic() || (byte.is_ascii_digit() && !stroke.shift),
+        _ => false,
+    }
 }
 
 fn context(
@@ -143,6 +189,7 @@ impl LiveTemplates {
             list: None,
             started: false,
             file_name: String::new(),
+            no_applicable: false,
         }
     }
 
@@ -376,10 +423,12 @@ impl LiveTemplates {
                 // A word that matches no abbreviation is not a prefix: the list then
                 // offers every template of the place and inserts one at the caret.
                 if matching.is_empty() {
-                    let items = self
+                    let items: Vec<Template> = self
                         .fitting(Kind::Abbreviation, place)
                         .map(|entry| entry.template)
                         .collect();
+                    // No template fits the place: no list, and the caret says why.
+                    self.no_applicable = items.is_empty();
                     self.open_list(Kind::Abbreviation, items, true);
                 } else {
                     self.open(Kind::Abbreviation, matching);
@@ -542,6 +591,7 @@ impl LiveTemplates {
             expressions: Vec::new(),
             template: None,
             at_caret,
+            filter: String::new(),
         });
     }
 
@@ -554,6 +604,7 @@ impl LiveTemplates {
             expressions,
             template: Some(template),
             at_caret: false,
+            filter: String::new(),
         });
     }
 
@@ -692,12 +743,17 @@ impl LiveTemplates {
                 }
                 return KeyUse::Used(None);
             }
-            let count = list.shown();
+            let rows = list.rows();
+            let count = rows.len();
             match stroke.key.as_str() {
-                "up" if plain => list.chosen = (list.chosen + count - 1) % count,
-                "down" if plain => list.chosen = (list.chosen + 1) % count,
+                "up" if plain && count > 0 => list.chosen = (list.chosen + count - 1) % count,
+                "down" if plain && count > 0 => list.chosen = (list.chosen + 1) % count,
+                // A filter that matches no row leaves nothing for Enter to take.
                 "enter" | "tab" if plain && !stroke.shift => {
-                    let template = list.items[list.chosen];
+                    let Some(&item) = rows.get(list.chosen) else {
+                        return KeyUse::Used(None);
+                    };
+                    let template = list.items[item];
                     let at_caret = list.at_caret;
                     self.list = None;
                     let change = if at_caret {
@@ -708,6 +764,16 @@ impl LiveTemplates {
                     return KeyUse::Used(change);
                 }
                 "escape" => self.list = None,
+                // A keystroke without a key name, or a modifier key on its own, leaves the
+                // list and its filter as they are. It must not reach the Surround arm below,
+                // where an empty name would match a multi-letter key.
+                "" | "shift" | "control" | "alt" | "platform" | "function" => {
+                    return KeyUse::Unused;
+                }
+                "backspace" if plain && !list.filter.is_empty() => {
+                    list.filter.pop();
+                    list.chosen = 0;
+                }
                 _ if plain && list.kind == Kind::Surround => {
                     let typed = stroke.key.to_lowercase();
                     let chosen = list.keys.iter().position(|key| {
@@ -721,6 +787,10 @@ impl LiveTemplates {
                     let template = list.items[chosen];
                     self.list = None;
                     return KeyUse::Used(self.apply_app(state, &template, cx));
+                }
+                _ if plain && list.kind == Kind::Abbreviation && is_filter_key(stroke) => {
+                    list.filter.push_str(&stroke.key);
+                    list.chosen = 0;
                 }
                 _ => {
                     self.list = None;
@@ -895,6 +965,21 @@ impl EditorView {
         Some(change)
     }
 
+    /// The note at the caret when Ctrl+J found no template that fits the place.
+    pub(crate) fn template_note(&mut self, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.live.no_applicable) {
+            return;
+        }
+        let Some(at) = self
+            .state
+            .as_ref()
+            .map(|state| state.selections().primary().head)
+        else {
+            return;
+        };
+        self.show_transient_note(at, NO_APPLICABLE_TEMPLATES, cx);
+    }
+
     /// `true` when the key went to the list or the fields.
     pub(crate) fn template_key(&mut self, stroke: &Keystroke, cx: &mut Context<Self>) -> bool {
         self.catch_up(cx);
@@ -971,22 +1056,28 @@ impl EditorView {
         let mut shown = ui_kit::surface(&theme)
             .debug_selector(|| "template-popup".to_owned())
             .min_w(px(280.))
+            // The description of an abbreviation is cut at the end of the list, so the list
+            // has a width of its own.
+            .when(list.kind == Kind::Abbreviation, |popup| {
+                popup.max_w(px(420.))
+            })
             .py(px(4.));
         if list.expressions.is_empty() {
-            for (index, template) in list.items.iter().take(list.shown()).enumerate() {
-                let chosen = *template;
+            for (row_index, item) in list.rows().into_iter().enumerate() {
+                let template = list.items[item];
+                let chosen = template;
                 let at_caret = list.at_caret;
-                let key = list.keys.get(index).cloned().unwrap_or_default();
+                let key = list.keys.get(item).cloned().unwrap_or_default();
                 let name = template.key;
                 let mut row = div()
-                    .id(("template", index))
+                    .id(("template", row_index))
                     .debug_selector(move || format!("template-item-{name}"))
                     .flex()
                     .items_center()
                     .gap(px(12.))
                     .px(px(10.))
                     .py(px(3.))
-                    .when(index == list.chosen, |row| row.bg(theme.selection))
+                    .when(row_index == list.chosen, |row| row.bg(theme.selection))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
@@ -1001,17 +1092,37 @@ impl EditorView {
                             this.changed(change, cx);
                         }),
                     );
-                if !key.is_empty() {
-                    row = row.child(div().text_color(theme.text_secondary).child(key));
-                }
-                row = row.child(
-                    div()
-                        .flex_1()
-                        .text_color(theme.text)
-                        .child(template.description),
-                );
-                if list.kind != Kind::Surround {
-                    row = row.child(div().text_color(theme.text_secondary).child(template.key));
+                if list.kind == Kind::Abbreviation {
+                    // The abbreviation comes first, in the text colour; the description
+                    // follows in gray and is cut with an ellipsis, as the right part of a
+                    // completion row is.
+                    row = row
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(theme.text)
+                                .debug_selector(move || format!("template-key-{name}"))
+                                .child(name),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(theme.text_muted)
+                                .debug_selector(move || format!("template-description-{name}"))
+                                .child(template.description),
+                        );
+                } else {
+                    if !key.is_empty() {
+                        row = row.child(div().text_color(theme.text_secondary).child(key));
+                    }
+                    row = row.child(
+                        div()
+                            .flex_1()
+                            .text_color(theme.text)
+                            .child(template.description),
+                    );
                 }
                 shown = shown.child(row);
             }

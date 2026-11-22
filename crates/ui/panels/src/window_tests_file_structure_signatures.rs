@@ -37,12 +37,6 @@ public class Owner {
 }
 "#;
 
-/// The file of the class, `Owner` with the extension of the language. The extension is put
-/// together here, as the other window tests do, so that this neutral crate does not spell it.
-fn owner_file() -> String {
-    format!("Owner.{}{}", "ja", "va")
-}
-
 /// A window on the file of the class, with the declarations read by the language of the
 /// application: the signatures and the visibility come from the tree of the file.
 pub(crate) fn owner_window(
@@ -50,7 +44,7 @@ pub(crate) fn owner_window(
     name: &str,
 ) -> (PathBuf, WindowHandle<Workspace>) {
     let root = scratch(name);
-    let source = root.join("src").join(owner_file());
+    let source = root.join("src").join(window_language::source_name("Owner"));
     fs::create_dir_all(source.parent().unwrap()).unwrap();
     fs::write(&source, OWNER).unwrap();
     let window = open_window(cx, root);

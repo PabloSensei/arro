@@ -75,7 +75,7 @@ fn uri_of(path: &Path) -> String {
 pub(crate) struct FakeLanguage {
     syntax: NoSyntax,
     documents: Mutex<HashMap<String, Arc<str>>>,
-    info: Mutex<ChangeSignatureInfo>,
+    pub(crate) info: Mutex<ChangeSignatureInfo>,
     outcome_error: Mutex<Option<String>>,
     requests: Mutex<Vec<ChangeSignatureRequest>>,
     closed: Mutex<Option<PathBuf>>,
@@ -110,6 +110,7 @@ impl FakeLanguage {
             info: Mutex::new(ChangeSignatureInfo {
                 signature: Some(signature),
                 error: None,
+                ..Default::default()
             }),
             outcome_error: Mutex::new(None),
             requests: Mutex::new(Vec::new()),
@@ -126,6 +127,7 @@ impl FakeLanguage {
         *self.info.lock().unwrap() = ChangeSignatureInfo {
             signature: None,
             error: Some(text.to_owned()),
+            ..Default::default()
         };
     }
 
@@ -137,7 +139,7 @@ impl FakeLanguage {
         *self.closed.lock().unwrap() = Some(path);
     }
 
-    fn requests(&self) -> Vec<ChangeSignatureRequest> {
+    pub(crate) fn requests(&self) -> Vec<ChangeSignatureRequest> {
         self.requests.lock().unwrap().clone()
     }
 
@@ -399,13 +401,17 @@ fn open_window_with(
     })
 }
 
-fn shown(cx: &mut TestAppContext, window: WindowHandle<Workspace>, selector: &'static str) -> bool {
+pub(crate) fn shown(
+    cx: &mut TestAppContext,
+    window: WindowHandle<Workspace>,
+    selector: &'static str,
+) -> bool {
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.debug_bounds(selector).is_some()
 }
 
 /// The signature the form previews, read from the dialog itself.
-fn preview_of(cx: &mut TestAppContext, window: WindowHandle<Workspace>) -> String {
+pub(crate) fn preview_of(cx: &mut TestAppContext, window: WindowHandle<Workspace>) -> String {
     let view = window
         .read_with(cx, |workspace, _| workspace.overlay_view())
         .unwrap()
@@ -553,6 +559,7 @@ fn escape_and_server_errors_leave_the_file_alone(cx: &mut TestAppContext) {
     *language.info.lock().unwrap() = ChangeSignatureInfo {
         signature: Some(signature),
         error: None,
+        ..Default::default()
     };
     language.set_outcome_error("Refactoring failed");
     press(cx, window, "ctrl-f6");

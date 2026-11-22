@@ -5,8 +5,8 @@ use std::ops::Range;
 
 use futures_util::StreamExt;
 use lang_api::{
-    ChangeSignatureInfo, ChangeSignatureRequest, Confidence, DocumentSpot, MethodSignature,
-    SignatureException, SignatureParameter, WorkspaceChange, ask,
+    ChangeSignatureInfo, ChangeSignatureRequest, Confidence, DocumentSpot, GraphVisibility,
+    MethodSignature, SignatureException, SignatureParameter, WorkspaceChange, ask,
 };
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
@@ -77,11 +77,34 @@ impl Visibility {
         }
     }
 
-    fn index(self) -> usize {
-        Self::ALL
+    /// The place of the value in `options`, the first place when the value is not there.
+    fn position_in(self, options: &[Self]) -> usize {
+        options.iter().position(|value| *value == self).unwrap_or(0)
+    }
+
+    /// The values the list offers for a declaration: all of them when the language gives no
+    /// list, else the allowed ones in the order of [`Self::ALL`].
+    fn options(allowed: &[GraphVisibility]) -> Vec<Self> {
+        if allowed.is_empty() {
+            return Self::ALL.to_vec();
+        }
+        let allowed: Vec<Self> = allowed
             .iter()
-            .position(|value| *value == self)
-            .unwrap_or(0)
+            .map(|level| Self::from_level(*level))
+            .collect();
+        Self::ALL
+            .into_iter()
+            .filter(|value| allowed.contains(value))
+            .collect()
+    }
+
+    fn from_level(level: GraphVisibility) -> Self {
+        match level {
+            GraphVisibility::Public => Self::Public,
+            GraphVisibility::Protected => Self::Protected,
+            GraphVisibility::Package => Self::Package,
+            GraphVisibility::Private => Self::Private,
+        }
     }
 }
 
@@ -119,6 +142,10 @@ pub struct ChangeSignatureDialog {
     spot: DocumentSpot,
     name: TextField,
     visibility: Visibility,
+    /// The values the visibility list offers: all of them unless the language allows fewer.
+    visibility_options: Vec<Visibility>,
+    /// The modifier the signature takes: the word of the server until a value is chosen.
+    visibility_word: String,
     visibility_open: bool,
     visibility_marked: usize,
     return_type: TextField,
@@ -148,6 +175,8 @@ impl ChangeSignatureDialog {
             spot,
             name: TextField::default(),
             visibility: Visibility::Public,
+            visibility_options: Visibility::ALL.to_vec(),
+            visibility_word: Visibility::Public.modifier().to_owned(),
             visibility_open: false,
             visibility_marked: 0,
             return_type: TextField::default(),
@@ -203,15 +232,24 @@ impl ChangeSignatureDialog {
         confidence: Confidence,
         cx: &mut Context<Self>,
     ) {
+        self.visibility_options = Visibility::options(&info.allowed_visibility);
         if let Some(error) = info.error {
             self.error = Some(error);
         } else if confidence == Confidence::Unknown {
             self.error = Some(NO_ANSWER.to_owned());
         } else if let Some(signature) = info.signature {
             self.name.text = signature.name;
-            self.visibility = Visibility::from_modifier(&signature.visibility);
+            // The list shows a value the place allows. The word of the server goes back
+            // unchanged until a value is chosen, so a modifier the place leaves out stays out.
+            let current = Visibility::from_modifier(&signature.visibility);
+            self.visibility = if self.visibility_options.contains(&current) {
+                current
+            } else {
+                self.visibility_options.first().copied().unwrap_or(current)
+            };
+            self.visibility_word = signature.visibility.trim().to_owned();
             self.visibility_open = false;
-            self.visibility_marked = self.visibility.index();
+            self.visibility_marked = self.visibility.position_in(&self.visibility_options);
             self.return_type.text = signature.return_type;
             self.parameters = signature
                 .parameters
@@ -248,7 +286,7 @@ impl ChangeSignatureDialog {
         }
         Ok(MethodSignature {
             name: name.to_owned(),
-            visibility: self.visibility.modifier().to_owned(),
+            visibility: self.visibility_word.clone(),
             return_type: self.return_type.text.trim().to_owned(),
             parameters,
             exceptions: self.exceptions.clone(),
@@ -261,8 +299,8 @@ impl ChangeSignatureDialog {
     /// constructor.
     fn signature_text(&self) -> String {
         let mut head = Vec::new();
-        if !self.visibility.modifier().is_empty() {
-            head.push(self.visibility.modifier().to_owned());
+        if !self.visibility_word.is_empty() {
+            head.push(self.visibility_word.clone());
         }
         let return_type = self.return_type.text.trim();
         if !return_type.is_empty() {
@@ -474,26 +512,30 @@ impl ChangeSignatureDialog {
     }
 
     fn open_visibility(&mut self, cx: &mut Context<Self>) {
-        self.visibility_open = true;
-        self.visibility_marked = self.visibility.index();
+        // A place that allows one value has no list to open.
+        if self.visibility_options.len() > 1 {
+            self.visibility_open = true;
+            self.visibility_marked = self.visibility.position_in(&self.visibility_options);
+        }
         self.active = Field::Visibility;
         cx.notify();
     }
 
     fn mark_visibility(&mut self, step: isize, cx: &mut Context<Self>) {
-        let last = Visibility::ALL.len() - 1;
+        let last = self.visibility_options.len().saturating_sub(1);
         self.visibility_marked =
             (self.visibility_marked as isize + step).clamp(0, last as isize) as usize;
         cx.notify();
     }
 
     fn choose_visibility(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(value) = Visibility::ALL.get(index).copied() else {
+        let Some(value) = self.visibility_options.get(index).copied() else {
             return;
         };
         self.visibility = value;
+        self.visibility_word = value.modifier().to_owned();
         self.visibility_open = false;
-        self.visibility_marked = self.visibility.index();
+        self.visibility_marked = self.visibility.position_in(&self.visibility_options);
         self.status = None;
         self.error = None;
         cx.notify();
@@ -954,15 +996,19 @@ impl Render for ChangeSignatureDialog {
             window.focus(&this.focus, cx);
             cx.notify();
         }));
-        let visibility_field = select_field(
+        let mut visibility_field = select_field(
             "change-signature-visibility",
             self.visibility.label(),
             self.visibility_open,
             &theme,
         )
         .debug_selector(|| "change-signature-visibility".to_owned())
-        .flex_1()
-        .on_click(cx.listener(|this, _, window, cx| {
+        .flex_1();
+        // One value allowed: the field shows it muted, and its list does not open.
+        if self.visibility_options.len() < 2 {
+            visibility_field = visibility_field.text_color(theme.text_muted);
+        }
+        let visibility_field = visibility_field.on_click(cx.listener(|this, _, window, cx| {
             if this.visibility_open {
                 this.visibility_open = false;
             } else {
@@ -974,7 +1020,7 @@ impl Render for ChangeSignatureDialog {
         let visibility_menu = self.visibility_open.then(|| {
             let mut menu = select_menu(&theme)
                 .debug_selector(|| "change-signature-visibility-menu".to_owned());
-            for (index, value) in Visibility::ALL.into_iter().enumerate() {
+            for (index, value) in self.visibility_options.iter().copied().enumerate() {
                 let selector = format!("change-signature-visibility-option-{}", value.label());
                 menu = menu.child(
                     select_option(

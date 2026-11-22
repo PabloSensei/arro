@@ -53,6 +53,8 @@ pub struct MenuCallbacks {
 #[derive(Clone)]
 pub struct MenuEntry {
     pub label: SharedString,
+    /// The muted text after the label, such as the folder of a test file.
+    pub detail: Option<SharedString>,
     pub shortcut: Option<SharedString>,
     /// The key of the row as the keymap writes it, `ctrl-shift-n`. The menu of the screen
     /// of macOS shows a key only for an action of the keymap, so it needs the key itself
@@ -78,6 +80,7 @@ impl MenuEntry {
     ) -> Self {
         Self {
             label: label.into(),
+            detail: None,
             shortcut: None,
             keys: None,
             icon: None,
@@ -101,6 +104,12 @@ impl MenuEntry {
 
     pub fn shortcut(mut self, shortcut: impl Into<SharedString>) -> Self {
         self.shortcut = Some(shortcut.into());
+        self
+    }
+
+    /// Muted text after the label, such as the folder the row names.
+    pub fn detail(mut self, detail: impl Into<SharedString>) -> Self {
+        self.detail = Some(detail.into());
         self
     }
 
@@ -147,6 +156,7 @@ impl MenuEntry {
     pub fn separator() -> Self {
         Self {
             label: SharedString::default(),
+            detail: None,
             shortcut: None,
             keys: None,
             icon: None,
@@ -426,6 +436,9 @@ pub fn menu_size(window: &Window, entries: &[MenuEntry], font_size: Pixels) -> S
             + MENU_ICON_WIDTH
             + MENU_ICON_GAP
             + menu_text_width(window, &entry.label, font_size);
+        if let Some(detail) = entry.detail.as_ref() {
+            row += MENU_ICON_GAP + menu_text_width(window, detail, font_size);
+        }
         if let Some(shortcut) = entry.shortcut.as_ref() {
             row += MENU_ROW_GAP + menu_text_width(window, shortcut, font_size);
         } else if entry.has_submenu() {
@@ -600,6 +613,8 @@ struct MenuRender<'a> {
     callbacks: &'a MenuCallbacks,
     viewport: Size<Pixels>,
     theme: &'a Theme,
+    /// The heading above the rows of the top level, such as the class of Go to Test.
+    title: Option<&'a SharedString>,
 }
 
 fn menu_level(
@@ -617,6 +632,7 @@ fn menu_level(
         callbacks,
         viewport,
         theme,
+        title,
     } = render;
     let hover = theme.selection;
     let muted = theme.text_secondary;
@@ -645,7 +661,18 @@ fn menu_level(
         .min_w(px(MENU_MIN_WIDTH))
         .py(px(POPUP_PADDING));
 
-    let mut items = Vec::with_capacity(entries.len());
+    let mut items = Vec::with_capacity(entries.len() + usize::from(title.is_some()));
+    if let Some(title) = title {
+        items.push(
+            div()
+                .debug_selector(|| "menu-title".to_owned())
+                .px(px(ROW_PADDING_X))
+                .py(px(SPACE_S))
+                .text_color(theme.text_secondary)
+                .child((*title).clone())
+                .into_any_element(),
+        );
+    }
     for (index, entry) in entries.iter().enumerate() {
         let mut path = parent_path.to_vec();
         path.push(index);
@@ -765,7 +792,19 @@ fn menu_level(
                         })
                         .children(entry.icon.map(|name| icon(name, theme).grayscale(true))),
                 )
-                .child(entry.label.clone()),
+                .child(entry.label.clone())
+                .children(entry.detail.clone().map(|detail| {
+                    let path = path.clone();
+                    div()
+                        .debug_selector(move || {
+                            let parts: Vec<String> =
+                                path.iter().map(|index| index.to_string()).collect();
+                            format!("menu-detail-{}", parts.join("-"))
+                        })
+                        .flex_none()
+                        .text_color(muted)
+                        .child(detail)
+                })),
         );
 
         if let Some(tip) = entry.tip.clone() {
@@ -837,8 +876,13 @@ fn menu_level(
     // The rows scroll inside the frame when they do not fit the window. A list that fits
     // takes exactly the height of its rows.
     let scroll = geometry.scroll(parent_path);
+    let heading = if depth == 0 && title.is_some() {
+        px(ROW_HEIGHT)
+    } else {
+        px(0.)
+    };
     let list_height =
-        (menu_max_height(*viewport) - px(POPUP_PADDING * 2. + MENU_FRAME)).max(px(0.));
+        (menu_max_height(*viewport) - px(POPUP_PADDING * 2. + MENU_FRAME) - heading).max(px(0.));
     let list = SharedString::from(format!("menu-list-{}-{depth}", geometry.id));
     let bars = SharedString::from(format!("menu-scroll-{}-{depth}", geometry.id));
     surface.child(scrollable(
@@ -870,12 +914,28 @@ pub fn menu(
     window: &mut Window,
     cx: &mut App,
 ) -> Stateful<Div> {
+    menu_titled(None, entries, state, geometry, callbacks, theme, window, cx)
+}
+
+/// [`menu`] with a heading above its rows, such as the class Go to Test looks tests for.
+#[allow(clippy::too_many_arguments)]
+pub fn menu_titled(
+    title: Option<&SharedString>,
+    entries: &[MenuEntry],
+    state: &MenuState,
+    geometry: &MenuGeometry,
+    callbacks: &MenuCallbacks,
+    theme: &Theme,
+    window: &mut Window,
+    cx: &mut App,
+) -> Stateful<Div> {
     let render = MenuRender {
         state,
         geometry,
         callbacks,
         viewport: window.viewport_size(),
         theme,
+        title,
     };
     menu_level(entries, 0, &[], true, &render, window, cx)
 }

@@ -3,6 +3,7 @@
 
 mod beans;
 mod build_scripts;
+mod change_signature;
 mod database;
 mod database_drivers;
 mod debug;
@@ -10,6 +11,7 @@ mod diagram;
 mod doc;
 mod endpoints;
 mod environment;
+mod expression_type;
 mod file_templates;
 mod hover_place;
 mod inspections;

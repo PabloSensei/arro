@@ -805,6 +805,8 @@ pub mod workspace {
     pub const RECENT_FILES: &str = "workspace.recent_files";
     /// Recent Files with the "Show edited only" checkbox already on.
     pub const RECENT_CHANGED_FILES: &str = "workspace.recent_changed_files";
+    /// The latest versions of the project from Local History.
+    pub const RECENT_CHANGES: &str = "workspace.recent_changes";
     pub const SWITCHER: &str = "workspace.switcher";
     pub const FIND_IN_FILES: &str = "workspace.find_in_files";
     pub const REPLACE_IN_FILES: &str = "workspace.replace_in_files";
@@ -884,6 +886,7 @@ pub mod workspace {
         ("ShowUmlDiagram", "window.show_diagram"),
         ("RunAnything", RUN_ANYTHING),
         ("RecentFiles", RECENT_FILES),
+        ("RecentChanges", RECENT_CHANGES),
         ("Switcher", SWITCHER),
         ("FindInPath", FIND_IN_FILES),
         ("ReplaceInPath", REPLACE_IN_FILES),
@@ -1279,6 +1282,20 @@ mod tests {
         assert_eq!(
             keymap.resolve(&stroke("ctrl-#"), editor::CONTEXT),
             Some(editor::SET_BOOKMARK_3)
+        );
+    }
+
+    #[test]
+    fn recent_changes_has_the_idea_key_of_the_window() {
+        let (_, windows) = default_keymap_for(Platform::Windows);
+        assert_eq!(
+            windows.resolve(&stroke("alt-shift-c"), workspace::CONTEXT),
+            Some(workspace::RECENT_CHANGES)
+        );
+        let (_, macos) = default_keymap_for(Platform::MacOs);
+        assert_eq!(
+            macos.resolve(&stroke("alt-shift-c"), workspace::CONTEXT),
+            Some(workspace::RECENT_CHANGES)
         );
     }
 

@@ -106,7 +106,8 @@ actions!(
         PinTab,
         SaveAll,
         OpenFolder,
-        // The window only declares it, the project tree selects the file.
+        // The window only declares these: the Select In popup and the project tree answer them.
+        SelectIn,
         SelectInProject,
         ToggleProblems,
         ToggleUsages,
@@ -266,7 +267,7 @@ window_keys![
     ("ctrl-alt-shift-right", FocusNextGroup, None, None, Some("ctrl-alt-shift-right")),
     ("ctrl-alt-shift-left", FocusPreviousGroup, None, None, Some("ctrl-alt-shift-left")),
     ("ctrl-s", SaveAll, Some("Workspace"), Some("SaveAll"), None),
-    ("alt-f1", SelectInProject, None, Some("SelectIn"), None),
+    ("alt-f1", SelectIn, None, Some("SelectIn"), None),
     ("ctrl-alt-s", ShowSettings, None, Some("ShowSettings"), None),
     ("f2", NextProblem, Some("Workspace"), Some("GotoNextError"), None),
     ("shift-f2", PreviousProblem, Some("Workspace"), Some("GotoPreviousError"), None),
@@ -538,6 +539,8 @@ pub(crate) enum Overlay {
         keys: Vec<MenuShortcut>,
         /// The section of the menu bar this menu belongs to, when it was opened from it.
         bar: Option<usize>,
+        /// The heading above the rows, such as the class Go to Test looks tests for.
+        title: Option<SharedString>,
     },
     View {
         view: AnyView,
@@ -4844,7 +4847,18 @@ impl Workspace {
         keys: Vec<MenuShortcut>,
         cx: &mut Context<Self>,
     ) {
-        self.show_menu_inner(position, entries, keys, None, cx);
+        self.show_menu_inner(position, entries, keys, None, None, cx);
+    }
+
+    /// A menu with a heading above its rows, such as the class Go to Test looks tests for.
+    pub fn show_menu_titled(
+        &mut self,
+        position: Point<Pixels>,
+        title: impl Into<SharedString>,
+        entries: Vec<MenuEntry>,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_menu_inner(position, entries, Vec::new(), None, Some(title.into()), cx);
     }
 
     /// The submenu of a section of the menu bar. The bar keeps answering the pointer
@@ -4856,7 +4870,7 @@ impl Workspace {
         entries: Vec<MenuEntry>,
         cx: &mut Context<Self>,
     ) {
-        self.show_menu_inner(position, entries, Vec::new(), bar, cx);
+        self.show_menu_inner(position, entries, Vec::new(), bar, None, cx);
     }
 
     fn show_menu_inner(
@@ -4865,6 +4879,7 @@ impl Workspace {
         mut entries: Vec<MenuEntry>,
         keys: Vec<MenuShortcut>,
         bar: Option<usize>,
+        title: Option<SharedString>,
         cx: &mut Context<Self>,
     ) {
         crate::chrome::with_menu_icons(&mut entries);
@@ -4878,6 +4893,7 @@ impl Workspace {
             geometry: MenuGeometry::default(),
             keys,
             bar,
+            title,
         });
         self.focus_menu(cx);
         cx.notify();
@@ -4974,6 +4990,14 @@ impl Workspace {
         match self.overlay.as_ref()? {
             Overlay::Menu { entries, .. } => Some(entries),
             Overlay::View { rows, .. } => rows.as_deref(),
+        }
+    }
+
+    /// The heading of the open menu, such as the class of Go to Test.
+    pub fn menu_title(&self) -> Option<&str> {
+        match self.overlay.as_ref()? {
+            Overlay::Menu { title, .. } => title.as_deref(),
+            Overlay::View { .. } => None,
         }
     }
 

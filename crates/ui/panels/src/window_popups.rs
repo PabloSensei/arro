@@ -650,11 +650,156 @@ fn swatch(color: Hsla) -> Div {
     div().w(px(14.)).h(px(10.)).rounded(px(2.)).bg(color)
 }
 
-/// Ctrl+Alt+Shift+Insert: the language of a new scratch file, from the running servers.
+/// A type of file the New Scratch File menu offers: the extension of a new file and the
+/// name used when no language resolves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScratchFileType {
+    pub extension: &'static str,
+    pub label: &'static str,
+}
+
+/// The file types the application adds to the neutral formats of the editor, such as the
+/// language it knows itself.
+#[derive(Clone, Debug, Default)]
+pub struct ScratchFileTypes(pub Vec<ScratchFileType>);
+
+impl Global for ScratchFileTypes {}
+
+/// The formats of the editor with the extension of a new file and the name a type shows
+/// when no language resolves it. The application adds the types it knows itself.
+const SCRATCH_TYPES: &[ScratchFileType] = &[
+    scratch_file("kt", "Kotlin"),
+    scratch_file("groovy", "Groovy"),
+    scratch_file("json", "JSON"),
+    scratch_file("xml", "XML"),
+    scratch_file("yaml", "YAML"),
+    scratch_file("properties", "Properties"),
+    scratch_file("md", "Markdown"),
+    scratch_file("sql", "SQL"),
+    scratch_file("http", "HTTP Request"),
+    scratch_file("sh", "Shell Script"),
+    scratch_file("txt", "Plain text"),
+    scratch_file("toml", "TOML"),
+    scratch_file("html", "HTML"),
+    scratch_file("css", "CSS"),
+    scratch_file("js", "JavaScript"),
+    scratch_file("ts", "TypeScript"),
+    scratch_file("py", "Python"),
+    scratch_file("c", "C"),
+    scratch_file("cpp", "C++"),
+    scratch_file("cs", "C#"),
+    scratch_file("go", "Go"),
+    scratch_file("rs", "Rust"),
+    scratch_file("scala", "Scala"),
+    scratch_file("php", "PHP"),
+    scratch_file("rb", "Ruby"),
+    scratch_file("swift", "Swift"),
+    scratch_file("lua", "Lua"),
+    scratch_file("ps1", "PowerShell"),
+    scratch_file("proto", "Protobuf"),
+    scratch_file("ini", "INI"),
+    scratch_file("diff", "Diff"),
+    scratch_file("mk", "Makefile"),
+    scratch_file("bat", "Windows Batch"),
+    scratch_file("dockerfile", "Dockerfile"),
+];
+
+/// One row of the built-in list of the menu.
+const fn scratch_file(extension: &'static str, label: &'static str) -> ScratchFileType {
+    ScratchFileType { extension, label }
+}
+
+/// The key of the state that remembers the last type of a scratch file.
+const SCRATCH_LAST: &str = "scratch-language";
+
+/// The rows the menu shows before the list scrolls.
+const SCRATCH_SHOWN: usize = 10;
+
+/// One row of the New Scratch File menu.
+struct ScratchType {
+    label: String,
+    extension: &'static str,
+    icon: &'static str,
+}
+
+/// The name a language shows in the menu, where it spells it differently from the editor.
+fn scratch_name(name: &str) -> &str {
+    match name {
+        "Shell" => "Shell Script",
+        name => name,
+    }
+}
+
+/// The types with the name and the icon of their language, by name. The types of the
+/// application come after the formats of the editor.
+fn scratch_types(workspace: &Workspace, cx: &App) -> Vec<ScratchType> {
+    let languages = cx.try_global::<editor_view::Languages>();
+    let extra = cx
+        .try_global::<ScratchFileTypes>()
+        .map_or(&[][..], |types| types.0.as_slice());
+    let mut known: Vec<&'static str> = Vec::new();
+    let mut types = Vec::new();
+    for file in SCRATCH_TYPES.iter().chain(extra) {
+        if known.contains(&file.extension) {
+            continue;
+        }
+        known.push(file.extension);
+        let sample = PathBuf::from(format!("scratch.{}", file.extension));
+        let label = languages
+            .and_then(|languages| (languages.resolve)(&sample))
+            .map_or(file.label, |config| scratch_name(config.name))
+            .to_owned();
+        types.push(ScratchType {
+            label,
+            extension: file.extension,
+            icon: workspace.icons().icon_for(&sample),
+        });
+    }
+    types.sort_by_cached_key(|kind| kind.label.to_lowercase());
+    types
+}
+
+/// The name of the language of `path`, as the menu spells it.
+fn scratch_name_of(
+    path: &Path,
+    languages: Option<&editor_view::Languages>,
+    types: &[ScratchType],
+) -> Option<String> {
+    if let Some(languages) = languages
+        && let Some(config) = (languages.resolve)(path)
+    {
+        return Some(scratch_name(config.name).to_owned());
+    }
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    let extension = match extension.as_str() {
+        "rest" => "http",
+        "yml" => "yaml",
+        "markdown" => "md",
+        "kts" => "kt",
+        "bash" => "sh",
+        "htm" => "html",
+        "jsonc" => "json",
+        "mjs" | "cjs" => "js",
+        "pyi" => "py",
+        "psm1" => "ps1",
+        other => other,
+    };
+    types
+        .iter()
+        .find(|kind| kind.extension == extension)
+        .map(|kind| kind.label.clone())
+}
+
+/// Ctrl+Alt+Shift+Insert: the language of a new scratch file. The language of the active
+/// editor comes first, then the one chosen last time, then the rest by name.
 pub struct ScratchLanguagePopup {
     workspace: WeakEntity<Workspace>,
     focus: FocusHandle,
-    rows: Vec<(String, &'static str)>,
+    types: Vec<ScratchType>,
+    /// The rows the query keeps, as indices of `types`.
+    visible: Vec<usize>,
+    query: TextField,
+    scroll: ScrollHandle,
     selected: usize,
 }
 
@@ -663,17 +808,35 @@ pub(crate) fn show_scratch_languages(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let mut rows = vec![("Plain text".to_owned(), "txt")];
-    if let Some(languages) = cx.try_global::<crate::AgentLanguages>() {
-        for id in languages.0.ids() {
-            rows.push((id.0.to_owned(), id.0));
+    let languages = cx.try_global::<editor_view::Languages>();
+    let mut types = scratch_types(workspace, cx);
+    let active = workspace
+        .active_path()
+        .and_then(|path| scratch_name_of(&path, languages, &types))
+        .unwrap_or_else(|| "Plain text".to_owned());
+    let last = workspace
+        .store()
+        .and_then(|store| store.get(SCRATCH_LAST).ok().flatten());
+    let mut ordered = Vec::with_capacity(types.len());
+    let mut take = |matching: &dyn Fn(&ScratchType) -> bool| {
+        if let Some(index) = types.iter().position(matching) {
+            ordered.push(types.remove(index));
         }
+    };
+    take(&|kind| kind.label == active);
+    if let Some(last) = last.as_deref() {
+        take(&|kind| kind.extension == last);
     }
+    ordered.extend(types);
+    let visible = (0..ordered.len()).collect();
     let weak = cx.weak_entity();
     let view = cx.new(|cx| ScratchLanguagePopup {
         workspace: weak,
         focus: cx.focus_handle(),
-        rows,
+        types: ordered,
+        visible,
+        query: TextField::default(),
+        scroll: ScrollHandle::new(),
         selected: 0,
     });
     let focus = view.read(cx).focus.clone();
@@ -682,9 +845,14 @@ pub(crate) fn show_scratch_languages(
 
 impl ScratchLanguagePopup {
     fn pick(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((_, extension)) = self.rows.get(index).cloned() else {
+        let Some(kind) = self
+            .visible
+            .get(index)
+            .and_then(|index| self.types.get(*index))
+        else {
             return;
         };
+        let extension = kind.extension;
         self.selected = index;
         let serial = NEXT_SCRATCH.fetch_add(1, Ordering::Relaxed);
         self.workspace
@@ -692,7 +860,11 @@ impl ScratchLanguagePopup {
                 workspace.dismiss(window, cx);
                 let dir = workspace.state_dir().join("scratches");
                 let path = dir.join(format!("scratch_{serial}.{extension}"));
+                let store = workspace.store();
                 let write = cx.background_executor().spawn(async move {
+                    if let Some(store) = store {
+                        let _ = store.put(SCRATCH_LAST, extension);
+                    }
                     std::fs::create_dir_all(&dir)?;
                     std::fs::write(&path, "")?;
                     Ok::<PathBuf, std::io::Error>(path)
@@ -712,16 +884,31 @@ impl ScratchLanguagePopup {
             .ok();
     }
 
+    /// The rows the query keeps, the first one selected.
+    fn filter(&mut self) {
+        let query = self.query.text.to_lowercase();
+        self.visible = self
+            .types
+            .iter()
+            .enumerate()
+            .filter(|(_, kind)| query.is_empty() || kind.label.to_lowercase().contains(&query))
+            .map(|(index, _)| index)
+            .collect();
+        self.selected = 0;
+    }
+
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         match key {
-            "up" | "left" => {
+            "up" => {
                 self.selected = self.selected.saturating_sub(1);
+                self.scroll.scroll_to_item(self.selected);
                 cx.stop_propagation();
                 cx.notify();
             }
-            "down" | "right" => {
-                self.selected = (self.selected + 1).min(self.rows.len() - 1);
+            "down" => {
+                self.selected = (self.selected + 1).min(self.visible.len().saturating_sub(1));
+                self.scroll.scroll_to_item(self.selected);
                 cx.stop_propagation();
                 cx.notify();
             }
@@ -735,8 +922,24 @@ impl ScratchLanguagePopup {
                     .ok();
                 cx.stop_propagation();
             }
-            _ => {}
+            _ => {
+                if self.query.key_with_clipboard(event, false, cx) {
+                    self.filter();
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }
         }
+    }
+
+    /// The names of the rows the query keeps, for the tests.
+    #[cfg(test)]
+    pub(crate) fn labels(&self) -> Vec<String> {
+        self.visible
+            .iter()
+            .filter_map(|index| self.types.get(*index))
+            .map(|kind| kind.label.clone())
+            .collect()
     }
 }
 
@@ -747,28 +950,38 @@ impl Render for ScratchLanguagePopup {
         let left = (viewport.width - px(WIDTH)) / 2.;
         let top = viewport.height * 0.18;
         let rows: Vec<_> = self
-            .rows
+            .visible
             .iter()
             .enumerate()
-            .map(|(index, (label, _))| {
+            .filter_map(|(index, type_index)| {
+                let kind = self.types.get(*type_index)?;
                 let selected = index == self.selected;
-                div()
-                    .id(("scratch-language-row", index))
-                    .debug_selector(move || format!("scratch-language-row-{index}"))
-                    .flex()
-                    .items_center()
-                    .flex_none()
-                    .h(px(ROW_HEIGHT))
-                    .px(px(ROW_PADDING_X))
-                    .rounded(px(ROW_RADIUS))
-                    .when(selected, |this| this.bg(theme.selection))
-                    .when(!selected, |this| {
-                        this.hover(|style| style.bg(theme.selection_hover))
-                    })
-                    .child(SharedString::from(label.clone()))
-                    .on_click(cx.listener(move |this, _, window, cx| this.pick(index, window, cx)))
+                let label = kind.label.clone();
+                let file_icon = kind.icon;
+                Some(
+                    div()
+                        .id(("scratch-language-row", index))
+                        .debug_selector(move || format!("scratch-language-row-{index}"))
+                        .flex()
+                        .items_center()
+                        .gap(px(SPACE_M))
+                        .flex_none()
+                        .h(px(ROW_HEIGHT))
+                        .px(px(ROW_PADDING_X))
+                        .rounded(px(ROW_RADIUS))
+                        .when(selected, |this| this.bg(theme.selection))
+                        .when(!selected, |this| {
+                            this.hover(|style| style.bg(theme.selection_hover))
+                        })
+                        .child(icon(file_icon, &theme))
+                        .child(SharedString::from(label))
+                        .on_click(
+                            cx.listener(move |this, _, window, cx| this.pick(index, window, cx)),
+                        ),
+                )
             })
             .collect();
+        let list_height = self.visible.len().min(SCRATCH_SHOWN) as f32 * ROW_HEIGHT;
         let body = surface(&theme)
             .id("scratch-language-popup")
             .debug_selector(|| "scratch-language-popup".to_owned())
@@ -795,10 +1008,52 @@ impl Render for ScratchLanguagePopup {
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .children(rows),
+                    .items_center()
+                    .flex_none()
+                    .debug_selector(|| "scratch-language-input".to_owned())
+                    .gap(px(SPACE_S))
+                    .h(px(CONTROL_HEIGHT))
+                    .mb(px(POPUP_PADDING))
+                    .px(px(SPACE_M))
+                    .rounded(px(CONTROL_RADIUS))
+                    .border_2()
+                    .border_color(theme.accent)
+                    .child(icon("general/search", &theme))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .children(text_field_children(
+                                FieldMouse::new(cx, |this| Some(&mut this.query)),
+                                &self.query,
+                                theme.text,
+                                theme.text,
+                                theme.selection,
+                                theme.caret,
+                                18.,
+                                true,
+                            )),
+                    ),
+            )
+            .child(
+                scrollable(
+                    "scratch-language-rows",
+                    &self.scroll,
+                    div()
+                        .id("scratch-language-rows")
+                        .flex()
+                        .flex_col()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll)
+                        .children(rows),
+                    &theme,
+                    window,
+                    cx,
+                )
+                .h(px(list_height))
+                .min_h_0(),
             );
         div()
             .absolute()

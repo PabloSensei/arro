@@ -506,14 +506,19 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         // The place the server marks is the name of the extract. The parameter of
-        // Introduce Parameter is placed by its type, which is not a name to type.
+        // Introduce Parameter is placed by its type, which is not a name to type: its name
+        // is the expression the action replaced, found in `start_extract_name`.
         let introduces_a_name = entry.code.as_deref().is_some_and(|code| {
             code.starts_with("refactor.extract.variable")
                 || code.starts_with("refactor.extract.constant")
                 || code.starts_with("refactor.extract.field")
                 || code.starts_with("refactor.extract.function")
         });
-        if entry.rename.is_some() && introduces_a_name {
+        let introduces_parameter = entry.code.as_deref().is_some_and(|code| {
+            code.starts_with("refactor.introduce.parameter")
+                && !code.starts_with("refactor.introduce.parameter.object")
+        });
+        if (entry.rename.is_some() && introduces_a_name) || introduces_parameter {
             self.start_extract_name(version, entry, label, cx);
             return;
         }
@@ -717,12 +722,24 @@ impl EditorView {
         cx: &mut Context<Self>,
         done: impl FnOnce(&mut Self, i32, usize, Vec<ActionEntry>, &mut Context<Self>) + 'static,
     ) {
-        let Some((uri, version, caret)) = self.asked_version() else {
-            return;
-        };
-        let Some(provider) = self.lsp.as_ref().and_then(|lsp| lsp.support.actions()) else {
-            return;
-        };
+        if let Some(task) = self.ask_actions_task(None, span, only, cx, done) {
+            task.detach();
+        }
+    }
+
+    /// The question of [`EditorView::ask_actions`] as a task. The wait `wait` keeps it, so
+    /// that taking the wait back cancels the question at the language. An answer that comes
+    /// after the wait was taken back is dropped; an answer that decides nothing ends the wait.
+    pub(crate) fn ask_actions_task(
+        &mut self,
+        wait: Option<u64>,
+        span: TextSpan,
+        only: Option<ActionKind>,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(&mut Self, i32, usize, Vec<ActionEntry>, &mut Context<Self>) + 'static,
+    ) -> Option<Task<()>> {
+        let (uri, version, caret) = self.asked_version()?;
+        let provider = self.lsp.as_ref().and_then(|lsp| lsp.support.actions())?;
         let query = ActionQuery {
             uri,
             version,
@@ -730,16 +747,32 @@ impl EditorView {
             only,
         };
         let replies = ask(provider, query);
-        cx.spawn(async move |this, cx| {
+        Some(cx.spawn(async move |this, cx| {
             let answer = first(replies).await;
-            this.update(cx, |this, cx| match answer {
-                Some((_, Confidence::Unknown)) => this.show_note(caret, NO_ANSWER, cx),
-                Some((entries, _)) => done(this, version, caret, entries, cx),
-                None => {}
+            this.update(cx, |this, cx| {
+                if wait.is_some() {
+                    this.follow_refactor_wait(cx);
+                }
+                if wait.is_some_and(|token| !this.refactor_waits(token)) {
+                    return;
+                }
+                match answer {
+                    Some((_, Confidence::Unknown)) => {
+                        if let Some(token) = wait {
+                            this.end_refactor_wait(token, cx);
+                        }
+                        this.show_note(caret, NO_ANSWER, cx)
+                    }
+                    Some((entries, _)) => done(this, version, caret, entries, cx),
+                    None => {
+                        if let Some(token) = wait {
+                            this.end_refactor_wait(token, cx);
+                        }
+                    }
+                }
             })
             .ok();
-        })
-        .detach();
+        }))
     }
 
     /// Ctrl+Alt+O.

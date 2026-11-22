@@ -96,12 +96,14 @@ mod project_structure;
 mod prompt;
 mod proposal;
 mod push;
+mod recent_changes;
 mod refactor_form;
 mod refactor_undo;
 mod reformat;
 mod run;
 mod run_configs;
 mod script;
+mod select_in;
 mod sequence_diagram;
 mod sequence_export;
 mod sequence_layout;
@@ -738,6 +740,8 @@ mod window_tests_git_log_icons;
 mod bookmarks;
 #[cfg(test)]
 mod window_tests_build_profiles;
+#[cfg(test)]
+mod window_tests_scratch_languages;
 
 mod choice;
 mod invalidate;
@@ -787,6 +791,7 @@ pub use start::{
 };
 pub use tree_ops::{Creates, FileTemplate};
 pub use usages::{ActiveUsages, UsagesHub};
+pub use window_popups::{ScratchFileType, ScratchFileTypes};
 
 /// Names the build tools of the language for the pages and the search of Settings.
 pub fn set_build_tool_names(first: impl Into<String>, second: impl Into<String>) {
@@ -829,9 +834,11 @@ pub struct StartedServer {
 /// search needs to know about the language, `project` how it builds and runs, `server` answers
 /// about the code, `script`
 /// drives the window without real input, see `script.rs`.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     launch: Launch,
     languages: Languages,
+    scratch: ScratchFileTypes,
     search: SearchSetup,
     project: ProjectSetup,
     server: Option<LanguageServer>,
@@ -842,6 +849,7 @@ pub fn run(
         launch,
         OpenRequests::default(),
         languages,
+        scratch,
         search,
         project,
         server,
@@ -862,6 +870,7 @@ pub fn run_with_setup(
     launch: Launch,
     requests: OpenRequests,
     languages: Languages,
+    scratch: ScratchFileTypes,
     search: SearchSetup,
     project: ProjectSetup,
     server: Option<LanguageServer>,
@@ -886,6 +895,7 @@ pub fn run_with_setup(
     workspace::run(launch, requests, move |workspace, window, cx| {
         cx.set_global(claude);
         cx.set_global(languages);
+        cx.set_global(scratch);
         cx.set_global(editor_view::CodeStyleLanguages(code_style_language));
         cx.set_global(cache);
         cx.set_global(templates.initial());
@@ -1315,6 +1325,7 @@ fn install(
         cx,
     );
     project::bind_actions(panel.clone(), weak.clone(), window.window_handle(), cx);
+    select_in::bind_actions(weak.clone(), window.window_handle(), cx);
     cx.set_global(project::ActiveProjectPanel(panel));
     let root = workspace.root().to_path_buf();
     let draft = commit::CommitDraft::create(&root, workspace.store(), cx);
@@ -2399,3 +2410,36 @@ mod window_tests_definition_layout;
 
 #[cfg(test)]
 mod window_tests_source_inline;
+
+#[cfg(test)]
+mod window_tests_signature_visibility;
+
+#[cfg(test)]
+mod window_tests_introduce_wait;
+
+#[cfg(test)]
+mod window_tests_real_expressions;
+
+#[cfg(test)]
+mod window_tests_select_in;
+
+#[cfg(test)]
+mod window_tests_find_in_files_highlight;
+
+#[cfg(test)]
+mod window_tests_extract_name;
+
+#[cfg(test)]
+mod window_tests_refactor_popups;
+
+#[cfg(test)]
+mod window_tests_goto_menu;
+
+#[cfg(test)]
+mod window_tests_type_info;
+
+#[cfg(test)]
+mod window_tests_insert_template;
+
+#[cfg(test)]
+mod window_tests_recent_changes;

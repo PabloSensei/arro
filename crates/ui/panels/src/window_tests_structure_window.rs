@@ -39,10 +39,9 @@ public class Pet {
 }
 "#;
 
-/// A source file of the class. The extension is put together here, as the other window
-/// tests do, so that this neutral crate does not spell it.
+/// A source file of the class, named by the language of the test support.
 fn source(root: &Path, class: &str, text: &str) -> PathBuf {
-    let path = root.join("src").join(format!("{class}.{}{}", "ja", "va"));
+    let path = root.join("src").join(window_language::source_name(class));
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, text).unwrap();
     path

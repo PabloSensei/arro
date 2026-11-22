@@ -581,6 +581,7 @@ fn change_signature_info(value: &serde_json::Value) -> ChangeSignatureInfo {
         return ChangeSignatureInfo {
             signature: None,
             error: Some(error.to_owned()),
+            ..Default::default()
         };
     }
     let text = |key: &str| {
@@ -598,6 +599,7 @@ fn change_signature_info(value: &serde_json::Value) -> ChangeSignatureInfo {
         return ChangeSignatureInfo {
             signature: None,
             error: Some("Cannot change the signature here".to_owned()),
+            ..Default::default()
         };
     };
     let parameters = value
@@ -654,6 +656,7 @@ fn change_signature_info(value: &serde_json::Value) -> ChangeSignatureInfo {
             exceptions,
         }),
         error: None,
+        ..Default::default()
     }
 }
 
@@ -2466,6 +2469,7 @@ impl Provider<DocumentSpot, ChangeSignatureInfo> for LspProviders {
                 ChangeSignatureInfo {
                     signature: None,
                     error: Some("Change Signature is not supported by this language".to_owned()),
+                    ..Default::default()
                 },
                 Confidence::Unknown,
                 self.source,
@@ -2493,6 +2497,7 @@ impl Provider<DocumentSpot, ChangeSignatureInfo> for LspProviders {
                             ChangeSignatureInfo {
                                 signature: None,
                                 error: Some(error.to_string()),
+                                ..Default::default()
                             },
                             Confidence::Unknown,
                             source,

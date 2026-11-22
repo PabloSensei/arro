@@ -375,17 +375,8 @@ fn the_real_server_takes_the_unused_import_setting(cx: &mut TestAppContext) {
 ",
     )
     .unwrap();
-    let source = format!(
-        "package com.example;
-
-import {}.util.List;
-
-class Main {{
-}}
-",
-        concat!("ja", "va")
-    );
-    let path = window_language::write_test_source(&root, "Main", &source);
+    let source = window_language::unused_import_source();
+    let path = window_language::write_test_source(&root, "Main", source);
     let language = RealLanguage::open(root.clone(), scratch("inspection-real-state"))
         .expect("the language server starts");
     let window = build_window(

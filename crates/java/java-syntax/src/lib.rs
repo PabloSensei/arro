@@ -5,6 +5,8 @@ mod declarations;
 mod diagram;
 mod edit;
 mod endpoints;
+mod expressions;
+mod extract_name;
 mod implicit;
 mod inline;
 mod spelling;
@@ -27,6 +29,8 @@ pub use edit::{
     unwrap_edits,
 };
 pub use endpoints::endpoints;
+pub use expressions::{ExpressionShape, LiteralKind, expression_shape, expressions_at};
+pub use extract_name::suggest_name;
 pub use implicit::implicit_use_spans;
 pub use inline::identifiers_around;
 pub use lang_api::StructuralTemplate as ReadyTemplate;

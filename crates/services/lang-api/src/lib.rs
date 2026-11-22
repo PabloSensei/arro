@@ -98,10 +98,10 @@ pub use semantic::{
     CompletionLabelDetails, CompletionList, CompletionProvider, CompletionResolveProvider,
     DependencyUpdatesProvider, DependencyVersion, DependencyVersionQuery, DiagnosticEntry,
     DiagnosticsProvider, DiagnosticsQuery, DocumentEdit, DocumentSpot, ExecuteCommandProvider,
-    ExtractKind, FileChange, FileRename, FormatProvider, FormatQuery, GenerateApplyProvider,
-    GenerateApplyRequest, GenerateChoice, GenerateKind, GenerateProvider, GenerateQuery,
-    GeneratedFile, Generation, HierarchyDirection, HierarchyProvider, HierarchyQuery,
-    HighlightProvider, HoverPlace, HoverProvider, HoverText, MemberActionForm,
+    ExpressionTypePlace, ExtractKind, FileChange, FileRename, FormatProvider, FormatQuery,
+    GenerateApplyProvider, GenerateApplyRequest, GenerateChoice, GenerateKind, GenerateProvider,
+    GenerateQuery, GeneratedFile, Generation, HierarchyDirection, HierarchyProvider,
+    HierarchyQuery, HighlightProvider, HoverPlace, HoverProvider, HoverText, MemberActionForm,
     MemberActionParametersProvider, MemberActionProvider, MemberActionQuery, MemberActionRequest,
     MemberChoice, MemberRefactoring, MemberSelection, MemberTarget, MethodSignature,
     MoveDestination, MoveDestinationProvider, MoveKind, MoveMember, MoveMembersForm,
@@ -117,7 +117,7 @@ pub use semantic::{
 };
 pub use semantic::{
     CallParameter, CallSignature, CompletionKind, ExpectedType, ExpectedTypeProvider, ExternalDoc,
-    ExternalDocProvider, SemanticToken, SemanticTokenKind, SemanticTokenModifiers,
+    ExternalDocProvider, NameRole, SemanticToken, SemanticTokenKind, SemanticTokenModifiers,
     SemanticTokensProvider, SemanticTokensQuery, SignatureHelp, SignatureInfoProvider,
 };
 pub use semantic::{

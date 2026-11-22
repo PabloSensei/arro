@@ -1226,6 +1226,11 @@ pub struct EditorView {
     pub(crate) completion_doc_task: Option<Task<()>>,
     /// The message under the caret that closes by itself.
     pub(crate) note_task: Option<Task<()>>,
+    /// Counts the waits of the refactorings, so that an answer of an earlier wait is dropped.
+    /// It lives on the view, not in `Lsp`, which is rebuilt for the language.
+    pub(crate) refactor_tokens: u64,
+    /// The refactoring that waits for the language, see [`crate::refactor::RefactorWait`].
+    pub(crate) refactor_wait: Option<crate::refactor::RefactorWait>,
     /// The labels above declarations, as the language gave them for this text.
     pub(crate) code_lens: Vec<crate::code_lens::CodeLensItem>,
     /// The parts of each block row, in the order the row draws them.
@@ -1449,6 +1454,9 @@ impl EditorView {
         // it when the user clicks away.
         let focus = view.focus_handle.clone();
         cx.on_blur(&focus, window, |view, _window, cx| {
+            // A refactoring that waits for the language, and the name it opened, end with
+            // the focus: a late answer must not open the name again.
+            view.leave_refactor(cx);
             if view
                 .lsp
                 .as_ref()
@@ -1805,6 +1813,8 @@ impl EditorView {
             completion_task: None,
             completion_doc_task: None,
             note_task: None,
+            refactor_tokens: 0,
+            refactor_wait: None,
             code_lens: Vec::new(),
             code_vision_labels: Vec::new(),
             code_vision_hovered: None,
@@ -3594,6 +3604,9 @@ impl EditorView {
     }
 
     fn finish_change(&mut self, change: Option<Change>, cx: &mut Context<Self>) {
+        // A refactoring that waits for the language was asked about the text and the caret it
+        // stood on: an edit or a move takes it back.
+        self.follow_refactor_wait(cx);
         // The menu of Alt+Enter belongs to the text and the word it opened on.
         if change.is_some() {
             self.dismiss_actions_popup(cx);
@@ -4447,15 +4460,14 @@ impl EditorView {
             cx.stop_propagation();
             return;
         }
-        // Escape closes the topmost popup of the editor and nothing else.
-        if stroke.key == "escape"
-            && !stroke.ctrl
-            && !stroke.alt
-            && !stroke.shift
-            && self.close_top_popup(cx)
-        {
-            cx.stop_propagation();
-            return;
+        // Escape closes the topmost popup of the editor and nothing else, except a refactoring
+        // that waits for the language: Escape takes it back, with its hint, and is used up.
+        if stroke.key == "escape" && !stroke.ctrl && !stroke.alt && !stroke.shift {
+            let waiting = self.cancel_refactor_wait(cx);
+            if self.close_top_popup(cx) || waiting {
+                cx.stop_propagation();
+                return;
+            }
         }
         // The second key of a chord: Ctrl+* then a digit, for instance.
         if !self.chords.is_empty() {
@@ -4605,6 +4617,9 @@ impl EditorView {
 
     /// Runs a keymap action.
     pub fn run(&mut self, action: &str, cx: &mut Context<Self>) {
+        // Any action of the editor takes back a refactoring that waits for the language; the
+        // refactoring that the action starts begins a new wait.
+        self.cancel_refactor_wait(cx);
         // A refactoring of several files is one step of the window's history: this file
         // asks the window for it instead of taking back its own buffer alone.
         if action == actions::UNDO
@@ -4816,6 +4831,7 @@ impl EditorView {
         }
         let rows = self.page_rows();
         if let Some(change) = self.template_action(action, cx) {
+            self.template_note(cx);
             self.changed(change, cx);
             return;
         }
@@ -5347,6 +5363,7 @@ impl EditorView {
                     event.click_count,
                 );
             }
+            self.follow_refactor_wait(cx);
             self.drag = drag_of(event.click_count, offset);
             if let Some(lsp) = &mut self.lsp {
                 lsp.actions = None;
@@ -5499,6 +5516,7 @@ impl EditorView {
             add_caret,
             event.click_count,
         );
+        self.follow_refactor_wait(cx);
         self.drag = drag_of(event.click_count, offset);
         self.block_drag = block.then(|| (offset, if modifiers.alt { kept } else { Vec::new() }));
         if let Some(bar) = &mut self.bar {
@@ -5547,6 +5565,7 @@ impl EditorView {
             if let Some(state) = &mut self.state {
                 state.click(offset, false, false, 1);
             }
+            self.follow_refactor_wait(cx);
             self.caret_on = true;
             self.highlight_later(cx);
             cx.notify();
@@ -5688,6 +5707,8 @@ impl EditorView {
                 (None, Some(DragUnit::Lines(anchor))) => state.drag_lines(anchor, offset),
                 (None, None) => state.drag_to(offset),
             }
+            // A drag moves the caret: a refactoring that waits for the language lets go.
+            self.follow_refactor_wait(cx);
             self.autoscroll = true;
             cx.notify();
         }
@@ -6914,7 +6935,11 @@ impl EditorView {
             );
         }
         if let Some(field) = &lsp.name
-            && let Some(position) = self.below(field.at)
+            && let Some((position, anchor)) = self.popup_position(
+                field.at,
+                (3. + f32::from(field.visibility_line().is_some())) * (self.style.line_height + 4.)
+                    + 12.,
+            )
         {
             let body = surface(&theme)
                 .debug_selector(|| "extract-name-popup".to_owned())
@@ -6947,6 +6972,7 @@ impl EditorView {
             popups.push(
                 deferred(
                     anchored()
+                        .anchor(anchor)
                         .position(position)
                         .snap_to_window_with_margin(px(SPACE_M))
                         .child(body),
@@ -7339,6 +7365,13 @@ impl Render for EditorView {
         // never took the focus.
         if self.list_popups_open() && !self.focus_handle.is_focused(window) {
             self.dismiss_list_popups(cx);
+        }
+        // The name of a refactoring and its wait end with the focus too, as the list does.
+        if !self.focus_handle.is_focused(window)
+            && (self.refactor_wait.is_some()
+                || self.lsp.as_ref().is_some_and(|lsp| lsp.name.is_some()))
+        {
+            self.leave_refactor(cx);
         }
         self.prepare_preview(cx);
         let head = self.state.as_ref().map(EditorState::head);

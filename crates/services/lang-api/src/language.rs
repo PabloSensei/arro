@@ -5,11 +5,11 @@ use crate::{
     ActionProvider, AddOverridableMethodsProvider, CallHierarchyProvider,
     ChangeSignatureInfoProvider, ChangeSignatureProvider, CompletionProvider,
     CompletionResolveProvider, DefinitionPreviewProvider, DependencyUpdatesProvider,
-    DiagnosticsProvider, ExecuteCommandProvider, FileSymbolsProvider, FormatProvider,
-    GenerateApplyProvider, GenerateProvider, HierarchyProvider, HighlightProvider, HoverPlace,
-    HoverProvider, MemberActionParametersProvider, MemberActionProvider, MethodHierarchyProvider,
-    MoveDestinationProvider, MoveMembersFormProvider, MovePlace, MoveProvider,
-    MoveTargetsFormProvider, NavigationProvider, OverridableMethodsProvider,
+    DiagnosticsProvider, ExecuteCommandProvider, ExpressionTypePlace, FileSymbolsProvider,
+    FormatProvider, GenerateApplyProvider, GenerateProvider, HierarchyProvider, HighlightProvider,
+    HoverPlace, HoverProvider, MemberActionParametersProvider, MemberActionProvider,
+    MethodHierarchyProvider, MoveDestinationProvider, MoveMembersFormProvider, MovePlace,
+    MoveProvider, MoveTargetsFormProvider, NavigationProvider, OverridableMethodsProvider,
     PrepareDiagnosticsProvider, PrepareRenameProvider, ProjectProblemsProvider,
     RangeFormatProvider, ReferenceStringProvider, ReferencesProvider, RenameProvider,
     SemanticServer, SignatureProvider, SourceTextProvider, SymbolProvider, SyntaxProvider,
@@ -125,6 +125,29 @@ pub trait LanguageSupport: Send + Sync {
     /// keeps the line as it is.
     fn hover_place(&self, line: &str) -> Option<HoverPlace> {
         let _ = line;
+        None
+    }
+
+    /// Ctrl+Shift+P: where the type of the expression that covers `expression`, a byte range of
+    /// `text`, is read from. `None` when the language gives no type for that range.
+    fn expression_type_place(
+        &self,
+        text: &str,
+        expression: std::ops::Range<usize>,
+    ) -> Option<ExpressionTypePlace> {
+        let _ = (text, expression);
+        None
+    }
+
+    /// The type that a hover answer gives for the name at byte `offset` of `text`, in one line,
+    /// read from the whole answer. `None` when the answer does not give a type.
+    fn expression_type_from_hover(
+        &self,
+        text: &str,
+        offset: usize,
+        answer: &str,
+    ) -> Option<String> {
+        let _ = (text, offset, answer);
         None
     }
 
@@ -585,6 +608,29 @@ pub trait LanguageSupport: Send + Sync {
     /// other address. The editor opens the links to such places through the language.
     fn describe_library_uri(&self, uri: &str) -> Option<crate::LibraryPlace> {
         let _ = uri;
+        None
+    }
+
+    /// Ctrl+Alt+V: the byte ranges of the expressions around `offset`, read from the tree of
+    /// the language: those nested in the innermost one first, then the enclosing ones. They
+    /// join the answer of the language server when it names fewer than two expressions.
+    fn expressions_at(&self, text: &str, offset: usize) -> Vec<std::ops::Range<usize>> {
+        let _ = (text, offset);
+        Vec::new()
+    }
+
+    /// The name an extraction or an Introduce Parameter suggests for the expression at
+    /// `expression`, a byte range of `text`, as a name of the `role`. `hint` is the name of
+    /// the parameter the expression fills, when the editor knows it from the parameter
+    /// hints. `None` keeps the name the server chose.
+    fn suggest_name(
+        &self,
+        text: &str,
+        expression: std::ops::Range<usize>,
+        role: crate::NameRole,
+        hint: Option<&str>,
+    ) -> Option<String> {
+        let _ = (text, expression, role, hint);
         None
     }
 }

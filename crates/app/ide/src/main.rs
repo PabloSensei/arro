@@ -717,10 +717,15 @@ fn main() -> ExitCode {
                 project.tool.clone(),
                 project.cache_root.clone(),
             )));
+            let scratch = panels::ScratchFileTypes(vec![panels::ScratchFileType {
+                extension: "java",
+                label: language_for(Path::new("scratch.java")).map_or("Java", |config| config.name),
+            }]);
             panels::run_with_setup(
                 launch,
                 requests,
                 languages,
+                scratch,
                 search,
                 project,
                 Some(server),

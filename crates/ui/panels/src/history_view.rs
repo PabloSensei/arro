@@ -64,6 +64,15 @@ pub(crate) fn side_by_side(cx: &App) -> bool {
         .and_then(|active| active.0.upgrade())
         .is_some_and(|view| view.read(cx).side_by_side())
 }
+
+/// The id of the version the open window shows, for tests.
+#[cfg(test)]
+pub(crate) fn selected_revision_id(cx: &App) -> Option<u64> {
+    let view = cx
+        .try_global::<ActiveHistory>()
+        .and_then(|active| active.0.upgrade())?;
+    view.read(cx).selected_revision_id()
+}
 const LIST_WIDTH: f32 = 340.;
 
 /// A version next to the file as it is now.
@@ -116,6 +125,8 @@ pub struct HistoryView {
     filter_editing: bool,
     /// The list shows the labels alone.
     only_labels: bool,
+    /// The version the window opens at, when the caller picked one.
+    wanted: Option<u64>,
 }
 
 fn editor_of(
@@ -191,11 +202,35 @@ impl HistoryView {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        Self::open(scope, None, None, workspace, window, cx);
+    }
+
+    /// Reads the versions and opens the window with `revision` chosen, as Recent Changes
+    /// opens the history of the file or the folder of the version the user picked.
+    pub fn show_at(
+        scope: PathBuf,
+        revision: &Revision,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let folder = revision.is_label().then_some(true);
+        Self::open(scope, Some(revision.id), folder, workspace, window, cx);
+    }
+
+    fn open(
+        scope: PathBuf,
+        wanted: Option<u64>,
+        folder: Option<bool>,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
         let Some(history) = history::get(cx) else {
             workspace.notify_user("Local History", "The history is not open yet", cx);
             return;
         };
-        let folder = scope.is_dir();
+        let folder = folder.unwrap_or_else(|| scope.is_dir());
         let root = workspace.root().to_path_buf();
         let weak = cx.weak_entity();
         let view = cx.new(|cx| Self {
@@ -218,6 +253,7 @@ impl HistoryView {
             filter: TextField::default(),
             filter_editing: false,
             only_labels: false,
+            wanted,
         });
         view.update(cx, |view, cx| view.reread(cx));
         cx.set_global(ActiveHistory(view.downgrade()));
@@ -243,6 +279,7 @@ impl HistoryView {
                 this.revisions = revisions;
                 this.deleted = deleted;
                 let visible = this.visible();
+                let wanted = this.wanted.take();
                 let first = visible
                     .iter()
                     .copied()
@@ -250,6 +287,14 @@ impl HistoryView {
                 let chosen = this
                     .selected
                     .filter(|index| visible.contains(index))
+                    .or_else(|| {
+                        wanted.and_then(|id| {
+                            visible
+                                .iter()
+                                .copied()
+                                .find(|index| this.revisions[*index].id == id)
+                        })
+                    })
                     .or(first);
                 match chosen {
                     Some(index) => this.select(index, cx),
@@ -583,6 +628,14 @@ impl HistoryView {
     #[cfg(test)]
     pub(crate) fn selected_index(&self) -> Option<usize> {
         self.selected
+    }
+
+    /// The id of the revision the window shows, for tests.
+    #[cfg(test)]
+    pub(crate) fn selected_revision_id(&self) -> Option<u64> {
+        self.selected
+            .and_then(|index| self.revisions.get(index))
+            .map(|revision| revision.id)
     }
 
     /// Whether the version and the file now stand side by side, for tests.

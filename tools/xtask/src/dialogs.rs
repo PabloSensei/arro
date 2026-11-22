@@ -72,6 +72,10 @@ const EXCEPTIONS: &[(&str, &str)] = &[
         "the Plugins picker: a list of plugins without fields or buttons",
     ),
     (
+        "crates/ui/panels/src/select_in.rs",
+        "the Select In picker of Alt+F1: a numbered list of places without fields or buttons",
+    ),
+    (
         "crates/ui/panels/src/window_popups.rs",
         "the file path, navigation bar, scheme and scratch language pickers: dropdown lists",
     ),

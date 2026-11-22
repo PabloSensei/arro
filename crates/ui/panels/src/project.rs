@@ -2777,13 +2777,7 @@ impl ProjectPanel {
             let folder = path.clone();
             let terminal_workspace = self.workspace.clone();
             entries.push(MenuEntry::new("Open in Terminal", move |window, cx| {
-                let directory = folder.clone();
-                let terminal = cx
-                    .try_global::<crate::terminal_panel::ActiveTerminal>()
-                    .map(|active| active.0.clone());
-                if let Some(terminal) = terminal {
-                    terminal.update(cx, |panel, cx| panel.open_tab_in(directory, window, cx));
-                }
+                crate::terminal_panel::open_tab_in_directory(folder.clone(), window, cx);
                 terminal_workspace
                     .update(cx, |workspace, cx| {
                         workspace.show_tool(workspace::TERMINAL_TOOL, window, cx)

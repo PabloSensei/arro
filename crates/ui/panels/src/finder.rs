@@ -772,11 +772,32 @@ impl Finder {
         let hits = self.results.get(file)?;
         let hit = hits.lines.get(line)?;
         let found = hit.matches.first()?.clone();
+        let matches = hits
+            .lines
+            .iter()
+            .flat_map(|line| {
+                line.matches
+                    .iter()
+                    .map(move |range| (line.line as usize, range.clone()))
+            })
+            .collect();
         Some(PreviewTarget::found(
             hits.path.clone(),
             hit.line as usize,
             found,
+            matches,
         ))
+    }
+
+    /// The text of the row at `index` without its indent and the byte ranges of its
+    /// matches, as the row draws it with one run of text, for a test.
+    #[cfg(test)]
+    pub(crate) fn hit_text_at(&self, index: usize) -> Option<(String, Vec<Range<usize>>)> {
+        let Row::Hit(file, line) = *self.rows().get(index)? else {
+            return None;
+        };
+        let hit = self.results.get(file)?.lines.get(line)?;
+        Some(hit_text(&hit.text, &hit.matches))
     }
 
     /// Shows the file of the selected row in the preview under the list.
@@ -1611,8 +1632,12 @@ impl Finder {
                 let hit = &self.results[file].lines[line];
                 let selected = at == self.selected;
                 let hover = theme.selection_hover;
-                let (match_bg, match_text) = (theme.match_bg, theme.match_text);
-                let spans = segments(&hit.text, &hit.matches);
+                let (text, ranges) = hit_text(&hit.text, &hit.matches);
+                let style = HighlightStyle {
+                    color: Some(theme.match_text),
+                    background_color: Some(theme.match_bg),
+                    ..HighlightStyle::default()
+                };
                 div()
                     .id(("find-row", at))
                     .debug_selector(move || format!("find-hit-{at}"))
@@ -1640,11 +1665,7 @@ impl Finder {
                         div()
                             .flex()
                             .whitespace_nowrap()
-                            .children(spans.into_iter().map(move |(text, matched)| {
-                                div()
-                                    .when(matched, |this| this.bg(match_bg).text_color(match_text))
-                                    .child(text)
-                            })),
+                            .child(highlighted_text(text, ranges, style)),
                     )
                     .into_any_element()
             }
@@ -1663,6 +1684,24 @@ fn file_title(root: &Path, path: &Path) -> (String, String) {
         .parent()
         .map_or_else(String::new, |folder| crate::git::relative_of(root, folder));
     (name, folder)
+}
+
+/// `text` without its indent and the byte ranges of its matches in that text. The offsets
+/// of the matches are those of the whole line.
+fn hit_text(
+    text: &str,
+    matches: &[std::ops::Range<usize>],
+) -> (String, Vec<std::ops::Range<usize>>) {
+    let mut line = String::new();
+    let mut ranges = Vec::new();
+    for (part, matched) in segments(text, matches) {
+        let start = line.len();
+        line.push_str(&part);
+        if matched {
+            ranges.push(start..line.len());
+        }
+    }
+    (line, ranges)
 }
 
 /// `text` without its indent, cut at the matches: each part and whether it matched.

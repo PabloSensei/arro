@@ -73,7 +73,7 @@ pub use window::{
     PERFORMANCE_TOOL, PROBLEMS_TOOL, PROFILER_TOOL, PROJECT_TOOL, PreviousProblem, ProjectOpener,
     ProjectStructure, PushChanges, RECENT_PLACES_POPUP, RUN_TOOL, RerunInspection, Resume,
     RevertChange, Run, SELECTION_HISTORY_TOOL, SERVICES_TOOL, STACK_TRACE_TOOL, STRUCTURE_TOOL,
-    SelectInProject, ShowBranches, ShowCommit, ShowSearch, ShowSettings, SplitRight,
+    SelectIn, SelectInProject, ShowBranches, ShowCommit, ShowSearch, ShowSettings, SplitRight,
     StatusProgress, StepInto, StepOut, StepOver, Stop, TASKS_TOOL, TERMINAL_TOOL, TODO_TOOL,
     TYPE_HIERARCHY_TOOL, TabListener, ToggleAi, ToggleBookmarks, ToggleBreakpoint, ToggleCommit,
     ToggleDatabase, ToggleDebug, ToggleEndpoints, ToggleFullScreen, ToggleHttp, ToggleLog,

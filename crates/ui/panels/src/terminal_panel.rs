@@ -59,6 +59,17 @@ pub struct ActiveTerminal(pub Entity<TerminalPanel>);
 
 impl Global for ActiveTerminal {}
 
+/// Opens a tab in `directory` in the terminal of the window, as Open in Terminal of the project
+/// tree does. The caller shows the terminal window. Nothing happens without a terminal.
+pub(crate) fn open_tab_in_directory(directory: PathBuf, window: &mut Window, cx: &mut App) {
+    let terminal = cx
+        .try_global::<ActiveTerminal>()
+        .map(|active| active.0.clone());
+    if let Some(terminal) = terminal {
+        terminal.update(cx, |panel, cx| panel.open_tab_in(directory, window, cx));
+    }
+}
+
 enum State {
     Starting,
     Running(Arc<TerminalSession>),

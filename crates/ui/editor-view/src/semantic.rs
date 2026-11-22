@@ -37,9 +37,15 @@ use crate::view::{EditorEvent, EditorView};
 use crate::{DocBlock, DocInline};
 
 pub(crate) const NO_ANSWER: &str = "The language server did not answer, try again";
+/// The note of a jump to a declaration that no place answers.
+const NO_DECLARATION: &str = "Cannot find declaration to go to";
+/// The note of a jump to the type of a name that no place answers.
+const NO_TYPE_DECLARATION: &str = "No type declaration found";
 /// The note of an implementation question that no place answers. The code lens says the
 /// same when a label has none to show.
 pub(crate) const NO_IMPLEMENTATIONS: &str = "No implementations found";
+/// The note of Ctrl+U on a method that overrides nothing.
+const NO_SUPER_METHOD: &str = "No super method found";
 /// The note of a question that needs the language server while the server imports.
 pub(crate) const WAITING_NOTE: &str =
     "Waiting for the language server to finish importing the project…";
@@ -1941,13 +1947,15 @@ pub(crate) fn completion_doc_line_count(doc: &CompletionDoc) -> usize {
 /// Ctrl+B with more than one target: the places to pick from.
 pub(crate) struct NavigationList {
     pub at: usize,
+    /// The question the places answer, for the note when none of them opens.
+    pub kind: NavigationKind,
     /// The places the server named, without repeats.
     pub targets: Vec<SourceSpan>,
     pub selected: usize,
 }
 
 impl NavigationList {
-    fn new(at: usize, mut targets: Vec<SourceSpan>) -> Self {
+    fn new(at: usize, kind: NavigationKind, mut targets: Vec<SourceSpan>) -> Self {
         // A server sometimes names one place twice; the list keeps the first row.
         let mut seen = HashSet::new();
         targets.retain(|target| {
@@ -1959,6 +1967,7 @@ impl NavigationList {
         });
         Self {
             at,
+            kind,
             targets,
             selected: 0,
         }
@@ -2319,6 +2328,16 @@ fn visible_rows(view: &EditorView, state: &EditorState) -> (usize, usize, usize,
 pub(crate) async fn first<T>(mut replies: Replies<T>) -> Option<(T, Confidence)> {
     let answer = replies.next().await?;
     Some((answer.value, answer.confidence))
+}
+
+/// What a navigation of `kind` says when it found no place.
+fn missing_navigation(kind: NavigationKind) -> &'static str {
+    match kind {
+        NavigationKind::Definition => NO_DECLARATION,
+        NavigationKind::TypeDefinition => NO_TYPE_DECLARATION,
+        NavigationKind::Implementation => NO_IMPLEMENTATIONS,
+        NavigationKind::SuperMethod => NO_SUPER_METHOD,
+    }
 }
 
 /// Keeps the active parameter inside the overload the user picked: the caret says which
@@ -3880,7 +3899,7 @@ impl EditorView {
             .and_then(|lsp| lsp.navigation_cache.get(&key))
             .cloned()
         {
-            self.show_navigation_targets(spans, caret, cx);
+            self.show_navigation_targets(spans, caret, kind, cx);
             return;
         }
         let Some(provider) = support.navigation() else {
@@ -3888,7 +3907,7 @@ impl EditorView {
                 if let Some(target) = lookup(&word) {
                     self.go_to_location(&target, cx);
                 } else {
-                    self.show_transient_note(caret, "Cannot find declaration to go to", cx);
+                    self.show_transient_note(caret, missing_navigation(kind), cx);
                 }
             }
             return;
@@ -3935,11 +3954,11 @@ impl EditorView {
                         if let Some(lsp) = &mut this.lsp {
                             lsp.navigation_cache.insert(key, places.clone());
                         }
-                        this.show_navigation_targets(places, caret, cx);
+                        this.show_navigation_targets(places, caret, kind, cx);
                     } else if spans.is_empty() && confidence == Confidence::Unknown {
                         this.show_unanswered(caret, true, cx);
                     } else {
-                        this.show_transient_note(caret, NO_IMPLEMENTATIONS, cx);
+                        this.show_transient_note(caret, missing_navigation(kind), cx);
                     }
                     return;
                 }
@@ -3958,7 +3977,7 @@ impl EditorView {
                             // asking the server to read the class again.
                             lsp.navigation_cache.insert(key, spans.clone());
                         }
-                        this.show_navigation_targets(spans, caret, cx);
+                        this.show_navigation_targets(spans, caret, kind, cx);
                     }
                     Some((_, confidence))
                         if confidence != Confidence::Unknown
@@ -3984,12 +4003,10 @@ impl EditorView {
                         if let Some(target) = lookup(&word) {
                             this.go_to_location(&target, cx);
                         } else {
-                            this.show_transient_note(caret, "Cannot find declaration to go to", cx);
+                            this.show_transient_note(caret, missing_navigation(kind), cx);
                         }
                     }
-                    Some(_) => {
-                        this.show_transient_note(caret, "Cannot find declaration to go to", cx)
-                    }
+                    Some(_) => this.show_transient_note(caret, missing_navigation(kind), cx),
                     None if fallback.is_some() => {
                         let (lookup, word) = fallback.unwrap();
                         if let Some(target) = lookup(&word) {
@@ -4052,6 +4069,7 @@ impl EditorView {
         &mut self,
         spans: Vec<SourceSpan>,
         caret: usize,
+        kind: NavigationKind,
         cx: &mut Context<Self>,
     ) {
         if spans.len() == 1 {
@@ -4060,7 +4078,7 @@ impl EditorView {
         }
         self.before_navigation_popup(cx);
         if let Some(lsp) = &mut self.lsp {
-            lsp.navigation_list = Some(NavigationList::new(caret, spans));
+            lsp.navigation_list = Some(NavigationList::new(caret, kind, spans));
             cx.notify();
         }
     }
@@ -4090,10 +4108,11 @@ impl EditorView {
                 let target = list.target();
                 let target = target.cloned();
                 let at = list.at;
+                let kind = list.kind;
                 lsp.navigation_list = None;
                 match target {
                     Some(target) => self.go_to_location(&target, cx),
-                    None => self.show_transient_note(at, "Cannot find declaration to go to", cx),
+                    None => self.show_transient_note(at, missing_navigation(kind), cx),
                 }
                 true
             }

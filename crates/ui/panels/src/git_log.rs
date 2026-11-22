@@ -3050,18 +3050,19 @@ impl GitLogPanel {
             return div().child(label.to_owned()).into_any_element();
         };
         let end = at + needle.len();
+        let style = HighlightStyle {
+            color: Some(theme.over_accent),
+            background_color: Some(theme.accent),
+            ..HighlightStyle::default()
+        };
         div()
             .flex()
             .items_center()
-            .child(label[..at].to_owned())
-            .child(
-                div()
-                    .text_color(theme.over_accent)
-                    .bg(theme.accent)
-                    .rounded(px(2.))
-                    .child(label[at..end].to_owned()),
-            )
-            .child(label[end..].to_owned())
+            .child(highlighted_text(
+                label.to_owned(),
+                std::iter::once(at..end),
+                style,
+            ))
             .into_any_element()
     }
 

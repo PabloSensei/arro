@@ -527,28 +527,17 @@ fn is_tool_command(id: &str) -> bool {
 /// and bold. One run keeps the letters together: parts in a row would stand apart by its
 /// gap. The positions are character indices, as [`NameMatcher::indices`] gives them.
 fn title_text(title: &str, matched: &[usize], theme: &Theme) -> StyledText {
-    let mut highlights = Vec::new();
-    let mut run: Option<std::ops::Range<usize>> = None;
-    for (at, (offset, character)) in title.char_indices().enumerate() {
-        let end = offset + character.len_utf8();
-        if matched.binary_search(&at).is_ok() {
-            match &mut run {
-                Some(range) if range.end == offset => range.end = end,
-                _ => {
-                    highlights.extend(run.take());
-                    run = Some(offset..end);
-                }
-            }
-        }
-    }
-    highlights.extend(run);
+    let ranges = title
+        .char_indices()
+        .enumerate()
+        .filter(|(at, _)| matched.binary_search(at).is_ok())
+        .map(|(_, (offset, character))| offset..offset + character.len_utf8());
     let style = HighlightStyle {
         color: Some(theme.accent),
         font_weight: Some(FontWeight::BOLD),
         ..HighlightStyle::default()
     };
-    StyledText::new(title.to_owned())
-        .with_highlights(highlights.into_iter().map(|range| (range, style)))
+    highlighted_text(title.to_owned(), ranges, style)
 }
 
 /// The text a command is matched by, with the name of its tool window when the title of

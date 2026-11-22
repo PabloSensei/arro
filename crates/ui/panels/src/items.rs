@@ -550,12 +550,11 @@ fn code_row(
     selected: bool,
     theme: &Theme,
 ) -> Stateful<Div> {
-    let start = code.highlight.start.min(code.text.len());
-    let end = code.highlight.end.clamp(start, code.text.len());
-    let before = code.text.get(..start).unwrap_or_default().to_owned();
-    let found = code.text.get(start..end).unwrap_or_default().to_owned();
-    let after = code.text.get(end..).unwrap_or_default().to_owned();
-    let (match_bg, match_text) = (theme.match_bg, theme.match_text);
+    let style = HighlightStyle {
+        color: Some(theme.match_text),
+        background_color: Some(theme.match_bg),
+        ..HighlightStyle::default()
+    };
     let hover = theme.selection_hover;
     div()
         .id(("item", index))
@@ -594,16 +593,12 @@ fn code_row(
                 .min_w_0()
                 .overflow_hidden()
                 .whitespace_nowrap()
-                .child(before)
-                .child(
-                    div()
-                        .bg(match_bg)
-                        .text_color(match_text)
-                        .rounded(px(2.))
-                        .debug_selector(move || format!("item-code-match-{index}"))
-                        .child(found),
-                )
-                .child(after),
+                .debug_selector(move || format!("item-code-match-{index}"))
+                .child(highlighted_text(
+                    code.text.clone(),
+                    [code.highlight.clone()],
+                    style,
+                )),
         )
 }
 
