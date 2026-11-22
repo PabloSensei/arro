@@ -5,7 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use lang_api::SymbolKind;
-use search::{SymbolRow, Target};
+use search::{MatchKind, SymbolRow, Target};
 use ui_kit::gpui;
 use ui_kit::gpui::{ModifiersChangedEvent, TestAppContext, VisualTestContext, WindowHandle};
 use ui_kit::{Modifiers, px};
@@ -182,6 +182,7 @@ fn a_late_group_keeps_the_row_the_keys_chose(cx: &mut TestAppContext) {
                     offset: 0,
                 },
                 score: u32::MAX,
+                match_kind: MatchKind::Prefix,
             }],
             cx,
         );

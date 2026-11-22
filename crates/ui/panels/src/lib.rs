@@ -55,6 +55,7 @@ mod git_history;
 mod git_log;
 mod gutter_menu;
 pub mod heap_dump;
+mod hierarchy_scope;
 mod history;
 mod history_view;
 mod http;
@@ -2347,3 +2348,15 @@ mod window_tests_notification_levels;
 
 #[cfg(test)]
 mod window_tests_switcher_columns;
+
+#[cfg(test)]
+mod window_tests_terminal_focus;
+
+#[cfg(test)]
+mod window_tests_find_bar;
+
+#[cfg(test)]
+mod window_tests_call_hierarchy_scope;
+
+#[cfg(test)]
+mod window_tests_palette_ranking;

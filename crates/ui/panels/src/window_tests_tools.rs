@@ -115,12 +115,13 @@ fn escape_in_every_tool_window_gives_the_focus_back_to_the_editor(cx: &mut TestA
         );
     }
 
-    // In the terminal Escape goes to the program inside, a harness stops its turn on it.
+    // The terminal hands the focus back too (T-0431); the harnesses run in AI Sessions,
+    // and a full-screen program in the terminal keeps its Escape.
     show_tool(cx, window, TERMINAL_TOOL);
     press(cx, window, "escape");
     assert!(
-        !focused_is_editor(cx, window, &path),
-        "Escape in the terminal stays in the terminal"
+        focused_is_editor(cx, window, &path),
+        "Escape in the terminal puts the focus back into the editor"
     );
 }
 

@@ -19,6 +19,7 @@ use ui_kit::*;
 use workspace::{Settings, ToggleTerminal, Workspace};
 
 use crate::navigation;
+use crate::places;
 use crate::prompt::{Place, Prompt, TextField};
 use crate::term_grid::{
     CellMetrics, GridPanel, GridView, Position, Selection, every_frame, grid, pressed, send_key,
@@ -398,6 +399,98 @@ fn terminal_keys(platform: Platform) -> &'static TerminalKeys {
         &TERMINAL_KEYS_MACOS
     } else {
         &TERMINAL_KEYS_WINDOWS
+    }
+}
+
+/// What the terminal does with a key of the window, when the key would go to the shell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowRoute {
+    /// The window runs the key from its bindings, as it does from any tool window.
+    Bindings,
+    /// Show Bookmarks. The editor has this key of its own, which the window does not take
+    /// from the terminal, so the terminal shows the list the way the editor does.
+    Bookmarks,
+}
+
+/// The keys of the window that the terminal of one platform hands over instead of writing
+/// them into the shell. Ctrl+C, Ctrl+R, Ctrl+D, Ctrl+L, Ctrl+E (the end of the line in
+/// readline), the arrows and Tab stay with it.
+struct TerminalWindowKeys {
+    /// The keys the window runs from its bindings once the terminal lets them go on.
+    bindings: &'static [&'static str],
+    /// The key of Show Bookmarks, see [`WindowRoute::Bookmarks`].
+    bookmarks: &'static str,
+}
+
+const TERMINAL_WINDOW_KEYS_WINDOWS: TerminalWindowKeys = TerminalWindowKeys {
+    bindings: &[
+        "alt-1",
+        "alt-2",
+        "alt-3",
+        "alt-4",
+        "alt-5",
+        "alt-6",
+        "alt-7",
+        "alt-8",
+        "alt-9",
+        "alt-0",
+        "alt-f12",
+        "ctrl-tab",
+        "ctrl-shift-e",
+        "ctrl-shift-a",
+        "ctrl-f12",
+        "ctrl-shift-f12",
+    ],
+    bookmarks: "shift-f11",
+};
+
+/// macOS binds the tool windows and the actions to Command, as its keymap does. Control
+/// stays with the shell there, except Ctrl+Tab, which the keymap binds to the Switcher.
+const TERMINAL_WINDOW_KEYS_MACOS: TerminalWindowKeys = TerminalWindowKeys {
+    bindings: &[
+        "cmd-0",
+        "cmd-1",
+        "cmd-2",
+        "cmd-3",
+        "cmd-4",
+        "cmd-5",
+        "cmd-6",
+        "cmd-7",
+        "cmd-8",
+        "cmd-9",
+        "ctrl-tab",
+        "cmd-e",
+        "cmd-shift-e",
+        "cmd-shift-a",
+        "cmd-f12",
+        "cmd-shift-f12",
+    ],
+    bookmarks: "shift-f3",
+};
+
+/// The window keys of the terminal of one platform.
+fn terminal_window_keys(platform: Platform) -> &'static TerminalWindowKeys {
+    if platform.uses_command() {
+        &TERMINAL_WINDOW_KEYS_MACOS
+    } else {
+        &TERMINAL_WINDOW_KEYS_WINDOWS
+    }
+}
+
+/// Where a press goes when the terminal has the focus and the press is a key of the
+/// window, `None` for the keys the shell takes.
+fn window_route(stroke: &Keystroke, platform: Platform) -> Option<WindowRoute> {
+    let keys = terminal_window_keys(platform);
+    if is_key(stroke, keys.bookmarks) {
+        Some(WindowRoute::Bookmarks)
+    } else if keys
+        .bindings
+        .iter()
+        .any(|shortcut| is_key(stroke, shortcut))
+    {
+        Some(WindowRoute::Bindings)
+    } else {
+        None
     }
 }
 
@@ -803,6 +896,45 @@ impl TerminalPanel {
             self.search_step(!modifiers.shift, cx);
             return;
         }
+        if let Some(route) = window_route(stroke, self.keys_platform) {
+            match route {
+                // Not stopped here, so the keymap of the window runs the key.
+                WindowRoute::Bindings => return,
+                WindowRoute::Bookmarks => {
+                    cx.stop_propagation();
+                    self.show_bookmarks(window, cx);
+                    return;
+                }
+            }
+        }
+        // Plain Escape: the search bar and the rename of a tab close first, then the focus
+        // goes to the editor, unless the setting hands Escape to the shell. A program on
+        // the alternate screen (vim, less, a full-screen tool) always gets its Escape.
+        let plain = !modifiers.shift && !modifiers.control && !modifiers.alt && !modifiers.platform;
+        if stroke.key == "escape" && plain {
+            if self.search_open() {
+                cx.stop_propagation();
+                self.close_search(window, cx);
+                return;
+            }
+            if self.renaming.is_some() {
+                cx.stop_propagation();
+                self.cancel_rename(window, cx);
+                return;
+            }
+            let full_screen = self
+                .session()
+                .is_some_and(|session| session.modes().alt_screen);
+            if !full_screen
+                && cx
+                    .try_global::<Settings>()
+                    .is_none_or(|settings| settings.terminal_escape_focus)
+            {
+                cx.stop_propagation();
+                self.focus_editor(window, cx);
+                return;
+            }
+        }
         let Some(session) = self.session().cloned() else {
             return;
         };
@@ -967,6 +1099,30 @@ impl TerminalPanel {
         if open {
             self.run_search(cx);
         }
+        cx.notify();
+    }
+
+    /// Escape in the terminal: the focus goes to the editor, and the terminal stays open.
+    fn focus_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| workspace.focus_editor(window, cx))
+            .ok();
+    }
+
+    /// Shift+F11 in the terminal: the bookmarks of the editor, shown the way its own key
+    /// shows them.
+    fn show_bookmarks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                places::show_bookmarks(workspace, window, cx)
+            })
+            .ok();
+    }
+
+    /// Ends the rename of a tab without a new name and gives the focus back to the grid.
+    fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.renaming = None;
+        window.focus(&self.focus, cx);
         cx.notify();
     }
 
@@ -1207,9 +1363,7 @@ impl TerminalPanel {
         let stroke = &event.keystroke;
         if stroke.key == "escape" {
             cx.stop_propagation();
-            self.renaming = None;
-            window.focus(&self.focus, cx);
-            cx.notify();
+            self.cancel_rename(window, cx);
             return;
         }
         if stroke.key == "enter" {

@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::fuzzy::{FuzzyMatcher, NameMatcher, Ranked, rank};
+use crate::fuzzy::{FuzzyMatcher, NameMatcher, Ranked, rank, retain_better_kinds};
 
 /// What the user typed, with an optional place: `Owner.src:12:5` or `Owner:12`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,13 +64,16 @@ pub fn rank_files<'a>(
         (key, path)
     });
     let matcher: &mut dyn FuzzyMatcher = &mut matcher;
-    rank(matcher, &pattern, keyed, |(key, _)| key, limit)
+    let mut found: Vec<Ranked<PathBuf>> = rank(matcher, &pattern, keyed, |(key, _)| key, limit)
         .into_iter()
         .map(|ranked| Ranked {
             item: ranked.item.1.to_path_buf(),
             score: ranked.score,
+            kind: ranked.kind,
         })
-        .collect()
+        .collect();
+    retain_better_kinds(&mut found);
+    found
 }
 
 #[cfg(test)]

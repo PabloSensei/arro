@@ -874,6 +874,22 @@ mod tests {
     }
 
     #[test]
+    fn file_types_of_a_project_carry_their_own_icons() {
+        let icons = file_icons();
+        for (path, icon) in [
+            ("application.properties", "fileTypes/properties"),
+            ("gradle-wrapper.jar", "fileTypes/archive"),
+            ("logo.svg", "fileTypes/image"),
+            ("build.gradle.kts", "fileTypes/gradle"),
+            (".editorconfig", "fileTypes/editorConfig"),
+            ("App.class", "fileTypes/javaClass"),
+            ("notes.unknown", "fileTypes/text"),
+        ] {
+            assert_eq!(icons.icon_for(Path::new(path)), icon, "{path}");
+        }
+    }
+
+    #[test]
     fn a_fenced_block_named_java_is_parsed_as_java() {
         use syntax::{DocumentId, HighlightKind, SyntaxService};
         use text_core::{Change, RopeStore, TextStore};

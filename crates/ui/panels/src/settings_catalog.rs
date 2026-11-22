@@ -347,6 +347,8 @@ pub enum SettingField {
     TodoCaseSensitive,
     /// The file and folder masks the project tree and the file index leave out.
     IgnoredFiles,
+    /// Whether Escape in the terminal moves the focus to the editor.
+    TerminalEscapeFocus,
 }
 
 /// The value of a build tool field inside [`workspace::Settings`].
@@ -1171,6 +1173,14 @@ pub const SETTINGS: &[Setting] = &[
         field: SettingField::IgnoredFiles,
         keywords: "file types masks exclude hide tree project class node_modules",
     },
+    Setting {
+        id: "terminal_escape_focus",
+        title: "Move focus to the editor with Escape",
+        page: SettingsPage::Terminal,
+        kind: SettingKind::Toggle,
+        field: SettingField::TerminalEscapeFocus,
+        keywords: "escape focus editor terminal move shell vim less",
+    },
 ];
 
 /// Every setting the window and the search know.
@@ -1335,6 +1345,7 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         SettingField::McpEnabled => Some(settings.mcp_enabled),
         SettingField::McpRouterOnlyMode => Some(settings.mcp_router_only_mode),
         SettingField::McpTerminalSuggestions => Some(settings.mcp_terminal_suggestions),
+        SettingField::TerminalEscapeFocus => Some(settings.terminal_escape_focus),
         SettingField::TodoCaseSensitive => Some(settings.todo_case_sensitive),
         SettingField::AiEnabled => Some(settings.ai_enabled),
         SettingField::ProjectCompactMiddlePackages => {
@@ -1503,6 +1514,9 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
         }
         Some(SettingField::McpTerminalSuggestions) => {
             settings.mcp_terminal_suggestions = !settings.mcp_terminal_suggestions;
+        }
+        Some(SettingField::TerminalEscapeFocus) => {
+            settings.terminal_escape_focus = !settings.terminal_escape_focus;
         }
         Some(SettingField::TodoCaseSensitive) => {
             settings.todo_case_sensitive = !settings.todo_case_sensitive;

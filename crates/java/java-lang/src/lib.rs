@@ -93,11 +93,21 @@ pub fn language_for(path: &Path) -> Option<LanguageConfig> {
     (is_source(path) || is_console(path)).then(java_syntax::config)
 }
 
-/// The icons of the files around a Java project that the neutral icon set does not know:
-/// a Gradle build script is Groovy. The application adds these to the icons of its file
-/// tree, so the word of the build tool stays out of the neutral crates.
+/// The icons of the files around a Java project that the neutral icon set spells
+/// differently: a Gradle build script is not Groovy, and a compiled class is not a source.
+/// The application adds these to the icons of its file tree, so the word of the build tool
+/// stays out of the neutral crates.
 pub fn file_icons() -> &'static [(&'static str, &'static str)] {
-    &[("gradle", "fileTypes/groovy")]
+    &[
+        ("gradle", "fileTypes/gradle"),
+        ("build.gradle", "fileTypes/gradle"),
+        ("settings.gradle", "fileTypes/gradle"),
+        ("build.gradle.kts", "fileTypes/gradle"),
+        ("settings.gradle.kts", "fileTypes/gradle"),
+        ("gradle.properties", "fileTypes/gradle"),
+        ("gradle-wrapper.properties", "fileTypes/gradle"),
+        ("class", "fileTypes/javaClass"),
+    ]
 }
 
 pub fn symbols_for(path: &Path) -> Option<&'static dyn SymbolProvider> {

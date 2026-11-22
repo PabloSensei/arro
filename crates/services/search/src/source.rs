@@ -11,6 +11,7 @@ use base::Cancel;
 use lang_api::{Answer, Confidence, Provider, Reply, SourceId, SymbolKind};
 
 use crate::SymbolIndex;
+use crate::fuzzy::MatchKind;
 
 /// What the popup asks for. Go to Class wants types, Go to Symbol the rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +63,8 @@ pub struct SymbolRow {
     pub target: Target,
     /// Higher is better. Rows of different sources are ordered by it.
     pub score: u32,
+    /// How the query matched the name, the better kinds first.
+    pub match_kind: MatchKind,
 }
 
 /// A source of symbol rows. Implement `Provider<SymbolRequest, Vec<SymbolRow>>`.
@@ -105,6 +108,7 @@ fn rows_of(index: &SymbolIndex, query: &SymbolRequest) -> Vec<SymbolRow> {
                 offset: ranked.item.symbol.name_range.start,
             },
             score: ranked.score,
+            match_kind: ranked.kind,
         })
         .collect()
 }
@@ -138,18 +142,24 @@ impl Provider<SymbolRequest, Vec<SymbolRow>> for IndexedSymbols {
     }
 }
 
-/// Merges rows of all sources for one query: best first, the same place once.
+/// Merges rows of all sources for one query: best first, the same place once. The matches
+/// of scattered letters stay out when another row matches better.
 pub fn merge_rows(
     batches: impl IntoIterator<Item = Vec<SymbolRow>>,
     limit: usize,
 ) -> Vec<SymbolRow> {
     let mut rows: Vec<SymbolRow> = batches.into_iter().flatten().collect();
     rows.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
+        a.match_kind
+            .cmp(&b.match_kind)
+            .then_with(|| b.score.cmp(&a.score))
             .then_with(|| a.name.len().cmp(&b.name.len()))
             .then_with(|| a.name.cmp(&b.name))
     });
+    let better = rows.iter().any(|row| row.match_kind < MatchKind::Scattered);
+    if better {
+        rows.retain(|row| row.match_kind < MatchKind::Scattered);
+    }
     let mut seen = std::collections::HashSet::new();
     rows.retain(|row| seen.insert((row.name.clone(), row.container.clone(), row.kind)));
     rows.truncate(limit);
@@ -261,6 +271,7 @@ mod tests {
             container: None,
             target: Target::Uri(format!("jar:{name}")),
             score,
+            match_kind: MatchKind::Prefix,
         };
         let merged = merge_rows([vec![row("A", 5), row("B", 9)], vec![row("A", 7)]], 10);
         let names: Vec<_> = merged

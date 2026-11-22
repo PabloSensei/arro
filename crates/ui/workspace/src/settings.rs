@@ -670,6 +670,9 @@ pub struct Settings {
     /// A terminal of the window suggests the setup of the MCP client when `claude` or
     /// `codex` starts in it without an entry of Arro.
     pub mcp_terminal_suggestions: bool,
+    /// Escape in the terminal moves the focus to the editor and keeps the terminal open. Off,
+    /// the shell gets Escape, which vim and less need.
+    pub terminal_escape_focus: bool,
 }
 
 impl Default for Settings {
@@ -795,6 +798,7 @@ impl Default for Settings {
             mcp_router_only_mode: false,
             mcp_router_only_scope: McpRouterScope::AllAgents,
             mcp_terminal_suggestions: true,
+            terminal_escape_focus: true,
         }
     }
 }

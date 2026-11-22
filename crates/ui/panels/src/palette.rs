@@ -10,6 +10,7 @@ use std::sync::Arc;
 use editor_view::{EditorView, OutlineItem, OutlineKind, Spot};
 use futures_util::StreamExt;
 use lang_api::{GraphVisibility, SymbolKind, ask};
+use project_model::TEST_UNIT;
 use search::{
     FuzzyMatcher, GotoQuery, MatchKind, NameMatcher, SymbolRequest, SymbolRow, SymbolScope, Tab,
     Target, merge_rows, rank, rank_files,
@@ -27,6 +28,7 @@ use crate::index::ProjectIndex;
 use crate::navigation;
 use crate::preview::{self, FilePreview, PreviewTarget};
 use crate::project::{ActiveProjectPanel, NEW_GROUP, NewAction};
+use crate::project_structure::ProjectEnvironmentGlobal;
 use crate::settings::SettingsView;
 use crate::settings_catalog::{self, SettingKind};
 
@@ -210,6 +212,8 @@ struct RowData {
     indent: u32,
     /// The switch of a boolean setting, when this row is one.
     toggle: Option<bool>,
+    /// The character positions of the title that the query matched, for the accent colour.
+    matched: Vec<usize>,
     item: Option<Item>,
 }
 
@@ -222,6 +226,7 @@ impl RowData {
             shortcut: None,
             indent: 0,
             toggle: None,
+            matched: Vec::new(),
             item: None,
         }
     }
@@ -362,6 +367,121 @@ fn row_order(left: (&str, &str), right: (&str, &str)) -> std::cmp::Ordering {
         .then_with(|| left_id.cmp(right_id))
 }
 
+/// The test source folders of the project model. Empty when the model has no test unit,
+/// and then the `test` segment of a path tells a test file.
+fn test_source_roots(cx: &App) -> Vec<PathBuf> {
+    cx.try_global::<ProjectEnvironmentGlobal>()
+        .and_then(|found| found.0.as_ref())
+        .and_then(|environment| environment.model())
+        .map(|model| {
+            model
+                .modules
+                .iter()
+                .flat_map(|module| module.units.iter())
+                .filter(|unit| unit.name == TEST_UNIT)
+                .flat_map(|unit| unit.source_roots.iter().cloned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a file lies in a test source folder: the folders of the model when it has
+/// them, else a path with a `test` segment.
+fn is_test_file(root: &Path, path: &Path, test_roots: &[PathBuf]) -> bool {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    if test_roots.is_empty() {
+        return relative
+            .components()
+            .any(|part| part.as_os_str().eq_ignore_ascii_case("test"));
+    }
+    test_roots.iter().any(|folder| {
+        let folder = folder.strip_prefix(root).unwrap_or(folder);
+        relative.starts_with(folder)
+    })
+}
+
+/// The place of a file among the open tabs and the recent files, the earlier the better.
+/// A file that neither list knows comes last.
+fn recent_place(open: &[PathBuf], recent: &[PathBuf], path: &Path) -> usize {
+    let key = ::platform::path_key(path);
+    open.iter()
+        .chain(recent.iter())
+        .position(|candidate| ::platform::path_key(candidate) == key)
+        .unwrap_or(usize::MAX)
+}
+
+/// The name of a file, cut to the spelling of the list.
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
+}
+
+/// Whether `path` is the file of `name` with any extension: `Owner.txt` for `Owner`.
+fn file_names_class(path: &Path, name: &str) -> bool {
+    path.file_stem()
+        .is_some_and(|stem| stem.to_string_lossy() == bare_name(name))
+}
+
+/// How a file of the project is placed against another match of the same kind: the open
+/// and recent files first, then the sources before the tests, then the shorter name, then
+/// alphabetically.
+fn file_order(
+    left: &Path,
+    right: &Path,
+    root: &Path,
+    open: &[PathBuf],
+    recent: &[PathBuf],
+    test_roots: &[PathBuf],
+) -> std::cmp::Ordering {
+    recent_place(open, recent, left)
+        .cmp(&recent_place(open, recent, right))
+        .then_with(|| {
+            is_test_file(root, left, test_roots).cmp(&is_test_file(root, right, test_roots))
+        })
+        .then_with(|| file_name_of(left).len().cmp(&file_name_of(right).len()))
+        .then_with(|| {
+            file_name_of(left)
+                .to_lowercase()
+                .cmp(&file_name_of(right).to_lowercase())
+        })
+        .then_with(|| file_name_of(left).cmp(&file_name_of(right)))
+        .then_with(|| left.cmp(right))
+}
+
+/// The file a symbol stands in, when it stands in one of the project.
+fn symbol_path(row: &SymbolRow) -> Option<&Path> {
+    match &row.target {
+        Target::Offset { path, .. } | Target::Line { path, .. } => Some(path.as_path()),
+        Target::Uri(_) => None,
+    }
+}
+
+/// How a symbol of the project is placed against another match of the same kind: the
+/// file it stands in gives the open and recent order, then the sources before the tests,
+/// then the shorter name, then alphabetically.
+fn symbol_order(
+    left: &SymbolRow,
+    right: &SymbolRow,
+    root: &Path,
+    open: &[PathBuf],
+    recent: &[PathBuf],
+    test_roots: &[PathBuf],
+) -> std::cmp::Ordering {
+    let place = |row: &SymbolRow| {
+        symbol_path(row).map_or(usize::MAX, |path| recent_place(open, recent, path))
+    };
+    let test =
+        |row: &SymbolRow| symbol_path(row).is_some_and(|path| is_test_file(root, path, test_roots));
+    left.match_kind
+        .cmp(&right.match_kind)
+        .then_with(|| place(left).cmp(&place(right)))
+        .then_with(|| test(left).cmp(&test(right)))
+        .then_with(|| left.name.len().cmp(&right.name.len()))
+        .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        .then_with(|| left.name.cmp(&right.name))
+        .then_with(|| left.container.cmp(&right.container))
+}
+
 /// A row of Find Action with the score of the query, before the cut.
 struct RankedRow {
     /// Which of the five kinds of a match this row is.
@@ -402,6 +522,26 @@ fn tool_shortcut(workspace: &Workspace, tool: &str) -> Option<String> {
 /// Whether a command is the row of a tool window in Find Action.
 fn is_tool_command(id: &str) -> bool {
     TOOL_COMMANDS.iter().any(|(_, command)| *command == id)
+}
+
+/// `title` cut at the characters the query matched: each part and whether it matched.
+/// The positions are character indices, as [`NameMatcher::indices`] gives them.
+fn title_parts(title: &str, matched: &[usize]) -> Vec<(String, bool)> {
+    let mut parts = Vec::new();
+    let mut run = String::new();
+    let mut run_matched = false;
+    for (at, character) in title.chars().enumerate() {
+        let hit = matched.binary_search(&at).is_ok();
+        if !run.is_empty() && hit != run_matched {
+            parts.push((std::mem::take(&mut run), run_matched));
+        }
+        run_matched = hit;
+        run.push(character);
+    }
+    if !run.is_empty() {
+        parts.push((run, run_matched));
+    }
+    parts
 }
 
 /// The text a command is matched by, with the name of its tool window when the title of
@@ -875,31 +1015,53 @@ impl Palette {
                     Box::new(files.iter().map(PathBuf::as_path))
                 }
             };
-            rank_files(&query.pattern, root, all, limit)
-                .into_iter()
-                .map(|ranked| ranked.item)
-                .collect()
+            let mut ranked = rank_files(&query.pattern, root, all, limit);
+            let roots = test_source_roots(cx);
+            ranked.sort_by(|left, right| {
+                left.kind.cmp(&right.kind).then_with(|| {
+                    file_order(
+                        &left.item,
+                        &right.item,
+                        root,
+                        &self.switcher,
+                        &self.recent,
+                        &roots,
+                    )
+                })
+            });
+            ranked.into_iter().map(|ranked| ranked.item).collect()
         };
         self.file_rows_of(paths, file_spot(&query))
     }
 
     /// The Switcher's rows: the open tabs in the order of `switcher`. A query ranks those
     /// tabs only, so that a tab is not lost behind the files of the whole project.
-    fn switcher_rows(&self, limit: usize) -> Vec<RowData> {
+    fn switcher_rows(&self, limit: usize, cx: &App) -> Vec<RowData> {
         let query = GotoQuery::parse(&self.query.text);
         let paths: Vec<PathBuf> = if query.pattern.is_empty() {
             self.switcher.iter().take(limit).cloned().collect()
         } else {
             let root = self.project.root.as_path();
-            rank_files(
+            let mut ranked = rank_files(
                 &query.pattern,
                 root,
                 self.switcher.iter().map(PathBuf::as_path),
                 limit,
-            )
-            .into_iter()
-            .map(|ranked| ranked.item)
-            .collect()
+            );
+            let roots = test_source_roots(cx);
+            ranked.sort_by(|left, right| {
+                left.kind.cmp(&right.kind).then_with(|| {
+                    file_order(
+                        &left.item,
+                        &right.item,
+                        root,
+                        &self.switcher,
+                        &self.recent,
+                        &roots,
+                    )
+                })
+            });
+            ranked.into_iter().map(|ranked| ranked.item).collect()
         };
         self.file_rows_of(paths, file_spot(&query))
     }
@@ -933,6 +1095,7 @@ impl Palette {
                     shortcut: None,
                     indent: 0,
                     toggle: None,
+                    matched: Vec::new(),
                     item: Some(Item::File { path, spot }),
                 }
             })
@@ -954,6 +1117,7 @@ impl Palette {
             shortcut: tool.shortcut.clone(),
             indent: 0,
             toggle: None,
+            matched: Vec::new(),
             item: Some(Item::Tool(tool.id)),
         });
         let pattern = GotoQuery::parse(&self.query.text).pattern;
@@ -1011,28 +1175,39 @@ impl Palette {
                     shortcut: None,
                     indent: 0,
                     toggle: None,
+                    matched: Vec::new(),
                     item: Some(Item::Action(id)),
                 }
             })
             .collect()
     }
 
-    fn symbol_rows(&self, scope_at: usize, limit: usize) -> Vec<RowData> {
+    fn symbol_rows(&self, scope_at: usize, limit: usize, classes: bool, cx: &App) -> Vec<RowData> {
         let root = self.project.root.as_path();
-        merge_rows(self.batches_of(scope_at), limit)
-            .into_iter()
+        let mut rows = merge_rows(self.batches_of(scope_at), limit);
+        let roots = test_source_roots(cx);
+        rows.sort_by(|left, right| {
+            symbol_order(left, right, root, &self.switcher, &self.recent, &roots)
+        });
+        rows.into_iter()
             .map(|row| {
                 let place = match &row.target {
                     Target::Offset { path, .. } | Target::Line { path, .. } => {
-                        let name = path.file_name().unwrap_or_default();
-                        let _ = root;
-                        name.to_string_lossy().into_owned()
+                        // A class in the file of its own name says nothing new with the
+                        // name of that file; in any other file the name is shown.
+                        if classes && file_names_class(path, &row.name) {
+                            String::new()
+                        } else {
+                            file_name_of(path)
+                        }
                     }
                     Target::Uri(uri) => uri.clone(),
                 };
-                let detail = match &row.container {
-                    Some(container) => format!("{container}  {place}"),
-                    None => place,
+                let detail = match (&row.container, place.is_empty()) {
+                    (Some(container), false) => format!("{container}  {place}"),
+                    (Some(container), true) => container.clone(),
+                    (None, false) => place,
+                    (None, true) => String::new(),
                 };
                 RowData {
                     title: row.name.clone(),
@@ -1041,6 +1216,7 @@ impl Palette {
                     shortcut: None,
                     indent: 0,
                     toggle: None,
+                    matched: Vec::new(),
                     item: Some(Item::Symbol(row)),
                 }
             })
@@ -1100,6 +1276,7 @@ impl Palette {
                     shortcut: None,
                     indent: 0,
                     toggle,
+                    matched: Vec::new(),
                     item: Some(Item::Setting(setting.id)),
                 },
             });
@@ -1130,6 +1307,7 @@ impl Palette {
                     shortcut: action.shortcut.clone(),
                     indent: 0,
                     toggle: None,
+                    matched: Vec::new(),
                     item: Some(Item::Action(action.id)),
                 },
             );
@@ -1151,6 +1329,7 @@ impl Palette {
                     shortcut: None,
                     indent: 0,
                     toggle: None,
+                    matched: Vec::new(),
                     item: Some(Item::NewAction(at)),
                 },
             );
@@ -1170,6 +1349,7 @@ impl Palette {
                     shortcut: tool.shortcut.clone(),
                     indent: 0,
                     toggle: None,
+                    matched: Vec::new(),
                     item: Some(Item::Tool(tool.id)),
                 },
             );
@@ -1194,6 +1374,7 @@ impl Palette {
                     shortcut: None,
                     indent: 0,
                     toggle,
+                    matched: Vec::new(),
                     item: Some(Item::Setting(setting.id)),
                 }
             })
@@ -1237,6 +1418,7 @@ impl Palette {
                         0
                     },
                     toggle: None,
+                    matched: Vec::new(),
                     item: Some(Item::Declaration {
                         offset: item.name_range.start,
                         visibility: item.visibility,
@@ -1278,6 +1460,7 @@ impl Palette {
                 shortcut: None,
                 indent: 0,
                 toggle: None,
+                matched: Vec::new(),
                 item: Some(Item::RunConfig(ranked.item.clone())),
             })
             .collect()
@@ -1285,6 +1468,33 @@ impl Palette {
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         self.rebuild_keeping(false, cx);
+    }
+
+    /// Marks the letters of every title that the query matched, so that the row shows them
+    /// in the accent colour. The same pass serves every tab of the popup.
+    fn mark_matches(&mut self) {
+        let pattern = match self.mode {
+            Mode::Everywhere(Tab::Actions)
+            | Mode::Structure
+            | Mode::RunAnything
+            | Mode::ChooseRun { .. } => self.query.text.trim().to_owned(),
+            _ => GotoQuery::parse(&self.query.text).pattern,
+        };
+        if pattern.is_empty() {
+            for row in &mut self.rows {
+                row.matched.clear();
+            }
+            return;
+        }
+        let mut matcher = NameMatcher::new();
+        matcher.set_pattern(&pattern);
+        let mut indices = Vec::new();
+        for row in &mut self.rows {
+            row.matched.clear();
+            if row.item.is_some() && matcher.indices(&row.title, &mut indices).is_some() {
+                row.matched = indices.iter().map(|&at| at as usize).collect();
+            }
+        }
     }
 
     /// Rows from a late answer: the row the user is on stays selected, even when the
@@ -1310,7 +1520,7 @@ impl Palette {
                 rows = if self.edited_only {
                     self.file_rows(cx, MAX_ROWS)
                 } else {
-                    self.switcher_rows(MAX_ROWS)
+                    self.switcher_rows(MAX_ROWS, cx)
                 };
                 rows.extend(self.tool_rows());
             }
@@ -1333,14 +1543,14 @@ impl Palette {
                         rows.extend(found);
                     };
                     if matches!(tab, Tab::All | Tab::Classes) && searching {
-                        group("Classes", self.symbol_rows(0, limit), &mut rows);
+                        group("Classes", self.symbol_rows(0, limit, true, cx), &mut rows);
                     }
                     if matches!(tab, Tab::All | Tab::Files) && (searching || tab == Tab::Files) {
                         group("Files", self.file_rows(cx, limit), &mut rows);
                     }
                     if matches!(tab, Tab::All | Tab::Symbols) && searching {
                         let at = usize::from(all);
-                        group("Symbols", self.symbol_rows(at, limit), &mut rows);
+                        group("Symbols", self.symbol_rows(at, limit, false, cx), &mut rows);
                     }
                     if matches!(tab, Tab::All | Tab::Actions) && searching {
                         if all {
@@ -1365,6 +1575,7 @@ impl Palette {
             }
         }
         self.rows = rows;
+        self.mark_matches();
         let first = self.first_selectable();
         self.selected = match previous.and_then(|item| {
             self.rows
@@ -1449,6 +1660,15 @@ impl Palette {
         self.rows
             .iter()
             .map(|row| (row.title.clone(), row.detail.clone()))
+            .collect()
+    }
+
+    /// The names of the rows with the character positions the query matched, for tests.
+    #[cfg(test)]
+    pub(crate) fn rows_matched(&self) -> Vec<(String, Vec<usize>)> {
+        self.rows
+            .iter()
+            .map(|row| (row.title.clone(), row.matched.clone()))
             .collect()
     }
 
@@ -2051,7 +2271,15 @@ impl Palette {
                         data.icon.is_empty() && matches!(data.item, Some(Item::Action(_))),
                         |this| this.child(div().size(px(ICON)).flex_none()),
                     )
-                    .child(data.title)
+                    .children(title_parts(&data.title, &data.matched).into_iter().map(
+                        |(text, hit)| {
+                            div()
+                                .when(hit, |this| {
+                                    this.text_color(theme.accent).font_weight(FontWeight::BOLD)
+                                })
+                                .child(text)
+                        },
+                    ))
                     .children(signature.map(|signature| {
                         div()
                             .debug_selector(move || format!("palette-signature-{index}"))

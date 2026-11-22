@@ -97,6 +97,27 @@ fn open_offline(
     (window, panel)
 }
 
+/// Hovers a row until its tooltip says `wanted`. Under the load of the whole suite a row
+/// can still move while the services answer, and the tooltip of the warm-up hover stays
+/// on screen; the row is hovered again from the toolbar once it stands still.
+fn hover_row(
+    cx: &mut TestAppContext,
+    window: WindowHandle<Workspace>,
+    selector: &'static str,
+    wanted: &str,
+) -> String {
+    let mut shown = String::new();
+    for _ in 0..5 {
+        wait_for_settled_bounds(cx, window, selector);
+        shown = hover(cx, window, selector).0;
+        if shown.contains(wanted) {
+            break;
+        }
+        hover(cx, window, "docker-toolbar-collapse");
+    }
+    shown
+}
+
 #[ui_kit::gpui::test]
 fn an_unreachable_cluster_has_no_branches_and_names_its_reason_in_a_tooltip(
     cx: &mut TestAppContext,
@@ -121,7 +142,7 @@ fn an_unreachable_cluster_has_no_branches_and_names_its_reason_in_a_tooltip(
     }
 
     // The reason is in the tooltip of the row.
-    let (shown, _) = hover(cx, window, "kube");
+    let shown = hover_row(cx, window, "kube", CLUSTER_REASON);
     assert!(
         shown.contains(CLUSTER_REASON),
         "the tooltip names the reason: {shown}"
@@ -147,7 +168,7 @@ fn a_stopped_docker_names_its_reason_on_the_right_with_a_retry(cx: &mut TestAppC
     let (window, panel) = open_offline(cx, "offline-docker", &docker_cli, &kubectl);
 
     // The row is short; the reason is in its tooltip.
-    let (shown, _) = hover(cx, window, "docker-daemon");
+    let shown = hover_row(cx, window, "docker-daemon", DOCKER_REASON);
     assert!(
         shown.contains(DOCKER_REASON),
         "the tooltip names the reason: {shown}"

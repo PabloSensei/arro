@@ -10,6 +10,8 @@ pub trait FuzzyMatcher {
     fn set_pattern(&mut self, pattern: &str);
     fn score(&mut self, candidate: &str) -> Option<u32>;
     fn indices(&mut self, candidate: &str, indices: &mut Vec<u32>) -> Option<u32>;
+    /// The kind of the match and its score, the way [`NameMatcher::classify`] gives them.
+    fn classify(&mut self, candidate: &str) -> Option<(MatchKind, u32)>;
 }
 
 /// How a query matches a candidate, the best kinds first. A list that has matches of a
@@ -131,6 +133,10 @@ impl FuzzyMatcher for NameMatcher {
         indices.sort_unstable();
         indices.dedup();
         Some(score + self.bonus(candidate))
+    }
+
+    fn classify(&mut self, candidate: &str) -> Option<(MatchKind, u32)> {
+        NameMatcher::classify(self, candidate)
     }
 }
 
@@ -321,9 +327,12 @@ fn fit(humps: &[String], lower: &[char], starts: &[usize], from: usize) -> bool 
 pub struct Ranked<T> {
     pub item: T,
     pub score: u32,
+    /// How the query matched the key, the better kinds first.
+    pub kind: MatchKind,
 }
 
-/// The best `limit` items, best first. Ties go to the shorter key, then alphabetically.
+/// The best `limit` items, best first: the better kind of a match, then the score, then
+/// the shorter key, then alphabetically.
 pub fn rank<T>(
     matcher: &mut dyn FuzzyMatcher,
     pattern: &str,
@@ -335,19 +344,28 @@ pub fn rank<T>(
     let mut found: Vec<Ranked<T>> = items
         .into_iter()
         .filter_map(|item| {
-            let score = matcher.score(key(&item))?;
-            Some(Ranked { item, score })
+            let (kind, score) = matcher.classify(key(&item))?;
+            Some(Ranked { item, score, kind })
         })
         .collect();
     found.sort_by(|a, b| {
         let (left, right) = (key(&a.item), key(&b.item));
-        b.score
-            .cmp(&a.score)
+        a.kind
+            .cmp(&b.kind)
+            .then_with(|| b.score.cmp(&a.score))
             .then(left.len().cmp(&right.len()))
             .then_with(|| left.cmp(right))
     });
     found.truncate(limit);
     found
+}
+
+/// Drops the matches of scattered letters when a row matches better: a list does not show
+/// the letters spread over a long name beside the names that begin with the query.
+pub fn retain_better_kinds<T>(rows: &mut Vec<Ranked<T>>) {
+    if rows.iter().any(|row| row.kind < MatchKind::Scattered) {
+        rows.retain(|row| row.kind < MatchKind::Scattered);
+    }
 }
 
 #[cfg(test)]

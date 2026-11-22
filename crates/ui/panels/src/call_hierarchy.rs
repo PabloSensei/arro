@@ -15,6 +15,7 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 use workspace::{CALL_HIERARCHY_TOOL, Workspace};
 
+use crate::hierarchy_scope::{HierarchyScope, ScopeRoots, header_controls};
 use crate::navigation;
 
 const GROUP: &str = "left-panel";
@@ -39,6 +40,8 @@ pub struct CallHierarchyPanel {
     support: Option<Arc<dyn LanguageSupport>>,
     spot: Option<DocumentSpot>,
     direction: CallDirection,
+    scope: HierarchyScope,
+    scope_roots: ScopeRoots,
     title: String,
     nodes: Vec<Node>,
     roots: Vec<usize>,
@@ -63,6 +66,8 @@ impl CallHierarchyPanel {
             support: None,
             spot: None,
             direction: CallDirection::Incoming,
+            scope: HierarchyScope::All,
+            scope_roots: ScopeRoots::default(),
             title: "Call Hierarchy".to_owned(),
             nodes: Vec::new(),
             roots: Vec::new(),
@@ -232,6 +237,22 @@ impl CallHierarchyPanel {
         self.load(cx);
     }
 
+    /// The button of the header: which folders of the project the rows come from. The filter
+    /// works over the rows that are already here, without a new request.
+    pub fn set_scope(&mut self, scope: HierarchyScope, cx: &mut Context<Self>) {
+        if self.scope == scope {
+            return;
+        }
+        self.scope = scope;
+        if self
+            .selected
+            .is_some_and(|selected| !self.visible().iter().any(|(index, _)| *index == selected))
+        {
+            self.selected = self.visible().first().map(|(index, _)| *index);
+        }
+        cx.notify();
+    }
+
     fn load(&mut self, cx: &mut Context<Self>) {
         let (Some(support), Some(spot)) = (self.support.clone(), self.spot.clone()) else {
             return;
@@ -376,24 +397,37 @@ impl CallHierarchyPanel {
         self.load_children(index, cx);
     }
 
-    /// The node indices on screen, depth first, and their depths.
+    /// The node indices on screen, depth first, and their depths. A row the scope hides takes
+    /// its whole branch with it, but the root stays: it is the function at the caret.
     fn visible(&self) -> Vec<(usize, usize)> {
-        fn add(nodes: &[Node], index: usize, found: &mut Vec<(usize, usize)>) {
-            let Some(node) = nodes.get(index) else {
+        fn add(panel: &CallHierarchyPanel, index: usize, found: &mut Vec<(usize, usize)>) {
+            let Some(node) = panel.nodes.get(index) else {
                 return;
             };
+            if node.depth > 0 && !panel.in_scope(node) {
+                return;
+            }
             found.push((index, node.depth));
             if node.expanded {
                 for child in &node.children {
-                    add(nodes, *child, found);
+                    add(panel, *child, found);
                 }
             }
         }
         let mut found = Vec::new();
         for root in &self.roots {
-            add(&self.nodes, *root, &mut found);
+            add(self, *root, &mut found);
         }
         found
+    }
+
+    /// Whether the scope keeps a call. The folders come from the model of the project, and a
+    /// call outside the project stays in every scope.
+    fn in_scope(&self, node: &Node) -> bool {
+        self.scope_roots.keeps(
+            self.scope,
+            node.item.place.as_ref().map(|place| place.uri.as_str()),
+        )
     }
 
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -505,6 +539,8 @@ impl Render for CallHierarchyPanel {
                 .ok();
         };
         let direction = self.direction;
+        self.scope_roots = ScopeRoots::from_model(cx);
+        let scope = self.scope;
         let rows: Vec<_> = self
             .visible()
             .into_iter()
@@ -550,6 +586,7 @@ impl Render for CallHierarchyPanel {
         let incoming = direction == CallDirection::Incoming;
         let switch = div()
             .flex()
+            .items_center()
             .gap_2()
             .px(px(ROW_MARGIN))
             .pb_1()
@@ -570,7 +607,17 @@ impl Render for CallHierarchyPanel {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.set_direction(CallDirection::Outgoing, cx)
                     })),
-            );
+            )
+            .child(div().flex_1())
+            .children(header_controls(
+                "call-hierarchy",
+                scope,
+                &theme,
+                cx,
+                Self::set_scope,
+                Self::expand_all,
+                Self::collapse_all,
+            ));
         island(&theme)
             .id("call-hierarchy-panel")
             .key_context("CallHierarchyPanel ToolWindow")

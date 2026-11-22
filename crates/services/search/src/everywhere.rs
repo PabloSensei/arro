@@ -73,6 +73,7 @@ fn search_tab(pattern: &str, tab: Tab, sources: &Sources, limit: usize) -> Vec<R
             .map(|ranked| Ranked {
                 item: Found::Symbol(ranked.item),
                 score: ranked.score,
+                kind: ranked.kind,
             })
             .collect()
     };
@@ -87,6 +88,7 @@ fn search_tab(pattern: &str, tab: Tab, sources: &Sources, limit: usize) -> Vec<R
                 .map(|ranked| Ranked {
                     item: Found::File(ranked.item),
                     score: ranked.score,
+                    kind: ranked.kind,
                 })
                 .collect()
         }
@@ -99,6 +101,7 @@ fn search_tab(pattern: &str, tab: Tab, sources: &Sources, limit: usize) -> Vec<R
                 .map(|ranked| Ranked {
                     item: Found::Action(ranked.item.id),
                     score: ranked.score,
+                    kind: ranked.kind,
                 })
                 .collect()
         }
