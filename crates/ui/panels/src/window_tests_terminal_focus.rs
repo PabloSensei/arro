@@ -10,7 +10,7 @@ use workspace::{PROJECT_TOOL, TERMINAL_TOOL, Workspace};
 use crate::terminal_panel::TerminalPanel;
 use crate::window_tests::{draw, open_path, press, wait_for_signal};
 use crate::window_tests_git::has_selector;
-use crate::window_tests_terminal_tabs::{open_terminal, print_line, session_of};
+use crate::window_tests_terminal_tabs::{open_terminal, session_of};
 
 /// The key of a test on this platform: the keymap of macOS binds the windows to Command.
 fn key_of(windows: &'static str, mac: &'static str) -> &'static str {
@@ -168,7 +168,31 @@ fn ctrl_c_from_the_terminal_goes_to_the_shell(cx: &mut TestAppContext) {
     });
 
     press(cx, window, "ctrl-c");
-    print_line(cx, &terminal, "after-cancel");
+    // A line typed while the shell still handles the interrupt can be dropped with the
+    // cancelled one, so the marker line is typed again until the shell prints it.
+    let printed = || {
+        session
+            .screen()
+            .lines()
+            .iter()
+            .any(|line| line.trim() == "after-cancel")
+    };
+    for _ in 0..10 {
+        session
+            .send(b"echo after-cancel\r".to_vec())
+            .expect("input");
+        let started = std::time::Instant::now();
+        while !printed() && started.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(50));
+            cx.run_until_parked();
+        }
+        if printed() {
+            break;
+        }
+    }
+    assert!(printed(), "the shell prints the line after Ctrl+C");
     assert!(
         !session
             .screen()
