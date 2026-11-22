@@ -194,6 +194,19 @@ impl Pick {
         }
     }
 
+    /// Whether the selected row marks the text in the editor: the expression or the
+    /// construct it would take, or the places an extract would replace.
+    pub fn marks_text(&self) -> bool {
+        match self {
+            Self::Expression { .. } | Self::Unwrap { .. } => true,
+            Self::Action(entry) => entry
+                .code
+                .as_deref()
+                .is_some_and(|code| code.starts_with("refactor.extract.variable")),
+            _ => false,
+        }
+    }
+
     /// The section a row belongs to. A correction of a misspelled word is a quick fix;
     /// everything the editor adds itself, such as Create Test, is an intention.
     fn section(&self) -> MenuSection {
@@ -326,6 +339,12 @@ const IMPORTING_ACTIONS: &str = "More actions after the project is imported";
 
 /// Fix all found no fix it could apply to every place of the check.
 const NO_FIX_ALL: &str = "The language gave no fix for every place of the check";
+
+/// The byte range a span of the text covers.
+fn expression_range(store: &RopeStore, span: TextSpan) -> Range<usize> {
+    let start = offset_at(store, span.start);
+    start..offset_at(store, span.end).max(start)
+}
 
 /// Whole-word occurrences of `needle` in `text`, in text order.
 pub(crate) fn word_ranges(text: &str, needle: &str) -> Vec<Range<usize>> {
@@ -1443,6 +1462,8 @@ impl EditorView {
                     let selected = menu.selected;
                     menu.rows.swap_remove(selected)
                 });
+                // The marks of the list belong to the choice it made.
+                lsp.highlights.clear();
                 let version = self.state.as_ref().map(|state| state.version() as i32);
                 match (picked, version) {
                     (Some(Pick::Action(entry)), Some(version)) => {
@@ -1513,8 +1534,9 @@ impl EditorView {
         true
     }
 
-    /// Marks the text an Unwrap choice leaves in place, so the pick list shows what
-    /// stays before Enter applies it.
+    /// Marks the text a pick list choice would take, so the list shows what it acts on
+    /// before Enter applies it: the construct an Unwrap leaves, or the expression an
+    /// extract takes.
     pub(crate) fn highlight_action_row(&mut self) {
         let Some(lsp) = &mut self.lsp else {
             return;
@@ -1522,10 +1544,45 @@ impl EditorView {
         let Some(menu) = &lsp.actions else {
             return;
         };
-        let Some(Pick::Unwrap { edit, .. }) = menu.rows.get(menu.selected) else {
+        let Some(pick) = menu.rows.get(menu.selected) else {
             return;
         };
-        lsp.highlights = std::iter::once(edit.start..edit.end).collect();
+        let uri = lsp.uri.clone();
+        let ranges: Vec<Range<usize>> = match pick {
+            Pick::Unwrap { edit, .. } => std::iter::once(edit.start..edit.end).collect(),
+            Pick::Expression { span, .. } => {
+                let Some(state) = &self.state else {
+                    return;
+                };
+                let store = state.store();
+                std::iter::once(expression_range(&store, *span)).collect()
+            }
+            // An extract of a value replaces the expression at this place or at every
+            // place: the list shows the places the selected row would change.
+            Pick::Action(entry)
+                if entry
+                    .code
+                    .as_deref()
+                    .is_some_and(|code| code.starts_with("refactor.extract.variable")) =>
+            {
+                let Some(state) = &self.state else {
+                    return;
+                };
+                let store = state.store();
+                entry
+                    .edits
+                    .iter()
+                    .filter(|source| source.uri == uri)
+                    .flat_map(|source| &source.edits)
+                    .filter(|edit| edit.span.start != edit.span.end)
+                    .map(|edit| expression_range(&store, edit.span))
+                    .collect()
+            }
+            _ => return,
+        };
+        if !ranges.is_empty() {
+            lsp.highlights = ranges;
+        }
     }
 
     /// Ctrl+Shift+F7: shows every occurrence of the thing under the caret, from the

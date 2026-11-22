@@ -53,6 +53,16 @@ pub(crate) fn show_dialog(
         .try_global::<workspace::Settings>()
         .cloned()
         .unwrap_or_default();
+    // Selected text is offered only while the active editor has a selection, and the dialog
+    // starts on it then. The remembered scope still decides what Ctrl+Alt+L formats.
+    let has_selection = workspace
+        .active_view()
+        .and_then(|view| view.downcast::<EditorView>().ok())
+        .is_some_and(|view| {
+            view.read(cx)
+                .selection()
+                .is_some_and(|(range, _)| !range.is_empty())
+        });
     let weak = cx.weak_entity();
     let view = cx.new(|cx| ReformatDialog {
         workspace: weak,
@@ -60,22 +70,38 @@ pub(crate) fn show_dialog(
         path,
         optimize: settings.reformat_optimize_imports,
         only_changed: settings.reformat_only_changed,
-        selection: settings.reformat_selection,
+        has_selection,
+        selection: has_selection,
     });
     let focus = view.read(cx).focus.clone();
     workspace.show_overlay(view.into(), focus, window, cx);
 }
 
-struct ReformatDialog {
+pub(crate) struct ReformatDialog {
     workspace: WeakEntity<Workspace>,
     focus: FocusHandle,
     path: PathBuf,
     optimize: bool,
     only_changed: bool,
+    /// Whether the active editor has a selection. Selected text is offered only then.
+    has_selection: bool,
+    /// Whether the scope is the selection. It stays false while there is no selection.
     selection: bool,
 }
 
 impl ReformatDialog {
+    /// The title of the dialog bar, for tests.
+    #[cfg(test)]
+    pub(crate) fn title(&self) -> String {
+        dialog_title(&self.path)
+    }
+
+    /// Whether Selected text is offered, and whether it is the scope, for tests.
+    #[cfg(test)]
+    pub(crate) fn scope(&self) -> (bool, bool) {
+        (self.has_selection, self.selection && self.has_selection)
+    }
+
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.workspace
             .update(cx, |workspace, cx| workspace.dismiss(window, cx))
@@ -83,15 +109,23 @@ impl ReformatDialog {
     }
 
     fn accept(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (optimize, only_changed, selection) =
-            (self.optimize, self.only_changed, self.selection);
+        let (optimize, only_changed, selection, offered) = (
+            self.optimize,
+            self.only_changed,
+            self.selection,
+            self.has_selection,
+        );
         self.workspace
             .update(cx, |workspace, cx| {
                 workspace.update_settings(
                     |settings| {
                         settings.reformat_optimize_imports = optimize;
                         settings.reformat_only_changed = only_changed;
-                        settings.reformat_selection = selection;
+                        // A scope the dialog did not offer keeps the remembered one, which
+                        // Ctrl+Alt+L uses in a file that has a selection.
+                        if offered {
+                            settings.reformat_selection = selection;
+                        }
                     },
                     cx,
                 );
@@ -118,12 +152,19 @@ impl ReformatDialog {
     }
 }
 
+/// The title of the Reformat File dialog: the name of the file, without the folders above it.
+fn dialog_title(path: &Path) -> String {
+    match path.file_name() {
+        Some(name) => format!("Reformat File: {}", name.to_string_lossy()),
+        None => "Reformat File".to_owned(),
+    }
+}
+
 impl Render for ReformatDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let left = (window.viewport_size().width - px(WIDTH)) / 2.;
         let top = window.viewport_size().height * 0.2;
-        let path = self.path.display().to_string();
         let check = |id: &'static str, on: bool, label: &'static str| {
             div()
                 .id(id)
@@ -138,7 +179,8 @@ impl Render for ReformatDialog {
                 .child(checkbox(on, &theme))
                 .child(label)
         };
-        let radio = |id: &'static str, on: bool, label: &'static str| {
+        // An unavailable radio is drawn in the disabled colour and takes no hover.
+        let radio = |id: &'static str, on: bool, label: &'static str, enabled: bool| {
             div()
                 .id(id)
                 .debug_selector(move || id.to_owned())
@@ -148,10 +190,14 @@ impl Render for ReformatDialog {
                 .h(px(ROW_HEIGHT))
                 .px(px(ROW_PADDING_X))
                 .rounded(px(ROW_RADIUS))
-                .hover(|style| style.bg(theme.selection_hover))
+                .when(enabled, |this| {
+                    this.hover(|style| style.bg(theme.selection_hover))
+                })
+                .when(!enabled, |this| this.text_color(theme.text_disabled))
                 .child(if on { "●" } else { "○" })
                 .child(label)
         };
+        let selection_on = self.selection && self.has_selection;
         let shell = surface(&theme)
             .id("reformat-dialog")
             .debug_selector(|| "reformat-dialog".to_owned())
@@ -164,18 +210,6 @@ impl Render for ReformatDialog {
             .min_h_0()
             .p(px(DIALOG_PADDING))
             .gap(px(DIALOG_GAP))
-            .child(
-                div()
-                    .debug_selector(|| "reformat-title".to_owned())
-                    .flex()
-                    .flex_col()
-                    .gap(px(SPACE_XS))
-                    .child(
-                        div()
-                            .text_color(theme.text_secondary)
-                            .child(SharedString::from(path)),
-                    ),
-            )
             .child(
                 div()
                     .flex()
@@ -207,15 +241,22 @@ impl Render for ReformatDialog {
                     .gap(px(SPACE_XS))
                     .child(div().text_color(theme.text_secondary).child("Scope"))
                     .child(
-                        radio("reformat-selected", self.selection, "Selected text").on_click(
-                            cx.listener(|this, _, _, cx| {
+                        radio(
+                            "reformat-selected",
+                            selection_on,
+                            "Selected text",
+                            self.has_selection,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            // Without a selection in the editor there is nothing to choose.
+                            if this.has_selection {
                                 this.selection = true;
                                 cx.notify();
-                            }),
-                        ),
+                            }
+                        })),
                     )
                     .child(
-                        radio("reformat-whole-file", !self.selection, "Whole file").on_click(
+                        radio("reformat-whole-file", !selection_on, "Whole file", true).on_click(
                             cx.listener(|this, _, _, cx| {
                                 this.selection = false;
                                 cx.notify();
@@ -253,7 +294,7 @@ impl Render for ReformatDialog {
         dialog_window(
             DialogSpec {
                 key: "reformat-file",
-                title: "Reformat File".into(),
+                title: dialog_title(&self.path).into(),
                 extra: None,
                 place: DialogPlace {
                     left: f32::from(left),

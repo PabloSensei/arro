@@ -104,6 +104,23 @@ fn name_at(text: &str, position: &RenamePosition) -> Option<String> {
     text.get(start..end).map(str::to_owned)
 }
 
+/// The one line a list shows for an expression: its text with the runs of spaces and
+/// the line breaks of a multi-line expression folded into single spaces.
+fn expression_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The places an extract action replaces. The declaration it inserts is a place with
+/// no text, not an occurrence it replaces.
+fn replaced_places(entry: &ActionEntry) -> usize {
+    entry
+        .edits
+        .iter()
+        .flat_map(|source| &source.edits)
+        .filter(|edit| edit.span.start != edit.span.end)
+        .count()
+}
+
 /// The text of the file after the edits of the entry, or `None` when the entry has no
 /// edits for it.
 fn text_after(entry: &ActionEntry, uri: &str, text: &str) -> Option<String> {
@@ -2513,7 +2530,8 @@ impl EditorView {
                     return;
                 };
                 let text = state.text();
-                let found: Vec<(String, TextSpan)> = entries
+                let store = state.store();
+                let mut found: Vec<(String, TextSpan, usize)> = entries
                     .into_iter()
                     .filter(|entry| entry.length > 0)
                     .filter_map(|entry| {
@@ -2522,25 +2540,41 @@ impl EditorView {
                         Some((
                             entry.name,
                             TextSpan {
-                                start: point_at(&state.store(), start),
-                                end: point_at(&state.store(), end),
+                                start: point_at(&store, start),
+                                end: point_at(&store, end),
                             },
+                            end.saturating_sub(start),
                         ))
                     })
                     .collect();
-                match found.as_slice() {
-                    [] => this.refactor_span(refactoring, span, cx),
-                    [(_, found)] => this.refactor_span(refactoring, *found, cx),
+                // The expressions around the caret are nested: the innermost is the
+                // shortest, and IDEA lists it first.
+                found.sort_by_key(|(_, _, length)| *length);
+                found.dedup_by(|a, b| a.1 == b.1);
+                match found.len() {
+                    0 => this.refactor_span(refactoring, span, cx),
+                    1 => {
+                        let (_, found, _) = found.remove(0);
+                        this.refactor_span(refactoring, found, cx);
+                    }
                     _ => {
                         let rows = found
                             .into_iter()
-                            .map(|(label, span)| Pick::Expression {
-                                label,
+                            .map(|(label, span, _)| Pick::Expression {
+                                label: expression_line(&label),
                                 span,
                                 refactoring,
                             })
                             .collect();
                         this.show_picks(caret, rows, refactoring.missing(), cx);
+                        if let Some(menu) = this.lsp.as_mut().and_then(|lsp| lsp.actions.as_mut()) {
+                            menu.title = Some("Expressions");
+                        }
+                        if let Some(lsp) = &mut this.lsp {
+                            lsp.highlights.clear();
+                        }
+                        this.highlight_action_row();
+                        cx.notify();
                     }
                 }
             })
@@ -2588,6 +2622,29 @@ impl EditorView {
                                 .as_deref()
                                 .is_some_and(|code| code.starts_with("refactor.extract.variable"))
                         });
+                    if replacing {
+                        let all = found
+                            .iter()
+                            .position(|entry| entry.title.to_lowercase().contains("all"));
+                        let places = all.map_or(0, |row| replaced_places(&found[row]));
+                        if places == 1 {
+                            // One occurrence has no choice to make: the row of this
+                            // place runs and the name of the new variable is typed
+                            // over, as IDEA goes straight to the name.
+                            let this_row = found
+                                .iter()
+                                .position(|entry| !entry.title.to_lowercase().contains("all"))
+                                .or(all)
+                                .unwrap_or(0);
+                            let entry = found.swap_remove(this_row);
+                            if let Some(handle) = entry.handle {
+                                cx.emit(EditorEvent::RefactorForm(handle));
+                                return;
+                            }
+                            this.apply_entry_labeled(version, entry, Some(refactoring.label()), cx);
+                            return;
+                        }
+                    }
                     let mut all = false;
                     let rows = found
                         .into_iter()
@@ -2600,15 +2657,7 @@ impl EditorView {
                                 }
                                 all |= every;
                                 entry.title = if every {
-                                    // The declaration the extract inserts is a place
-                                    // without text, not an occurrence it replaces.
-                                    let places: usize = entry
-                                        .edits
-                                        .iter()
-                                        .flat_map(|source| &source.edits)
-                                        .filter(|edit| edit.span.start != edit.span.end)
-                                        .count();
-                                    format!("Replace all {places} occurrences")
+                                    format!("Replace all {} occurrences", replaced_places(&entry))
                                 } else {
                                     "Replace this occurrence only".to_owned()
                                 };
@@ -2626,6 +2675,13 @@ impl EditorView {
                         })
                         .collect();
                     this.show_picks(caret, rows, refactoring.missing(), cx);
+                    if replacing {
+                        if let Some(menu) = this.lsp.as_mut().and_then(|lsp| lsp.actions.as_mut()) {
+                            menu.title = Some("Multiple occurrences found");
+                        }
+                        this.highlight_action_row();
+                        cx.notify();
+                    }
                 }
             }
         });

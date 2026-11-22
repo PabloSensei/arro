@@ -51,11 +51,18 @@ pub struct CommitChange {
 }
 
 /// What the details pane of the log shows about one commit besides the fields of
-/// [`Commit`]: the whole message and the branches the commit belongs to.
+/// [`Commit`]: the whole message, the person who committed it and the branches the commit
+/// belongs to.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CommitDetails {
     /// The message without its trailing line ends.
     pub message: String,
+    /// The name of the person who committed it, which differs from the author after an
+    /// amend or a rebase by another person.
+    pub committer: String,
+    pub committer_email: String,
+    /// Seconds since 1970, the time the commit itself was made.
+    pub committer_time: i64,
     /// The local and remote branches whose history contains the commit.
     pub branches: Vec<String>,
 }
@@ -1423,10 +1430,17 @@ impl Repository {
         Ok(commits_of(&output))
     }
 
-    /// The whole message of a commit and the branches whose history contains it, for the
-    /// details pane of the log.
+    /// The whole message of a commit, the person who committed it and the branches whose
+    /// history contains it, for the details pane of the log. The message, which may hold
+    /// any text, comes after the fields of the committer, so the fields are one record of
+    /// their own.
     pub fn commit_details(&self, commit: &str) -> io::Result<CommitDetails> {
-        let message = self.run(["show", "-s", "--format=%B", commit])?;
+        let output = self.run(["show", "-s", "--format=%cn%x1f%ce%x1f%ct%x1e%B", commit])?;
+        let (fields, message) = output.split_once(RECORD).unwrap_or(("", output.as_str()));
+        let mut fields = fields.split(FIELD);
+        let committer = fields.next().unwrap_or_default().to_owned();
+        let committer_email = fields.next().unwrap_or_default().to_owned();
+        let committer_time = fields.next().and_then(|time| time.trim().parse().ok());
         let branches = self.run([
             "branch",
             "--all",
@@ -1444,6 +1458,9 @@ impl Repository {
         branches.dedup();
         Ok(CommitDetails {
             message: message.trim_end_matches(['\r', '\n']).to_owned(),
+            committer,
+            committer_email,
+            committer_time: committer_time.unwrap_or_default(),
             branches,
         })
     }

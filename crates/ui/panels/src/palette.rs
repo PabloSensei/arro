@@ -2261,7 +2261,12 @@ impl Palette {
                     .items_center()
                     .gap(px(SPACE_S))
                     .when(!data.icon.is_empty(), |this| {
-                        this.child(icon(data.icon, theme))
+                        this.child(
+                            div()
+                                .debug_selector(move || format!("palette-icon-{index}"))
+                                .flex_none()
+                                .child(icon(data.icon, theme)),
+                        )
                     })
                     // The mark of the visibility stands beside the icon of the kind.
                     .when(!badge.is_empty(), |this| {
@@ -2278,13 +2283,24 @@ impl Palette {
                         data.icon.is_empty() && matches!(data.item, Some(Item::Action(_))),
                         |this| this.child(div().size(px(ICON)).flex_none()),
                     )
-                    .child(title_text(&data.title, &data.matched, theme))
-                    .children(signature.map(|signature| {
+                    // The name and its signature stand together, as IDEA draws them: the gap of
+                    // the row separates the icon from the name, and no gap comes after the name.
+                    .child(
                         div()
-                            .debug_selector(move || format!("palette-signature-{index}"))
-                            .text_color(theme.text_secondary)
-                            .child(signature)
-                    })),
+                            .flex()
+                            .items_center()
+                            .child(
+                                div()
+                                    .debug_selector(move || format!("palette-title-{index}"))
+                                    .child(title_text(&data.title, &data.matched, theme)),
+                            )
+                            .children(signature.map(|signature| {
+                                div()
+                                    .debug_selector(move || format!("palette-signature-{index}"))
+                                    .text_color(theme.text_secondary)
+                                    .child(signature)
+                            })),
+                    ),
             )
             .child(right)
     }

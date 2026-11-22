@@ -2378,3 +2378,15 @@ mod window_tests_alt_enter_kinds;
 
 #[cfg(test)]
 mod window_tests_definition;
+
+#[cfg(test)]
+mod window_tests_caret_restore;
+
+#[cfg(test)]
+mod window_tests_signature_gap_reformat;
+
+#[cfg(test)]
+mod window_tests_git_log_details;
+
+#[cfg(test)]
+mod window_tests_introduce_variable;

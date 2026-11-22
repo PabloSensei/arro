@@ -45,7 +45,10 @@ fn owner_file() -> String {
 
 /// A window on the file of the class, with the declarations read by the language of the
 /// application: the signatures and the visibility come from the tree of the file.
-fn owner_window(cx: &mut TestAppContext, name: &str) -> (PathBuf, WindowHandle<Workspace>) {
+pub(crate) fn owner_window(
+    cx: &mut TestAppContext,
+    name: &str,
+) -> (PathBuf, WindowHandle<Workspace>) {
     let root = scratch(name);
     let source = root.join("src").join(owner_file());
     fs::create_dir_all(source.parent().unwrap()).unwrap();
@@ -64,7 +67,10 @@ fn owner_window(cx: &mut TestAppContext, name: &str) -> (PathBuf, WindowHandle<W
     (source, window)
 }
 
-fn palette(cx: &TestAppContext, window: WindowHandle<Workspace>) -> gpui::Entity<Palette> {
+pub(crate) fn palette(
+    cx: &TestAppContext,
+    window: WindowHandle<Workspace>,
+) -> gpui::Entity<Palette> {
     let view = window
         .read_with(cx, |workspace, _| workspace.overlay_view())
         .unwrap()

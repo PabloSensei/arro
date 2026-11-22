@@ -1213,6 +1213,8 @@ pub struct EditorView {
     pub(crate) usages: Option<Vec<std::ops::Range<usize>>>,
     /// A `go_to` that came before the file was read.
     pending_spot: Option<Spot>,
+    /// The command that came before the file was read; `loaded` runs it once the text is there.
+    pending_action: Option<String>,
     /// The buffer rows the last inlay question covered, so a scroll asks only when
     /// another part of the document shows.
     pub(crate) inlay_range: Option<(usize, usize)>,
@@ -1797,6 +1799,7 @@ impl EditorView {
             hippie: None,
             usages: None,
             pending_spot: None,
+            pending_action: None,
             inlay_range: None,
             inlays_task: None,
             completion_task: None,
@@ -1929,6 +1932,8 @@ impl EditorView {
         self.reveal_center = true;
         self.caret_on = true;
         self.inlays_if_needed(cx);
+        // The status line shows the caret and redraws only on this event.
+        cx.emit(EditorEvent::Moved);
         cx.notify();
     }
 
@@ -2427,6 +2432,23 @@ impl EditorView {
         self.lsp.as_ref()?.actions.as_ref()?.title
     }
 
+    /// The place the selected row of an open list marks in the text, such as the
+    /// expression an extract takes. A test reads it; nothing else does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn action_highlight(&self) -> Option<std::ops::Range<usize>> {
+        self.action_highlights()?.into_iter().next()
+    }
+
+    /// The places the selected row of an open list marks in the text: one expression,
+    /// or every occurrence an extract would replace. A test reads them; nothing else
+    /// does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn action_highlights(&self) -> Option<Vec<std::ops::Range<usize>>> {
+        let lsp = self.lsp.as_ref()?;
+        lsp.actions.as_ref()?;
+        Some(lsp.highlights.clone())
+    }
+
     /// The rows of an open list above which a separator is drawn, counted from zero. A test
     /// reads them; nothing else does.
     #[cfg(any(test, feature = "test-support"))]
@@ -2683,10 +2705,15 @@ impl EditorView {
                 }
                 self.remember_text(cx);
                 cx.emit(EditorEvent::Loaded);
+                // A command that came before the text runs now, at the place the file opens at.
+                if let Some(action) = self.pending_action.take() {
+                    self.run(&action, cx);
+                }
             }
             Err(LoadError(message)) => {
                 let message: SharedString = message.into();
                 self.failed = Some(message.clone());
+                self.pending_action = None;
                 cx.emit(EditorEvent::Failed(message));
             }
         }
@@ -2943,11 +2970,15 @@ impl EditorView {
     }
 
     /// Where the caret goes once the file is read: a restored session, a jump from a list.
+    /// A file that is read already moves the caret now, and the status line shows it.
     pub fn restore_caret(&mut self, line: usize, column: usize, cx: &mut Context<Self>) {
         match &mut self.state {
             Some(state) => {
                 state.set_caret(line, column);
                 self.autoscroll = true;
+                self.caret_on = true;
+                // The status line shows the caret and redraws only on this event.
+                cx.emit(EditorEvent::Moved);
                 cx.notify();
             }
             None => self.pending_caret = Some((line, column)),
@@ -4555,6 +4586,18 @@ impl EditorView {
         self.on_key(event, window, cx);
     }
 
+    /// The commands that read the caret or the text to act on it. Pressed before the file is
+    /// read, they wait for the text instead of finding nothing to act on.
+    fn waits_for_text(action: &str) -> bool {
+        matches!(
+            action,
+            actions::RENAME
+                | actions::SHOW_ACTIONS
+                | actions::EXTRACT_VARIABLE
+                | actions::GOTO_DECLARATION
+        )
+    }
+
     /// Runs a keymap action.
     pub fn run(&mut self, action: &str, cx: &mut Context<Self>) {
         // A refactoring of several files is one step of the window's history: this file
@@ -4569,6 +4612,12 @@ impl EditorView {
             && let Some(group) = self.workspace_redo()
         {
             cx.emit(EditorEvent::RedoRefactoring(group));
+            return;
+        }
+        // Before the file is read there is no place to act on: a command that reads the caret
+        // or the text waits for the text, and `loaded` runs it then.
+        if !self.is_loaded() && Self::waits_for_text(action) {
+            self.pending_action = Some(action.to_owned());
             return;
         }
         // A command counts its edits from the carets and folds here, so the changes of

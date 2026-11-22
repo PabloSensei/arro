@@ -84,7 +84,7 @@ fn the_dialogs_keep_the_padding_and_one_button_height(cx: &mut TestAppContext) {
     press(cx, window, "ctrl-alt-shift-l");
     draw(cx, window);
     let dialog = bounds_of(cx, window, "reformat-dialog");
-    let title = bounds_of(cx, window, "reformat-title");
+    let title = bounds_of(cx, window, "reformat-file-title");
     assert_eq!(
         title.left() - dialog.left(),
         px(DIALOG_PADDING + FRAME),

@@ -273,7 +273,17 @@ impl EditorView {
         match top {
             Popup::Actions => {
                 if let Some(lsp) = &mut self.lsp {
+                    // The mark of a preview goes with the list it belongs to. A usage
+                    // highlight of Ctrl+Shift+F7 stays under the other lists.
+                    let marked = lsp.actions.as_ref().is_some_and(|menu| {
+                        menu.rows
+                            .get(menu.selected)
+                            .is_some_and(crate::actions::Pick::marks_text)
+                    });
                     lsp.actions = None;
+                    if marked {
+                        lsp.highlights.clear();
+                    }
                 }
             }
             Popup::Note => {

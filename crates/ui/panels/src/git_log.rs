@@ -342,6 +342,8 @@ pub struct GitLogPanel {
     /// The message and the branches of the selected commit.
     details: Option<CommitDetails>,
     details_loading: bool,
+    /// The branch line of the details lists every branch rather than the first five.
+    branches_expanded: bool,
     scroll_commits: ScrollHandle,
     scroll_files: ScrollHandle,
     scroll_details: ScrollHandle,
@@ -436,6 +438,7 @@ impl GitLogPanel {
                 more: false,
                 details: None,
                 details_loading: false,
+                branches_expanded: false,
                 scroll_commits: ScrollHandle::new(),
                 scroll_files: ScrollHandle::new(),
                 scroll_details: ScrollHandle::new(),
@@ -559,6 +562,7 @@ impl GitLogPanel {
         self.anchor = None;
         self.selected_file = None;
         self.details = None;
+        self.branches_expanded = false;
         self.offset = 0;
         self.more = false;
     }
@@ -572,6 +576,7 @@ impl GitLogPanel {
         self.selected_file = None;
         self.files.clear();
         self.details = None;
+        self.branches_expanded = false;
         self.want = None;
         self.reload(cx);
         cx.notify();
@@ -774,6 +779,7 @@ impl GitLogPanel {
                         this.selected_file = None;
                         this.files.clear();
                         this.details = None;
+                        this.branches_expanded = false;
                         this.apply_filter();
                         if let Some(want) = this.want.take()
                             && let Some(index) = this
@@ -932,6 +938,7 @@ impl GitLogPanel {
             self.selected_file = None;
             self.files.clear();
             self.details = None;
+            self.branches_expanded = false;
         }
     }
 
@@ -1102,6 +1109,7 @@ impl GitLogPanel {
         self.selected_file = None;
         self.files.clear();
         self.details = None;
+        self.branches_expanded = false;
         self.files_loading = true;
         self.details_loading = true;
         let Some(repo) = self.git.read(cx).repo() else {
@@ -1907,6 +1915,7 @@ impl GitLogPanel {
                 self.selected_file = None;
                 self.files.clear();
                 self.details = None;
+                self.branches_expanded = false;
                 if let Some(next) = self.picked.iter().min().copied() {
                     self.select_row(next, cx);
                 }
@@ -2013,9 +2022,9 @@ impl GitLogPanel {
         let commit = self.selected_commit()?;
         let mut text = format!("{}\n\n{}", commit.subject, commit.id);
         if let Some(details) = &self.details {
-            if details.message != commit.subject {
+            if let Some(body) = message_body(&details.message) {
                 text.push_str("\n\n");
-                text.push_str(&details.message);
+                text.push_str(body);
             }
             if !details.branches.is_empty() {
                 text.push_str(&format!(
@@ -2277,6 +2286,50 @@ impl GitLogPanel {
     #[cfg(test)]
     pub fn details(&self) -> Option<&CommitDetails> {
         self.details.as_ref()
+    }
+
+    /// The body of the message as the details pane draws it, `None` when the message has
+    /// only its subject, for a test.
+    #[cfg(test)]
+    pub fn details_body(&self) -> Option<String> {
+        self.details
+            .as_ref()
+            .and_then(|details| message_body(&details.message))
+            .map(str::to_owned)
+    }
+
+    /// The branch line of the details pane, with every branch it lists and the count of
+    /// the rest, for a test.
+    #[cfg(test)]
+    pub fn details_branch_line(&self) -> Option<String> {
+        let details = self.details.as_ref()?;
+        let (line, hidden) = branch_summary(&details.branches, self.branches_expanded);
+        Some(match hidden {
+            Some(hidden) => format!("{line} and {hidden} more"),
+            None => line,
+        })
+    }
+
+    /// The short hash of the details pane, for a test.
+    #[cfg(test)]
+    pub fn details_hash(&self) -> Option<String> {
+        self.selected_commit()
+            .map(|commit| short_commit(&commit.id))
+    }
+
+    /// The author line of the details pane, for a test.
+    #[cfg(test)]
+    pub fn details_identity(&self) -> Option<String> {
+        self.selected_commit().map(|commit| identity_line(&commit))
+    }
+
+    /// The line about the committer of the details pane, `None` when the author and the
+    /// committer are the same person, for a test.
+    #[cfg(test)]
+    pub fn details_committer_line(&self) -> Option<String> {
+        let commit = self.selected_commit()?;
+        let details = self.details.as_ref()?;
+        committer_line(details, &commit)
     }
 
     /// How many commits of the history are loaded, for a test.
@@ -2819,56 +2872,105 @@ impl GitLogPanel {
                 )
                 .into_any_element();
         };
-        let message = self
+        let body = self
             .details
             .as_ref()
-            .map(|details| details.message.clone())
-            .filter(|message| !message.is_empty())
-            .unwrap_or_else(|| commit.subject.clone());
-        let branches = self
-            .details
-            .as_ref()
-            .map(|details| details.branches.clone())
-            .unwrap_or_default();
-        let branches = if branches.is_empty() {
-            "In 0 branches".to_owned()
-        } else {
-            format!("In {} branches: {}", branches.len(), branches.join(", "))
-        };
-        let rows = vec![
+            .and_then(|details| message_body(&details.message));
+        let mut rows = vec![
             div()
                 .text_size(px(TEXT_TITLE))
-                .font_weight(FontWeight::MEDIUM)
+                .font_weight(FontWeight::SEMIBOLD)
                 .debug_selector(|| "log-details-subject".to_owned())
                 .child(commit.subject.clone())
                 .into_any_element(),
+        ];
+        if let Some(body) = body {
+            let lines: Vec<AnyElement> = body
+                .split('\n')
+                .enumerate()
+                .map(|(index, line)| self.message_line(index, line, theme, cx))
+                .collect();
+            rows.push(
+                div()
+                    .debug_selector(|| "log-details-message".to_owned())
+                    .flex()
+                    .flex_col()
+                    .gap(px(SPACE_XS))
+                    .w_full()
+                    .children(lines)
+                    .into_any_element(),
+            );
+        }
+        let short = short_commit(&commit.id);
+        let copied = commit.id.clone();
+        let hash = div()
+            .id("log-details-hash")
+            .font_family(MONO_FONT)
+            .text_color(theme.link)
+            .cursor_pointer()
+            .debug_selector(|| "log-details-hash".to_owned())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()));
+                this.workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.notify_user("Copied", copied.clone(), cx)
+                    })
+                    .ok();
+            }))
+            .child(short);
+        rows.push(
             div()
-                .debug_selector(|| "log-details-message".to_owned())
-                .whitespace_normal()
-                .child(message)
+                .flex()
+                .items_center()
+                .gap(px(SPACE_S))
+                .child(hash)
+                .child(
+                    div()
+                        .text_color(theme.text_secondary)
+                        .debug_selector(|| "log-details-author".to_owned())
+                        .child(identity_line(&commit)),
+                )
                 .into_any_element(),
-            div()
-                .font_family(MONO_FONT)
-                .text_color(theme.link)
-                .debug_selector(|| "log-details-hash".to_owned())
-                .child(commit.id.clone())
-                .into_any_element(),
-            div()
-                .text_color(theme.text_secondary)
-                .debug_selector(|| "log-details-author".to_owned())
-                .child(format!("{} <{}>", commit.author, commit.email))
-                .into_any_element(),
-            div()
-                .text_color(theme.text_secondary)
-                .debug_selector(|| "log-details-date".to_owned())
-                .child(format!("{} {}", date_of(commit.time), time_of(commit.time)))
-                .into_any_element(),
-            div()
+        );
+        if let Some(line) = self
+            .details
+            .as_ref()
+            .and_then(|details| committer_line(details, &commit))
+        {
+            rows.push(
+                div()
+                    .text_color(theme.text_secondary)
+                    .debug_selector(|| "log-details-committer".to_owned())
+                    .child(line)
+                    .into_any_element(),
+            );
+        }
+        if let Some(details) = &self.details {
+            let (line, hidden) = branch_summary(&details.branches, self.branches_expanded);
+            let mut branches = div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(SPACE_XS))
                 .text_color(theme.text_secondary)
                 .debug_selector(|| "log-details-branches".to_owned())
-                .child(branches)
-                .into_any_element(),
-        ];
+                .child(line);
+            if let Some(hidden) = hidden {
+                branches = branches.child(
+                    div()
+                        .id("log-details-branches-more")
+                        .debug_selector(|| "log-details-branches-more".to_owned())
+                        .cursor_pointer()
+                        .text_color(theme.link)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.branches_expanded = true;
+                            cx.notify();
+                        }))
+                        .child(format!("and {hidden} more")),
+                );
+            }
+            rows.push(branches.into_any_element());
+        }
         div()
             .id("log-details")
             .debug_selector(|| "log-details".to_owned())
@@ -2899,6 +3001,41 @@ impl GitLogPanel {
                 .min_h_0(),
             )
             .into_any_element()
+    }
+
+    /// One line of the body of the commit message: its words with a web address opening
+    /// in the browser.
+    fn message_line(
+        &self,
+        line_index: usize,
+        line: &str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .w_full()
+            .min_w_0()
+            .min_h(px(TEXT_SMALL));
+        for (index, (text, url)) in message_parts(line).into_iter().enumerate() {
+            let mut cell = div()
+                .id(("log-details-word", line_index * 10_000 + index))
+                .flex_none()
+                .whitespace_nowrap()
+                .child(text);
+            if let Some(url) = url {
+                cell = cell
+                    .text_color(theme.link)
+                    .underline()
+                    .cursor_pointer()
+                    .debug_selector(move || format!("log-details-link-{line_index}-{index}"))
+                    .on_click(cx.listener(move |_, _, _, cx| open_external_link(&url, cx)));
+            }
+            row = row.child(cell);
+        }
+        row.into_any_element()
     }
 
     /// The text of a branch or tag with the part of the search highlighted.
@@ -3822,6 +3959,109 @@ pub(crate) fn date_of(seconds: i64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// The line under the hash of the details: the author, the mail of the author and the
+/// date of the commit, in the format of the list of commits.
+fn identity_line(commit: &Commit) -> String {
+    format!(
+        "{} <{}> on {} {}",
+        commit.author,
+        commit.email,
+        date_of(commit.time),
+        time_of(commit.time)
+    )
+}
+
+/// The line of the details about the person who committed the change, when that person
+/// differs from the author.
+fn committer_line(details: &CommitDetails, commit: &Commit) -> Option<String> {
+    if details.committer.is_empty()
+        || (details.committer == commit.author && details.committer_email == commit.email)
+    {
+        return None;
+    }
+    Some(format!(
+        "committed by {} on {} {}",
+        details.committer,
+        date_of(details.committer_time),
+        time_of(details.committer_time)
+    ))
+}
+
+/// The part of a commit message under its subject, `None` when the message has only the
+/// subject. The first line is the subject, which the details pane draws once.
+fn message_body(message: &str) -> Option<&str> {
+    let end = message.find('\n')?;
+    let body = message[end + 1..].trim_start_matches(['\r', '\n']);
+    (!body.trim().is_empty()).then_some(body)
+}
+
+/// The words of one line of a commit message and the web address of each word that is
+/// one. Spaces stay with the word before them, so a long line wraps between words.
+fn message_parts(line: &str) -> Vec<(String, Option<String>)> {
+    let mut parts = Vec::new();
+    let mut rest = line;
+    while let Some(start) = find_url(rest) {
+        push_words(&mut parts, &rest[..start]);
+        let tail = &rest[start..];
+        let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+        let candidate = tail[..end].trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}']);
+        if !candidate.is_empty() {
+            parts.push((candidate.to_owned(), Some(candidate.to_owned())));
+        }
+        push_words(&mut parts, &tail[candidate.len()..]);
+        rest = &tail[end..];
+    }
+    push_words(&mut parts, rest);
+    parts
+}
+
+/// The first web address of a line, `http://` and `https://` alike.
+fn find_url(text: &str) -> Option<usize> {
+    [text.find("https://"), text.find("http://")]
+        .into_iter()
+        .flatten()
+        .min()
+}
+
+/// The words of a plain run of a line with the spaces after them.
+fn push_words(parts: &mut Vec<(String, Option<String>)>, text: &str) {
+    for word in text.split_inclusive(char::is_whitespace) {
+        parts.push((word.to_owned(), None));
+    }
+}
+
+/// The branch line of the details: every branch, or the first five and a count of the
+/// rest that a click opens.
+fn branch_summary(branches: &[String], expanded: bool) -> (String, Option<usize>) {
+    let total = branches.len();
+    if total == 0 {
+        return ("In 0 branches".to_owned(), None);
+    }
+    let shown = if expanded { total } else { total.min(5) };
+    let names = branches[..shown].join(", ");
+    if shown == total {
+        (format!("In {total} branches: {names}"), None)
+    } else {
+        (
+            format!("In {total} branches: {names},"),
+            Some(total - shown),
+        )
+    }
+}
+
+/// A web address of a commit message: the settings may replace the browser of the system.
+fn open_external_link(url: &str, cx: &mut App) {
+    let custom = cx
+        .try_global::<editor_view::ExternalLinks>()
+        .and_then(|links| links.0.clone());
+    match custom {
+        Some(open) => open(url),
+        None => {
+            ::platform::open_url(url);
+        }
+    }
 }
 
 /// The width of the graph column: a lane for each line of the widest shown row, up to
