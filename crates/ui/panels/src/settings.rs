@@ -757,7 +757,9 @@ impl SettingsView {
         };
         let (count, marked) = (open.values.len(), open.marked);
         match event.keystroke.key.as_str() {
-            "escape" => self.choice_open = None,
+            "escape" => {
+                self.close_nested(cx);
+            }
             "up" => {
                 if let Some(open) = self.choice_open.as_mut() {
                     open.marked = marked.saturating_sub(1);
@@ -1014,6 +1016,49 @@ impl SettingsView {
             .ok();
     }
 
+    /// Escape closes the topmost layer open in the window and returns whether one closed:
+    /// the list of a dropdown, an inline editor, the question of the MCP server, the layers
+    /// of the Keymap and template pages, then a filled search. With none open, the window
+    /// closes.
+    fn close_nested(&mut self, cx: &mut Context<Self>) -> bool {
+        let closed = if self.choice_open.take().is_some() {
+            true
+        } else if self.spelling_editing {
+            self.spelling_editing = false;
+            true
+        } else if self.todo_new_editing {
+            self.todo_new_editing = false;
+            true
+        } else if self.inspection_editing {
+            // The filter of the Inspections page clears first; an empty one lets the window go.
+            if self.inspection_search.text.is_empty() {
+                false
+            } else {
+                self.inspection_search = TextField::default();
+                true
+            }
+        } else if self.editing == Some(IGNORED_FIELD) {
+            self.editing = None;
+            true
+        } else if self.mcp_confirm_enable {
+            self.mcp_confirm_enable = false;
+            true
+        } else if (self.page == SettingsPage::Keymap && self.keymap_page.escape(cx))
+            || (TemplateSection::section(self.page).is_some() && self.templates_page.escape(cx))
+        {
+            true
+        } else if !self.search.text.is_empty() {
+            self.search = TextField::default();
+            true
+        } else {
+            false
+        };
+        if closed {
+            cx.notify();
+        }
+        closed
+    }
+
     /// The search field over the tree of pages.
     fn search_field(&self, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
         let empty = self.search.text.is_empty();
@@ -1063,11 +1108,8 @@ impl SettingsView {
     /// window, as the close button does. Up and Down walk the pages the query keeps.
     fn search_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if event.keystroke.key == "escape" {
-            if self.search.text.is_empty() {
+            if !self.close_nested(cx) {
                 self.close(window, cx);
-            } else {
-                self.search = TextField::default();
-                cx.notify();
             }
             cx.stop_propagation();
             return;
@@ -1215,7 +1257,7 @@ impl SettingsView {
         }
         if self.spelling_editing {
             if event.keystroke.key == "escape" {
-                self.spelling_editing = false;
+                self.close_nested(cx);
             } else if event.keystroke.key == "enter" {
                 self.add_spelling_word(cx);
             } else if self.spelling_word.key_with_clipboard(event, false, cx) {
@@ -1226,7 +1268,7 @@ impl SettingsView {
         }
         if self.todo_new_editing {
             if event.keystroke.key == "escape" {
-                self.todo_new_editing = false;
+                self.close_nested(cx);
             } else if event.keystroke.key == "enter" {
                 self.add_todo_template(cx);
             } else if self.todo_new.key_with_clipboard(event, false, cx) {
@@ -1237,11 +1279,8 @@ impl SettingsView {
         }
         if self.inspection_editing {
             if event.keystroke.key == "escape" {
-                if self.inspection_search.text.is_empty() {
+                if !self.close_nested(cx) {
                     self.close(window, cx);
-                } else {
-                    self.inspection_search = TextField::default();
-                    cx.notify();
                 }
             } else if self.inspection_search.key_with_clipboard(event, false, cx) {
                 cx.notify();
@@ -1255,8 +1294,7 @@ impl SettingsView {
         }
         if self.editing == Some(IGNORED_FIELD) {
             if event.keystroke.key == "escape" {
-                self.editing = None;
-                cx.notify();
+                self.close_nested(cx);
             } else if event.keystroke.key == "enter" {
                 self.add_ignored_pattern(cx);
             } else if self
@@ -1307,7 +1345,9 @@ impl SettingsView {
             return;
         }
         if event.keystroke.key == "escape" {
-            self.close(window, cx);
+            if !self.close_nested(cx) {
+                self.close(window, cx);
+            }
             cx.stop_propagation();
         }
     }
@@ -3754,17 +3794,8 @@ impl Render for SettingsView {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
             .on_action(cx.listener(|this, _: &workspace::Dismiss, window, cx| {
-                if this.page == SettingsPage::Keymap && this.keymap_page.escape(cx) {
-                    return;
-                }
-                if TemplateSection::section(this.page).is_some() && this.templates_page.escape(cx) {
-                    return;
-                }
-                if this.search.text.is_empty() {
+                if !this.close_nested(cx) {
                     this.close(window, cx);
-                } else {
-                    this.search = TextField::default();
-                    cx.notify();
                 }
             }))
             .on_mouse_down(

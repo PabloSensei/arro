@@ -2323,3 +2323,15 @@ mod window_tests_settings_search;
 
 #[cfg(test)]
 mod window_tests_find_action_ranking;
+
+#[cfg(test)]
+mod window_tests_tool_polish;
+
+#[cfg(test)]
+mod window_tests_tool_field_keys;
+
+#[cfg(test)]
+mod window_tests_dialog_escape;
+
+#[cfg(test)]
+mod window_tests_services_offline;

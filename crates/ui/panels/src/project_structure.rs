@@ -757,9 +757,34 @@ impl ProjectStructureDialog {
         self.model.as_ref().map_or(0, |model| model.modules.len())
     }
 
+    /// Escape closes the list open in the dialog first: the SDK, then the language level of
+    /// the project or of the module. Returns whether one was open.
+    fn close_nested(&mut self, cx: &mut Context<Self>) -> bool {
+        let closed = if self.sdk_open {
+            self.sdk_open = false;
+            true
+        } else if self.language_open {
+            self.language_open = false;
+            true
+        } else if self.module_language_open {
+            self.module_language_open = false;
+            true
+        } else {
+            false
+        };
+        if closed {
+            cx.notify();
+        }
+        closed
+    }
+
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event.keystroke.key.as_str() {
-            "escape" => self.close(window, cx),
+            "escape" => {
+                if !self.close_nested(cx) {
+                    self.close(window, cx);
+                }
+            }
             "enter" => self.apply(true, window, cx),
             _ => {}
         }
@@ -1773,7 +1798,11 @@ impl Render for ProjectStructureDialog {
             .track_focus(&self.focus)
             .text_size(px(UI_SIZE))
             .text_color(theme.text)
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
+            .on_action(cx.listener(|this, _: &workspace::Dismiss, _, cx| {
+                let closed = this.close_nested(cx);
+                workspace::forward_dismiss(closed, cx);
+            }));
         let contents = div()
             .flex()
             .flex_col()

@@ -79,7 +79,7 @@ pub use window::{
     ToggleDebug, ToggleEndpoints, ToggleFullScreen, ToggleHttp, ToggleLog, ToggleProject,
     ToggleRun, ToggleServices, ToggleStructure, ToggleTerminal, ToggleTheme, ToggleUsages,
     USAGES_TOOL, UpdateProject, VcsQuickList, ViewBreakpoints, WINDOW_KEYS, WindowKey, Workspace,
-    bind_keys, bind_keys_for, build_date, build_version, window_key, window_step,
+    bind_keys, bind_keys_for, build_date, build_version, forward_dismiss, window_key, window_step,
 };
 
 #[cfg(any(test, feature = "test-support"))]

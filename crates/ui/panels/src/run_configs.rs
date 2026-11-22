@@ -301,6 +301,12 @@ impl RunConfigDialog {
         self.selected.and_then(|index| self.items.get(index))
     }
 
+    /// The text of the Name field, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn name_text(&self) -> &str {
+        &self.name.text
+    }
+
     /// Reads the fields of the selected configuration into the dialog.
     fn load_fields(&mut self) {
         self.name = TextField::default();
@@ -930,15 +936,36 @@ impl RunConfigDialog {
             .ok();
     }
 
+    /// Escape closes the list or menu open inside the dialog, the topmost first: the Add
+    /// menu of the configurations, the kinds of a new step, then Modify options. Returns
+    /// whether one was open; with none, the window closes the dialog.
+    fn close_nested(&mut self, cx: &mut Context<Self>) -> bool {
+        let closed = if self.templates_open {
+            self.templates_open = false;
+            true
+        } else if self.steps_add_open {
+            self.steps_add_open = false;
+            true
+        } else if self.options_open {
+            self.options_open = false;
+            true
+        } else {
+            false
+        };
+        if closed {
+            cx.notify();
+        }
+        closed
+    }
+
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let stroke = &event.keystroke;
         let primary = stroke.modifiers.control || stroke.modifiers.platform;
         if self.templates_open {
             match stroke.key.as_str() {
                 "escape" => {
-                    self.templates_open = false;
+                    self.close_nested(cx);
                     cx.stop_propagation();
-                    cx.notify();
                 }
                 "up" => {
                     self.move_template_mark(-1, cx);
@@ -987,9 +1014,8 @@ impl RunConfigDialog {
             return;
         }
         if self.steps_add_open && stroke.key.as_str() == "escape" {
-            self.steps_add_open = false;
+            self.close_nested(cx);
             cx.stop_propagation();
-            cx.notify();
             return;
         }
         if !matches!(event.keystroke.key.as_str(), "escape" | "enter")
@@ -1004,7 +1030,11 @@ impl RunConfigDialog {
         }
         let env_active = self.rows.len() + 1;
         match event.keystroke.key.as_str() {
-            "escape" => self.close(window, cx),
+            "escape" => {
+                if !self.close_nested(cx) {
+                    self.close(window, cx);
+                }
+            }
             // Enter presses OK, which takes no press while the configuration has a problem.
             "enter" if self.problem().is_none() => self.apply(true, window, cx),
             "space" if self.active > 0 && self.active <= self.rows.len() => {
@@ -1901,7 +1931,11 @@ impl Render for RunConfigDialog {
             .track_focus(&self.focus)
             .text_size(px(UI_SIZE))
             .text_color(theme.text)
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
+            .on_action(cx.listener(|this, _: &workspace::Dismiss, _, cx| {
+                let closed = this.close_nested(cx);
+                workspace::forward_dismiss(closed, cx);
+            }));
         let contents = div()
             .flex()
             .flex_col()

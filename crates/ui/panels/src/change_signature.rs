@@ -302,6 +302,16 @@ impl ChangeSignatureDialog {
         self.signature_text()
     }
 
+    /// Escape closes the visibility list open in the form. Returns whether it was open.
+    fn close_nested(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.visibility_open {
+            return false;
+        }
+        self.visibility_open = false;
+        cx.notify();
+        true
+    }
+
     /// Keys of the form: text goes to the active field, Tab moves between fields, the
     /// visibility list opens on Space and walks on the arrows, and the parameter row
     /// under the selection follows Alt+Insert, Alt+Delete, Alt+Up and Alt+Down.
@@ -310,8 +320,7 @@ impl ChangeSignatureDialog {
         if self.visibility_open {
             match key {
                 "escape" => {
-                    self.visibility_open = false;
-                    cx.notify();
+                    self.close_nested(cx);
                     cx.stop_propagation();
                     return;
                 }
@@ -335,7 +344,9 @@ impl ChangeSignatureDialog {
             }
         }
         if key == "escape" {
-            self.close(window, cx);
+            if !self.close_nested(cx) {
+                self.close(window, cx);
+            }
             cx.stop_propagation();
             return;
         }
@@ -1252,7 +1263,11 @@ impl Render for ChangeSignatureDialog {
             .track_focus(&self.focus)
             .text_size(px(UI_SIZE))
             .text_color(theme.text)
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
+            .on_action(cx.listener(|this, _: &workspace::Dismiss, _, cx| {
+                let closed = this.close_nested(cx);
+                workspace::forward_dismiss(closed, cx);
+            }));
         let contents = div()
             .flex()
             .flex_col()

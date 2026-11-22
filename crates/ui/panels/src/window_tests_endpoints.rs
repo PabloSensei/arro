@@ -156,7 +156,7 @@ fn project(name: &str) -> PathBuf {
     root
 }
 
-fn open(cx: &mut TestAppContext, name: &str) -> (WindowHandle<Workspace>, PathBuf) {
+pub(crate) fn open(cx: &mut TestAppContext, name: &str) -> (WindowHandle<Workspace>, PathBuf) {
     let root = project(name);
     let window = open_window(cx, root.clone());
     let language = Arc::new(EndpointLanguage::new());

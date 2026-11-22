@@ -1823,7 +1823,7 @@ impl GitLogPanel {
                 cx.notify();
                 return;
             }
-            if self.path_query.key_with_clipboard(event, false, cx) {
+            if self.path_query.key_tool_field(event, false, cx) {
                 cx.stop_propagation();
                 cx.notify();
             }
@@ -1836,7 +1836,7 @@ impl GitLogPanel {
                 cx.notify();
                 return;
             }
-            if self.branch_query.key_with_clipboard(event, false, cx) {
+            if self.branch_query.key_tool_field(event, false, cx) {
                 self.rebuild_branches();
                 cx.stop_propagation();
                 cx.notify();
@@ -1875,7 +1875,7 @@ impl GitLogPanel {
             }
             _ => {}
         }
-        if self.filter.key_with_clipboard(event, false, cx) {
+        if self.filter.key_tool_field(event, false, cx) {
             cx.stop_propagation();
             self.refilter(cx);
         }
@@ -2233,6 +2233,12 @@ impl GitLogPanel {
         self.filter = TextField::from_text(text.to_owned());
         self.branch_search = false;
         self.refilter(cx);
+    }
+
+    /// The text of the filter of the commits, for a test of the keys of the field.
+    #[cfg(test)]
+    pub fn filter_text(&self) -> &str {
+        &self.filter.text
     }
 
     /// Chooses the author of the User filter, as its menu does.

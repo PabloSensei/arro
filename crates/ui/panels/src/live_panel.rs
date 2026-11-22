@@ -428,7 +428,7 @@ impl LivePanel {
             }
             _ => {
                 let section = self.section;
-                if self.filters[section.index()].key_with_clipboard(event, false, cx) {
+                if self.filters[section.index()].key_tool_field(event, false, cx) {
                     self.selected[section.index()] = None;
                     cx.stop_propagation();
                     cx.notify();

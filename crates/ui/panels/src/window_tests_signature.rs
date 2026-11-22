@@ -72,7 +72,7 @@ fn uri_of(path: &Path) -> String {
     CanonPath::new(path).unwrap().to_uri()
 }
 
-struct FakeLanguage {
+pub(crate) struct FakeLanguage {
     syntax: NoSyntax,
     documents: Mutex<HashMap<String, Arc<str>>>,
     info: Mutex<ChangeSignatureInfo>,
@@ -610,7 +610,7 @@ fn refactor_this_lists_change_signature(cx: &mut TestAppContext) {
 /// Opens the Change Signature form on the `combine` method of a fresh project. The form is
 /// shown as the editor shows it, without a key press, and the language stays alive for the
 /// test.
-fn open_form(
+pub(crate) fn open_form(
     cx: &mut TestAppContext,
     name: &str,
 ) -> (WindowHandle<Workspace>, Arc<FakeLanguage>, PathBuf) {

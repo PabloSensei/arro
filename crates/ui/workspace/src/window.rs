@@ -327,6 +327,15 @@ pub fn window_step(len: usize, current: usize, step: isize) -> Option<usize> {
     Some(((current as isize + step).rem_euclid(len)) as usize)
 }
 
+/// The end of `Dismiss` on the shell of a dialog, which answers the key before the window
+/// does. `closed` says the dialog closed a list or a menu of its own: the key stops there.
+/// Otherwise it goes on to the window, which closes the dialog.
+pub fn forward_dismiss(closed: bool, cx: &mut App) {
+    if !closed {
+        cx.propagate();
+    }
+}
+
 const SAVE_DELAY: Duration = Duration::from_millis(300);
 /// Files the edited list keeps.
 const RECENT_EDITED_LIMIT: usize = 50;
@@ -4910,7 +4919,9 @@ impl Workspace {
             })
     }
 
-    /// Escape: a submenu closes first, then the menu itself.
+    /// Escape: a submenu closes first, then the menu itself. A dialog closes the lists of
+    /// its own before this runs: its shell answers `Dismiss` and passes it on with
+    /// [`forward_dismiss`] only when none of them was open.
     pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(Overlay::Menu { state, .. }) = self.overlay.as_mut()
             && state.close_submenu()

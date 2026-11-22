@@ -160,6 +160,10 @@ const CELL_WIDTH: f32 = 160.;
 const TREE_WIDTH: f32 = 240.;
 /// The height of a field of the form.
 const FIELD_HEIGHT: f32 = 26.;
+/// The icons of the two copy buttons of a result: one cell and its whole row. They differ,
+/// so the two buttons are told apart at a glance.
+const COPY_CELL_ICON: &str = "general/copy";
+const COPY_ROW_ICON: &str = "general/editorAndPreview";
 
 /// A statement the window sends, with the row limit that goes with it.
 type SentQuery = (String, Option<usize>);
@@ -4620,6 +4624,17 @@ impl DatabasePanel {
         cx.write_to_clipboard(ui_kit::ClipboardItem::new_string(text));
     }
 
+    /// Whether a cell of the result is selected, so the copy buttons have something to copy.
+    fn copy_ready(&self) -> bool {
+        let Some((row, column)) = self.selected_cell else {
+            return false;
+        };
+        self.active()
+            .and_then(|tab| tab.result.as_ref())
+            .and_then(|result| result.rows.get(row))
+            .is_some_and(|values| values.get(column).is_some())
+    }
+
     fn sort_by(&mut self, column: usize, cx: &mut Context<Self>) {
         let ascending = !matches!(self.sort, Some((sorted, true)) if sorted == column);
         let Some(result) = self.active_mut().and_then(|tab| tab.result.as_mut()) else {
@@ -6296,22 +6311,27 @@ impl DatabasePanel {
                     .child(status.clone()),
             );
         }
-        bar = bar.child(
-            icon_button(
-                "database-copy-cell",
-                "general/copy",
-                "Copy Cell",
-                Some(DatabasePanel::copy_cell_key().into()),
-                theme,
-            )
-            .debug_selector(|| "database-copy-cell".to_owned())
-            .on_click(cx.listener(|this, _, _, cx| this.copy_cell(cx))),
-        );
-        bar = bar.child(
-            icon_button("database-copy-row", "general/copy", "Copy Row", None, theme)
-                .debug_selector(|| "database-copy-row".to_owned())
-                .on_click(cx.listener(|this, _, _, cx| this.copy_row(cx))),
-        );
+        let copy_ready = self.copy_ready();
+        let copy_cell = icon_button(
+            "database-copy-cell",
+            COPY_CELL_ICON,
+            "Copy Cell",
+            Some(DatabasePanel::copy_cell_key().into()),
+            theme,
+        )
+        .debug_selector(|| "database-copy-cell".to_owned());
+        bar = bar.child(if copy_ready {
+            copy_cell.on_click(cx.listener(|this, _, _, cx| this.copy_cell(cx)))
+        } else {
+            copy_cell.opacity(0.4)
+        });
+        let copy_row = icon_button("database-copy-row", COPY_ROW_ICON, "Copy Row", None, theme)
+            .debug_selector(|| "database-copy-row".to_owned());
+        bar = bar.child(if copy_ready {
+            copy_row.on_click(cx.listener(|this, _, _, cx| this.copy_row(cx)))
+        } else {
+            copy_row.opacity(0.4)
+        });
         let _ = window;
         bar.into_any_element()
     }

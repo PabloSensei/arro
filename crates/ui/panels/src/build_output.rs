@@ -188,7 +188,10 @@ impl BuildOutputPanel {
             } else {
                 view.title.clone()
             },
-            hint: Some(status_text(view, errors, warnings)),
+            hint: {
+                let status = status_text(view, errors, warnings);
+                (!status.is_empty()).then_some(status)
+            },
             icon: "toolwindows/tasks",
             expandable: true,
             open: self.root_open,
@@ -544,12 +547,14 @@ impl BuildOutputPanel {
                 .track_scroll(&self.scroll)
                 .children(children)
                 .when(empty, |this| {
+                    let text = empty_text();
                     this.child(
                         div()
                             .px(px(ROW_MARGIN + SPACE_M))
                             .py(px(SPACE_S))
                             .text_color(theme.text_secondary)
-                            .child("No builds yet."),
+                            .child(text.clone())
+                            .children(empty_probe(&text)),
                     )
                 }),
             theme,
@@ -719,7 +724,9 @@ fn status_text(view: &BuildView, errors: usize, warnings: usize) -> String {
             format!("{verdict} in {time}")
         }
     } else if counts.is_empty() {
-        return "no builds yet".to_string();
+        // The tree has no build: the one empty line under the root says so and names the
+        // key; the root itself stays without a count.
+        return String::new();
     } else {
         return counts;
     };
@@ -737,6 +744,32 @@ fn duration_text(duration: Duration) -> String {
     } else {
         format!("{milliseconds} ms")
     }
+}
+
+/// The one line of a window without a build: what is missing and the key that starts the
+/// build on this platform.
+fn empty_text() -> String {
+    let stroke = if cfg!(target_os = "macos") {
+        "cmd-f9"
+    } else {
+        "ctrl-f9"
+    };
+    let key = keymap::shortcut_label(stroke, keymap::platform());
+    format!("No builds yet. Build the project with {key}.")
+}
+
+/// The probe of the empty line: a test reads that the window says it once.
+#[cfg(test)]
+fn empty_probe(text: &str) -> Option<AnyElement> {
+    Some(bounds_probe(
+        "build-output-empty",
+        Some(text.to_owned().into()),
+    ))
+}
+
+#[cfg(not(test))]
+fn empty_probe(_text: &str) -> Option<AnyElement> {
+    None
 }
 
 #[cfg(all(test, windows))]

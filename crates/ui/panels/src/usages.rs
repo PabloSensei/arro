@@ -2832,7 +2832,7 @@ impl ShowUsagesPopup {
             "enter" => self.open(self.selected, window, cx),
             "escape" => self.dismiss(window, cx),
             _ => {
-                if !self.query.key_with_clipboard(event, false, cx) {
+                if !self.query.key_tool_field(event, false, cx) {
                     return;
                 }
                 self.selected = 0;

@@ -386,6 +386,16 @@ impl KubeSection {
             .collect()
     }
 
+    /// The reason a cluster does not answer, in full: the tooltip of its node, and the right
+    /// side of the node once it is chosen.
+    pub(crate) fn problem(&self) -> Option<String> {
+        match &self.snapshot.cluster {
+            ClusterState::NoCli => Some(NO_CLI.to_owned()),
+            ClusterState::Unreachable { reason } => Some(reason.clone()),
+            ClusterState::Up { .. } => None,
+        }
+    }
+
     pub(crate) fn report(&self) -> Vec<String> {
         let cluster = match &self.snapshot.cluster {
             ClusterState::NoCli => "kube cluster no-cli".to_string(),
@@ -440,6 +450,9 @@ impl KubeSection {
     pub(crate) fn tree(&self, theme: &Theme, cx: &mut Context<DockerPanel>) -> Vec<AnyElement> {
         let mut rows = Vec::new();
         let root_open = !self.collapsed.contains(ROOT);
+        // A cluster that does not answer has no contexts, namespaces or resources: its node
+        // has no branches until the cluster answers again.
+        let answers = matches!(self.snapshot.cluster, ClusterState::Up { .. });
         let root_label = match &self.snapshot.cluster {
             ClusterState::NoCli => "Kubernetes is not installed: no kubectl CLI found".to_string(),
             ClusterState::Unreachable { .. } => {
@@ -453,29 +466,44 @@ impl KubeSection {
                 }
             }
         };
+        // The reason of an unreachable cluster is in the tooltip, not beside the label.
         let hint = match &self.snapshot.cluster {
-            ClusterState::Unreachable { reason } => Some(reason.clone().into()),
+            ClusterState::Unreachable { .. } => None,
             _ => self.snapshot.problem.clone().map(Into::into),
         };
-        rows.push(
-            kube_row(
-                TreeRow {
-                    id: ROOT.into(),
-                    depth: 0,
-                    label: root_label.into(),
-                    hint,
-                    icon: "toolwindows/services",
-                    expandable: true,
-                    open: root_open,
-                    selected: self.selected == Some(Node::Root),
-                },
-                theme,
-            )
-            .debug_selector(|| ROOT.to_owned())
-            .on_click(cx.listener(|this, _, _, cx| this.kube.toggle_root(cx)))
-            .into_any_element(),
-        );
-        if !root_open {
+        let root = kube_row(
+            TreeRow {
+                id: ROOT.into(),
+                depth: 0,
+                label: root_label.into(),
+                hint,
+                icon: "toolwindows/services",
+                expandable: answers,
+                open: answers && root_open,
+                selected: self.selected == Some(Node::Root),
+            },
+            theme,
+        )
+        .debug_selector(|| ROOT.to_owned())
+        // A node that does not answer has nothing to fold: a click shows its reason on the
+        // right side instead.
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if answers {
+                this.kube.toggle_root(cx)
+            } else {
+                this.kube_select(Node::Root, cx)
+            }
+        }));
+        let root = match &self.snapshot.cluster {
+            ClusterState::Unreachable { reason } => {
+                let reason = reason.clone();
+                root.tooltip(move |_, cx| tooltip(reason.clone(), None, cx))
+                    .tooltip_show_delay(TOOLTIP_CREATE_DELAY)
+            }
+            _ => root,
+        };
+        rows.push(root.into_any_element());
+        if !answers || !root_open {
             return rows;
         }
         let contexts_open = !self.collapsed.contains(CONTEXTS);
@@ -899,7 +927,13 @@ impl KubeSection {
             return vec![("refresh", "run/restart", "Refresh", true)];
         };
         match node {
-            Node::Root => vec![("refresh", "run/restart", "Refresh", true)],
+            Node::Root => {
+                let label = match &self.snapshot.cluster {
+                    ClusterState::Unreachable { .. } => "Retry",
+                    _ => "Refresh",
+                };
+                vec![("refresh", "run/restart", label, true)]
+            }
             Node::Context(_) | Node::Namespace(_) | Node::Kind(_) => Vec::new(),
             Node::Key { .. } => vec![
                 ("show-value", "general/show", "Show Value", true),
@@ -1055,6 +1089,11 @@ impl KubeSection {
             return revealed_view(name, value, &self.scroll_value, theme, window, cx);
         }
         if self.lines.is_empty() {
+            if matches!(self.selected, Some(Node::Root))
+                && let Some(problem) = self.problem()
+            {
+                return crate::docker::problem_view(problem, theme);
+            }
             let text = match &self.selected {
                 Some(Node::Resource { kind, name }) => match self.resource(*kind, name) {
                     Some(resource) if resource.kind == ResourceKind::Secret => {

@@ -604,8 +604,10 @@ impl HistoryView {
                 cx.stop_propagation();
                 return;
             }
-            if self.filter.key_with_clipboard(event, false, cx) {
+            if self.filter.key_tool_field(event, false, cx) {
                 self.refresh_visible(cx);
+            } else {
+                return;
             }
             cx.stop_propagation();
             return;
