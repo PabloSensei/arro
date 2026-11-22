@@ -336,6 +336,12 @@ fn action_kind(kind: &lsp::CodeActionKind) -> Option<ActionKind> {
     }
 }
 
+/// Whether the server marks the action as disabled: it cannot run at the place, such as Inline
+/// Method of a method of a library.
+fn is_disabled(action: &lsp::CodeActionOrCommand) -> bool {
+    matches!(action, lsp::CodeActionOrCommand::CodeAction(action) if action.disabled.is_some())
+}
+
 fn lsp_kind(kind: ActionKind) -> lsp::CodeActionKind {
     match kind {
         ActionKind::QuickFix => lsp::CodeActionKind::QUICKFIX,
@@ -523,6 +529,10 @@ async fn action_entries(
 ) -> Vec<ActionEntry> {
     let mut entries = Vec::new();
     for action in response.into_iter().flatten() {
+        // A disabled action cannot run here, so the list does not offer it.
+        if is_disabled(&action) {
+            continue;
+        }
         let action = resolve_action(
             router,
             action,
@@ -3534,8 +3544,8 @@ mod tests {
     use super::destination_folder;
     use super::{
         TextPoint, TextSpan, action_entry, completion_entry, diagnostic, documentation_url,
-        expected_type_from_declaration, inlay_hints, overridable_methods, parameter_type,
-        return_type_of, signature_help_info, usage_kind,
+        expected_type_from_declaration, inlay_hints, is_disabled, overridable_methods,
+        parameter_type, return_type_of, signature_help_info, usage_kind,
     };
 
     fn action(value: serde_json::Value) -> lsp::CodeActionOrCommand {
@@ -3585,6 +3595,25 @@ mod tests {
             entry.detail.as_deref(),
             Some("Person.getLastName() : String")
         );
+    }
+
+    #[test]
+    fn a_source_action_keeps_the_source_kind_and_a_disabled_action_is_marked() {
+        let sort = action(json!({
+            "title": "Sort Members",
+            "kind": "source.sortMembers",
+            "command": {"title": "Sort Members", "command": "lang.sortMembers"},
+        }));
+        let entry = action_entry(sort.clone(), None, None, None).unwrap();
+        assert_eq!(entry.kind, Some(ActionKind::Source));
+        // The server marks an action it cannot run at the place: such a row is not listed.
+        let inline = action(json!({
+            "title": "Inline Method",
+            "kind": "refactor.inline",
+            "disabled": {"reason": "The method belongs to a library"},
+        }));
+        assert!(is_disabled(&inline));
+        assert!(!is_disabled(&sort));
     }
 
     #[test]

@@ -192,6 +192,15 @@ pub struct ActiveGit(pub Entity<GitState>);
 
 impl Global for ActiveGit {}
 
+/// What a commit of [`GitState::commit_roots`] came to.
+pub enum CommitOutcome {
+    /// The commits made, one per root.
+    Made(Vec<String>),
+    /// An Amend would rewrite a commit the upstream already has, and Push was asked. Nothing
+    /// was written: the user answers, and the commit runs again with the force of the answer.
+    ForcePushNeeded,
+}
+
 /// What one background read of the repository brought back.
 struct Refreshed {
     status: Result<Status, String>,
@@ -903,14 +912,19 @@ impl GitState {
     }
 
     /// Commits the chosen files of every root, one commit per root with the same message,
-    /// as the Commit window does for a project with submodules.
+    /// as the Commit window does for a project with submodules. With `push`, each root is
+    /// sent after its commit. An Amend that rewrites a commit the upstream has, with `push`,
+    /// stops before it writes anything and reports [`CommitOutcome::ForcePushNeeded`]; the
+    /// same commit with `force` set, once the user agreed, sends those commits with a lease.
+    #[allow(clippy::too_many_arguments)]
     pub fn commit_roots(
         &mut self,
         request: CommitRequest,
         options: CommitOptions,
         push: bool,
+        force: bool,
         partial: Vec<PartialFile>,
-        done: impl FnOnce(&mut Self, Vec<String>, &mut Context<Self>) + 'static,
+        done: impl FnOnce(&mut Self, CommitOutcome, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) {
         if self.repo.is_none() {
@@ -985,8 +999,20 @@ impl GitState {
         self.last_error = None;
         cx.notify();
         let job = cx.background_executor().spawn(async move {
+            // Before the first write: an Amend that rewrites a commit the upstream has asks
+            // first, so Cancel leaves every root as it was.
+            if push && amend && !force {
+                for (repo, _, _) in &groups {
+                    if repo.head_on_upstream()? {
+                        return Ok::<_, std::io::Error>(CommitOutcome::ForcePushNeeded);
+                    }
+                }
+            }
             let mut ids = Vec::new();
             for (repo, paths, partial) in groups {
+                // The user agreed to the force push: a commit the upstream has goes with a
+                // lease, and the other roots go as they always do.
+                let leased = force && push && amend && repo.head_on_upstream()?;
                 let id = if paths.is_empty() {
                     repo.amend_message(&message, &options)?
                 } else {
@@ -1001,23 +1027,28 @@ impl GitState {
                         repo.commit_partial(&request, &options, &partial)?
                     }
                 };
-                if push {
+                if leased {
+                    repo.push_with_lease()?;
+                } else if push {
                     repo.push()?;
                 }
                 ids.push(id);
             }
-            Ok::<_, std::io::Error>(ids)
+            Ok::<_, std::io::Error>(CommitOutcome::Made(ids))
         });
         cx.spawn(async move |this, cx| {
             let result = job.await;
             this.update(cx, |this, cx| {
                 this.busy = None;
                 match result {
-                    Ok(ids) => {
-                        let done_ids = ids.clone();
-                        done(this, ids, cx);
-                        let short: Vec<String> =
-                            done_ids.iter().map(|id| short_commit(id)).collect();
+                    Ok(outcome) => {
+                        let short: Vec<String> = match &outcome {
+                            CommitOutcome::Made(ids) => {
+                                ids.iter().map(|id| short_commit(id)).collect()
+                            }
+                            CommitOutcome::ForcePushNeeded => Vec::new(),
+                        };
+                        done(this, outcome, cx);
                         if short.len() > 1 {
                             this.tell(
                                 "Commit",

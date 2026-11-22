@@ -1236,6 +1236,12 @@ fn install(
     editor_view::install_find_history(&agents.state_dir, cx);
     editor_view::install_completion_usage(&agents.state_dir, cx);
     finder::install_history(&agents.state_dir, cx);
+    // The editor draws the icon of a file it shows outside its own text, such as the
+    // header of Quick Definition, and knows no file types of its own.
+    let icons = std::sync::Arc::new(workspace.icons().clone());
+    cx.set_global(editor_view::FileIcon(std::sync::Arc::new(
+        move |path: &std::path::Path| icons.icon_for(path),
+    )));
     // The bookmarks of the project open before the first editor reads them.
     let project_name = workspace.root().file_name().map_or_else(
         || "Bookmarks".to_owned(),
@@ -2360,3 +2366,15 @@ mod window_tests_call_hierarchy_scope;
 
 #[cfg(test)]
 mod window_tests_palette_ranking;
+
+#[cfg(test)]
+mod window_tests_amend_message;
+
+#[cfg(test)]
+mod window_tests_amend_push;
+
+#[cfg(test)]
+mod window_tests_alt_enter_kinds;
+
+#[cfg(test)]
+mod window_tests_definition;

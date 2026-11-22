@@ -50,6 +50,9 @@ const PREFERRED_COMPLETION_NAMES: &[&str] = &[
     "CharSequence",
 ];
 
+/// The type every Java type inherits. The completion list puts its members last.
+const ROOT_COMPLETION_TYPE: &str = "Object";
+
 /// The keywords and the literals of the language, none of which names a declaration.
 const JAVA_KEYWORDS: &[&str] = &[
     "abstract",
@@ -238,6 +241,10 @@ impl LanguageSupport for JavaProject {
 
     fn preferred_completion_names(&self) -> &'static [&'static str] {
         PREFERRED_COMPLETION_NAMES
+    }
+
+    fn root_completion_type(&self) -> Option<&'static str> {
+        Some(ROOT_COMPLETION_TYPE)
     }
 
     fn embedded_languages(&self) -> Vec<Arc<dyn LanguageSupport>> {

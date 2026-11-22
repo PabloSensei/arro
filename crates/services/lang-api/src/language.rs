@@ -91,6 +91,13 @@ pub trait LanguageSupport: Send + Sync {
         &[]
     }
 
+    /// The root type every type of the language inherits, when it has one. The completion
+    /// list puts its members after the members of the type of the expression and of its
+    /// supertypes, as IDEA puts the methods that every value has last.
+    fn root_completion_type(&self) -> Option<&'static str> {
+        None
+    }
+
     fn completion(&self) -> Option<&CompletionProvider> {
         None
     }

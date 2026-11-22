@@ -422,9 +422,10 @@ fn file_names_class(path: &Path, name: &str) -> bool {
         .is_some_and(|stem| stem.to_string_lossy() == bare_name(name))
 }
 
-/// How a file of the project is placed against another match of the same kind: the open
-/// and recent files first, then the sources before the tests, then the shorter name, then
-/// alphabetically.
+/// How a file of the project is placed against another match of the same kind: the
+/// sources before the tests, then the shorter name, then the open and recent files, then
+/// alphabetically. `Own` puts `Owner` before `OwnerController` even when only the second
+/// is open.
 fn file_order(
     left: &Path,
     right: &Path,
@@ -433,12 +434,10 @@ fn file_order(
     recent: &[PathBuf],
     test_roots: &[PathBuf],
 ) -> std::cmp::Ordering {
-    recent_place(open, recent, left)
-        .cmp(&recent_place(open, recent, right))
-        .then_with(|| {
-            is_test_file(root, left, test_roots).cmp(&is_test_file(root, right, test_roots))
-        })
+    is_test_file(root, left, test_roots)
+        .cmp(&is_test_file(root, right, test_roots))
         .then_with(|| file_name_of(left).len().cmp(&file_name_of(right).len()))
+        .then_with(|| recent_place(open, recent, left).cmp(&recent_place(open, recent, right)))
         .then_with(|| {
             file_name_of(left)
                 .to_lowercase()
@@ -457,8 +456,8 @@ fn symbol_path(row: &SymbolRow) -> Option<&Path> {
 }
 
 /// How a symbol of the project is placed against another match of the same kind: the
-/// file it stands in gives the open and recent order, then the sources before the tests,
-/// then the shorter name, then alphabetically.
+/// sources before the tests, then the shorter name, then the open and recent order of the
+/// file it stands in, then alphabetically.
 fn symbol_order(
     left: &SymbolRow,
     right: &SymbolRow,
@@ -474,9 +473,9 @@ fn symbol_order(
         |row: &SymbolRow| symbol_path(row).is_some_and(|path| is_test_file(root, path, test_roots));
     left.match_kind
         .cmp(&right.match_kind)
-        .then_with(|| place(left).cmp(&place(right)))
         .then_with(|| test(left).cmp(&test(right)))
         .then_with(|| left.name.len().cmp(&right.name.len()))
+        .then_with(|| place(left).cmp(&place(right)))
         .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
         .then_with(|| left.name.cmp(&right.name))
         .then_with(|| left.container.cmp(&right.container))
@@ -524,24 +523,32 @@ fn is_tool_command(id: &str) -> bool {
     TOOL_COMMANDS.iter().any(|(_, command)| *command == id)
 }
 
-/// `title` cut at the characters the query matched: each part and whether it matched.
-/// The positions are character indices, as [`NameMatcher::indices`] gives them.
-fn title_parts(title: &str, matched: &[usize]) -> Vec<(String, bool)> {
-    let mut parts = Vec::new();
-    let mut run = String::new();
-    let mut run_matched = false;
-    for (at, character) in title.chars().enumerate() {
-        let hit = matched.binary_search(&at).is_ok();
-        if !run.is_empty() && hit != run_matched {
-            parts.push((std::mem::take(&mut run), run_matched));
+/// `title` as one run of text, with the characters the query matched in the accent colour
+/// and bold. One run keeps the letters together: parts in a row would stand apart by its
+/// gap. The positions are character indices, as [`NameMatcher::indices`] gives them.
+fn title_text(title: &str, matched: &[usize], theme: &Theme) -> StyledText {
+    let mut highlights = Vec::new();
+    let mut run: Option<std::ops::Range<usize>> = None;
+    for (at, (offset, character)) in title.char_indices().enumerate() {
+        let end = offset + character.len_utf8();
+        if matched.binary_search(&at).is_ok() {
+            match &mut run {
+                Some(range) if range.end == offset => range.end = end,
+                _ => {
+                    highlights.extend(run.take());
+                    run = Some(offset..end);
+                }
+            }
         }
-        run_matched = hit;
-        run.push(character);
     }
-    if !run.is_empty() {
-        parts.push((run, run_matched));
-    }
-    parts
+    highlights.extend(run);
+    let style = HighlightStyle {
+        color: Some(theme.accent),
+        font_weight: Some(FontWeight::BOLD),
+        ..HighlightStyle::default()
+    };
+    StyledText::new(title.to_owned())
+        .with_highlights(highlights.into_iter().map(|range| (range, style)))
 }
 
 /// The text a command is matched by, with the name of its tool window when the title of
@@ -2271,15 +2278,7 @@ impl Palette {
                         data.icon.is_empty() && matches!(data.item, Some(Item::Action(_))),
                         |this| this.child(div().size(px(ICON)).flex_none()),
                     )
-                    .children(title_parts(&data.title, &data.matched).into_iter().map(
-                        |(text, hit)| {
-                            div()
-                                .when(hit, |this| {
-                                    this.text_color(theme.accent).font_weight(FontWeight::BOLD)
-                                })
-                                .child(text)
-                        },
-                    ))
+                    .child(title_text(&data.title, &data.matched, theme))
                     .children(signature.map(|signature| {
                         div()
                             .debug_selector(move || format!("palette-signature-{index}"))

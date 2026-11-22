@@ -1,20 +1,22 @@
 //! Ctrl+O, Ctrl+I, Ctrl+Alt+H, Ctrl+Shift+B, Ctrl+Shift+I and Ctrl+Alt+Shift+C: the
 //! structure of the code around the caret, as the language describes it.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::PathBuf;
 
-use futures_util::StreamExt;
 use lang_api::{
     AddOverridableMethodsRequest, Confidence, DefinitionPreviewQuery, DocumentSpot, NavigationKind,
     NavigationQuery, OverridableMethod, OverridableMethodsQuery, ReferenceQuery, SourceSpan, ask,
 };
-use syntax::{DocumentId, HighlightSpan};
-use text_core::{Change, RopeStore, TextStore};
+use syntax::HighlightSpan;
+use ui_kit::metrics::*;
+use ui_kit::prelude::*;
 use ui_kit::*;
 
 use crate::actions::Pick;
-use crate::semantic::{NO_ANSWER, first};
-use crate::view::{EditorEvent, EditorView};
+use crate::quick_doc::highlight_source;
+use crate::semantic::{NO_ANSWER, first, uri_path};
+use crate::style::EditorStyle;
+use crate::view::{EditorEvent, EditorView, FileIcon, Languages};
 
 fn is_typed_key(key: &str) -> bool {
     key.chars().count() == 1
@@ -141,15 +143,234 @@ impl OverridePopup {
     }
 }
 
+/// The most lines of a definition the popup shows before it scrolls.
+const DEFINITION_MAX_LINES: usize = 20;
+/// The narrowest the popup gets.
+const DEFINITION_MIN_WIDTH: f32 = 240.;
+/// The lowest the code area of the popup gets when the user drags its corner.
+const DEFINITION_MIN_HEIGHT: f32 = 32.;
+/// The width of one character of the code font of the popup, as a part of its size.
+const DEFINITION_CHAR: f32 = 0.6;
+/// The grab area of the lower right corner of the popup.
+const DEFINITION_GRIP: f32 = 12.;
+
 /// Ctrl+Shift+I: the declaration at the caret, with its syntax colours.
 pub(crate) struct DefinitionPopup {
     pub at: usize,
     pub text: String,
     pub spans: Vec<HighlightSpan>,
     target: Option<SourceSpan>,
+    pub scroll: ScrollHandle,
+    /// The width and the height of the code area, when the user dragged the corner.
+    size: Option<(f32, f32)>,
+    /// The corner drag under way: the pointer where it began and the size it began at.
+    resize: Option<DefinitionResize>,
 }
 
-static NEXT_SOURCE: AtomicU64 = AtomicU64::new(1);
+/// A drag of the lower right corner of the definition popup.
+#[derive(Clone, Copy)]
+struct DefinitionResize {
+    from: Point<Pixels>,
+    width: f32,
+    height: f32,
+}
+
+/// The name and the package or folder of a definition, as the header of its popup shows
+/// them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DefinitionHeader {
+    /// The file name, or the name of the class of a library.
+    pub name: String,
+    /// The package or the folder, empty when the place has neither.
+    pub folder: String,
+    /// The path the icon resolver reads, or a made-up one for a class of a library.
+    icon_path: PathBuf,
+    /// The place is a class of a library, which has no file of the project.
+    class: bool,
+}
+
+/// The name and the package or folder a definition comes from. A class of a jar or of
+/// the JDK has no file, so its header names the class and the package of its URI.
+fn definition_header(target: Option<&SourceSpan>) -> DefinitionHeader {
+    let Some(target) = target else {
+        return DefinitionHeader {
+            name: "Definition".to_owned(),
+            folder: String::new(),
+            icon_path: PathBuf::from("Definition"),
+            class: false,
+        };
+    };
+    if let Some(rest) = target.uri.strip_prefix("jdt://") {
+        let parts: Vec<&str> = rest.split('/').filter(|part| !part.is_empty()).collect();
+        let last = parts.last().copied().unwrap_or("Definition");
+        let name = last.strip_suffix(".class").unwrap_or(last).to_owned();
+        // `contents/<module>/<package>/<Class>.class`: the package is what stands
+        // between the module and the class.
+        let folder = if parts.len() >= 3 && parts.first() == Some(&"contents") {
+            parts[2..parts.len() - 1].join(".")
+        } else if parts.len() >= 2 {
+            parts[..parts.len() - 1].join(".")
+        } else {
+            String::new()
+        };
+        return DefinitionHeader {
+            name: name.clone(),
+            folder,
+            icon_path: PathBuf::from(format!("{name}.class")),
+            class: true,
+        };
+    }
+    if let Some(path) = uri_path(&target.uri) {
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let folder = path.parent().map_or_else(String::new, |folder| {
+            folder.display().to_string().replace('\\', "/")
+        });
+        return DefinitionHeader {
+            name,
+            folder,
+            icon_path: path,
+            class: false,
+        };
+    }
+    let name = target
+        .uri
+        .rsplit('/')
+        .next()
+        .unwrap_or(&target.uri)
+        .to_owned();
+    DefinitionHeader {
+        icon_path: PathBuf::from(&name),
+        name,
+        folder: String::new(),
+        class: false,
+    }
+}
+
+/// The icon of the header: the one the application gives the file, or a generic one.
+fn definition_icon(header: &DefinitionHeader, cx: &App) -> &'static str {
+    cx.try_global::<FileIcon>().map_or_else(
+        || {
+            if header.class {
+                "nodes/class"
+            } else {
+                "fileTypes/text"
+            }
+        },
+        |icons| (icons.0)(&header.icon_path),
+    )
+}
+
+/// One run of a row of the definition popup: its text and its colour.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DefinitionRun {
+    pub text: String,
+    pub color: Hsla,
+}
+
+/// One row of the definition popup: the line of the file it shows and its coloured runs.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DefinitionRow {
+    pub number: usize,
+    pub runs: Vec<DefinitionRun>,
+}
+
+/// What the definition popup shows, for a test.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DefinitionView {
+    /// The file name, or the name of the class of a library.
+    pub name: String,
+    /// The package or the folder of the definition.
+    pub folder: String,
+    pub rows: Vec<DefinitionRowView>,
+}
+
+/// One row of the definition popup, as a test reads it.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DefinitionRowView {
+    /// The line of the file the row shows.
+    pub number: usize,
+    pub text: String,
+    /// The colour of each run of the row, in the order of its text.
+    pub colors: Vec<Hsla>,
+}
+
+/// The rows of the definition popup: the lines of the text split by the colours of its
+/// spans, numbered from the line of the declaration.
+fn definition_rows(popup: &DefinitionPopup, style: &EditorStyle) -> Vec<DefinitionRow> {
+    let text = popup.text.trim_end_matches('\n');
+    let first = popup
+        .target
+        .as_ref()
+        .map_or(1, |target| target.span.start.line as usize + 1);
+    let mut rows = Vec::new();
+    let mut line_start = 0;
+    for (index, line) in text.split('\n').enumerate() {
+        let line_end = line_start + line.len();
+        let mut runs = Vec::new();
+        let mut at = line_start;
+        let mut spans: Vec<&HighlightSpan> = popup
+            .spans
+            .iter()
+            .filter(|span| (span.start as usize) < line_end && (span.end as usize) > line_start)
+            .collect();
+        spans.sort_by_key(|span| span.start);
+        for span in spans {
+            let start = (span.start as usize).max(line_start).max(at);
+            let end = (span.end as usize).min(line_end);
+            if end <= start {
+                continue;
+            }
+            if start > at {
+                runs.push(DefinitionRun {
+                    text: text[at..start].to_owned(),
+                    color: style.code,
+                });
+            }
+            runs.push(DefinitionRun {
+                text: text[start..end].to_owned(),
+                color: style.color_of(span.kind),
+            });
+            at = end;
+        }
+        if at < line_end {
+            runs.push(DefinitionRun {
+                text: text[at..line_end].to_owned(),
+                color: style.code,
+            });
+        }
+        rows.push(DefinitionRow {
+            number: first + index,
+            runs,
+        });
+        line_start = line_end + 1;
+    }
+    rows
+}
+
+/// The language of a definition: the language of its file, or the language of the editor
+/// for a class of a library, which has no file on disk.
+fn definition_language(
+    target: Option<&SourceSpan>,
+    view: &EditorView,
+    cx: &App,
+) -> Option<syntax::LanguageConfig> {
+    let by_path = target
+        .and_then(|target| uri_path(&target.uri))
+        .and_then(|path| {
+            cx.try_global::<Languages>()
+                .and_then(|languages| (languages.resolve)(&path))
+        });
+    by_path.or_else(|| {
+        view.state
+            .as_ref()
+            .and_then(|state| state.language().cloned())
+    })
+}
 
 impl EditorView {
     /// Ctrl+O, and Ctrl+I with `only_abstract`.
@@ -351,10 +572,6 @@ impl EditorView {
         else {
             return;
         };
-        let language = self
-            .state
-            .as_ref()
-            .and_then(|state| state.language().cloned());
         let syntax = self.syntax.clone();
         let replies = ask(provider, DefinitionPreviewQuery(spot));
         self.importing_note(caret, cx);
@@ -371,6 +588,8 @@ impl EditorView {
                 }
                 Some((preview, _)) => {
                     let text = preview.text;
+                    let target = preview.target;
+                    let language = definition_language(target.as_ref(), this, cx);
                     if let Some(lsp) = &mut this.lsp {
                         lsp.note = None;
                         lsp.overrides = None;
@@ -378,42 +597,28 @@ impl EditorView {
                             at: caret,
                             text: text.clone(),
                             spans: Vec::new(),
-                            target: preview.target,
+                            target,
+                            scroll: ScrollHandle::new(),
+                            size: None,
+                            resize: None,
                         });
                     }
                     cx.notify();
-                    Some(text)
+                    Some((text, language))
                 }
                 None => None,
             });
-            let Ok(Some(text)) = opened else {
+            let Ok(Some((text, Some(language)))) = opened else {
                 return;
             };
-            let Some(language) = language else {
-                return;
-            };
-            let id = DocumentId(NEXT_SOURCE.fetch_add(1, Ordering::Relaxed));
-            let (sender, mut receiver) = futures_channel::mpsc::unbounded();
-            syntax.open(id, language, move |snapshot| {
-                sender.unbounded_send(snapshot).ok();
-            });
-            let text_for_syntax = text.clone();
-            syntax.update(
-                id,
-                1,
-                RopeStore::from_text(&text_for_syntax),
-                &Change::default(),
-            );
-            let snapshot = receiver.next().await;
-            syntax.close(id);
-            let Some(snapshot) = snapshot else {
+            let Some(spans) = highlight_source(syntax, language, text.clone()).await else {
                 return;
             };
             this.update(cx, |this, cx| {
                 if let Some(popup) = this.lsp.as_mut().and_then(|lsp| lsp.definition.as_mut())
                     && popup.text == text
                 {
-                    popup.spans = snapshot.highlights;
+                    popup.spans = spans;
                     cx.notify();
                 }
             })
@@ -422,7 +627,7 @@ impl EditorView {
         .detach();
     }
 
-    /// Escape closes Ctrl+Shift+I, Enter goes to the declaration.
+    /// Escape closes Ctrl+Shift+I, Enter and F4 go to the declaration.
     pub(crate) fn definition_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
         let Some(lsp) = &mut self.lsp else {
             return false;
@@ -432,7 +637,7 @@ impl EditorView {
         };
         match key {
             "escape" => {}
-            "enter" => {
+            "enter" | "f4" => {
                 if let Some(target) = popup.target {
                     self.go_to_location(&target, cx);
                 }
@@ -444,6 +649,326 @@ impl EditorView {
         }
         cx.notify();
         true
+    }
+
+    /// The lower right corner drag of the definition popup: it begins at the pointer and
+    /// the size the popup is drawn at.
+    fn start_definition_resize(
+        &mut self,
+        position: Point<Pixels>,
+        width: f32,
+        height: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(popup) = self.lsp.as_mut().and_then(|lsp| lsp.definition.as_mut()) {
+            popup.resize = Some(DefinitionResize {
+                from: position,
+                width,
+                height,
+            });
+        }
+        cx.notify();
+    }
+
+    /// Follows the pointer of a corner drag. A move that reports no button held ends it,
+    /// so a missed release cannot stick.
+    pub(crate) fn drag_definition_resize(
+        &mut self,
+        position: Point<Pixels>,
+        held: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let (max_width, max_height) = self.definition_resize_limits();
+        let Some(popup) = self.lsp.as_mut().and_then(|lsp| lsp.definition.as_mut()) else {
+            return;
+        };
+        let Some(start) = popup.resize else {
+            return;
+        };
+        if !held {
+            popup.resize = None;
+            cx.notify();
+            return;
+        }
+        let dx = f32::from(position.x) - f32::from(start.from.x);
+        let dy = f32::from(position.y) - f32::from(start.from.y);
+        popup.size = Some((
+            (start.width + dx).clamp(DEFINITION_MIN_WIDTH, max_width),
+            (start.height + dy).clamp(DEFINITION_MIN_HEIGHT, max_height),
+        ));
+        cx.notify();
+    }
+
+    /// Ends the corner drag.
+    pub(crate) fn end_definition_resize(&mut self, cx: &mut Context<Self>) {
+        if let Some(popup) = self.lsp.as_mut().and_then(|lsp| lsp.definition.as_mut()) {
+            popup.resize = None;
+        }
+        cx.notify();
+    }
+
+    /// The largest size the definition popup takes: the editor's.
+    fn definition_resize_limits(&self) -> (f32, f32) {
+        self.layout.as_ref().map_or((720., 600.), |layout| {
+            (
+                (f32::from(layout.bounds.size.width) - SPACE_M * 2.).max(DEFINITION_MIN_WIDTH),
+                (f32::from(layout.bounds.size.height) - CONTROL_HEIGHT - SPACE_M * 2.)
+                    .max(DEFINITION_MIN_HEIGHT),
+            )
+        })
+    }
+
+    /// The popup over the window while the corner of the definition popup is dragged.
+    pub(crate) fn definition_drag_catcher(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.lsp
+            .as_ref()
+            .and_then(|lsp| lsp.definition.as_ref())
+            .and_then(|popup| popup.resize)?;
+        Some(
+            div()
+                .id("quick-definition-drag-catcher")
+                .debug_selector(|| "quick-definition-drag-catcher".to_owned())
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .occlude()
+                .cursor_nwse_resize()
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                    this.drag_definition_resize(event.position, event.dragging(), cx);
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_definition_resize(cx)),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_definition_resize(cx)),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The Ctrl+Shift+I popup: the header of the file of the definition and the source
+    /// with the colours and the line numbers of the editor.
+    pub(crate) fn render_definition(
+        &self,
+        popup: &DefinitionPopup,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let theme = *cx.global::<Theme>();
+        let style = &self.style;
+        let rows = definition_rows(popup, style);
+        let header = definition_header(popup.target.as_ref());
+        let icon = definition_icon(&header, cx);
+        let (max_width, max_height) = self.definition_resize_limits();
+        let char_width = style.font_size * DEFINITION_CHAR;
+        let digits = rows.last().map_or(1, |row| row.number.to_string().len());
+        let gutter = digits as f32 * char_width + SPACE_S + SPACE_XS;
+        let widest = rows
+            .iter()
+            .map(|row| row.runs.iter().map(|run| run.text.chars().count()).sum())
+            .max()
+            .unwrap_or(0);
+        let natural = widest as f32 * char_width + gutter + SPACE_M * 2. + SPACE_S;
+        let width = popup
+            .size
+            .map_or(natural, |size| size.0)
+            .clamp(DEFINITION_MIN_WIDTH, max_width);
+        let cap = popup
+            .size
+            .map_or(DEFINITION_MAX_LINES as f32 * style.line_height, |size| {
+                size.1
+            })
+            .min(max_height);
+        let code_height = (rows.len() as f32 * style.line_height).min(cap);
+        let frame_height = CONTROL_HEIGHT + code_height + SPACE_XS;
+
+        let mut body_rows = div()
+            .id("quick-definition-rows")
+            .debug_selector(|| "quick-definition-rows".to_owned())
+            .flex()
+            .flex_col();
+        for row in &rows {
+            let mut runs = Vec::new();
+            for run in &row.runs {
+                if run.text.is_empty() {
+                    continue;
+                }
+                runs.push(
+                    div()
+                        .flex_none()
+                        .text_color(run.color)
+                        .child(run.text.clone())
+                        .into_any_element(),
+                );
+            }
+            body_rows = body_rows.child(
+                div()
+                    .flex()
+                    .items_start()
+                    .h(px(style.line_height))
+                    .whitespace_nowrap()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .justify_end()
+                            .w(px(gutter))
+                            .pr(px(SPACE_S))
+                            .text_color(style.line_number)
+                            .child(row.number.to_string()),
+                    )
+                    .children(runs),
+            );
+        }
+        let body = div()
+            .id("quick-definition-scroll")
+            .debug_selector(|| "quick-definition-scroll".to_owned())
+            .flex()
+            .flex_col()
+            .w_full()
+            .max_h(px(cap))
+            .overflow_y_scroll()
+            .track_scroll(&popup.scroll)
+            .child(body_rows);
+        let body = scrollable("quick-definition", &popup.scroll, body, &theme, window, cx)
+            .flex_none()
+            .min_h_0();
+
+        let edit = div()
+            .id("quick-definition-edit")
+            .debug_selector(|| "quick-definition-edit".to_owned())
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .h(px(CONTROL_HEIGHT - SPACE_XS))
+            .px(px(SPACE_S))
+            .rounded(px(CONTROL_RADIUS))
+            .text_size(px(UI_SIZE))
+            .cursor_pointer()
+            .hover(move |style| style.bg(theme.hover))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.definition_key("enter", cx);
+            }))
+            .tooltip(move |_, cx| tooltip("Edit Source", Some("F4".into()), cx))
+            .tooltip_show_delay(TOOLTIP_CREATE_DELAY)
+            .child("Edit Source");
+        let header = div()
+            .debug_selector(|| "quick-definition-header".to_owned())
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(SPACE_XS))
+            .h(px(CONTROL_HEIGHT))
+            .px(px(SPACE_S))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(icon_sized(icon, 16., &theme))
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(theme.text)
+                    .child(header.name.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(UI_SIZE))
+                    .text_color(theme.text_muted)
+                    .child(header.folder.clone()),
+            )
+            .child(edit);
+        let grip = div()
+            .id("quick-definition-resize")
+            .debug_selector(|| "quick-definition-resize".to_owned())
+            .absolute()
+            .bottom_0()
+            .right_0()
+            .w(px(DEFINITION_GRIP))
+            .h(px(DEFINITION_GRIP))
+            .occlude()
+            .cursor_nwse_resize()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.start_definition_resize(event.position, width, cap, cx);
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                this.drag_definition_resize(event.position, event.dragging(), cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_definition_resize(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_definition_resize(cx)),
+            );
+        let frame = surface(&theme)
+            .id("quick-definition-frame")
+            .debug_selector(|| "quick-definition".to_owned())
+            .occlude()
+            .relative()
+            .w(px(width))
+            .max_h(px(CONTROL_HEIGHT + cap + SPACE_XS))
+            .flex()
+            .flex_col()
+            .font_family(style.font_family.clone())
+            .text_size(px(style.font_size))
+            .child(header)
+            .child(body)
+            .child(grip)
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                this.drag_definition_resize(event.position, event.dragging(), cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_definition_resize(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_definition_resize(cx)),
+            );
+
+        let (position, anchor) = self.popup_position(popup.at, frame_height)?;
+        Some(
+            deferred(
+                anchored()
+                    .anchor(anchor)
+                    .position(position)
+                    .snap_to_window_with_margin(px(SPACE_M))
+                    .child(frame),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
+    /// What the Ctrl+Shift+I popup shows, for a test: the name and the folder of the
+    /// definition, and the text and colours of every row.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn definition_view(&self) -> Option<DefinitionView> {
+        let popup = self.lsp.as_ref()?.definition.as_ref()?;
+        let header = definition_header(popup.target.as_ref());
+        let rows = definition_rows(popup, &self.style)
+            .into_iter()
+            .map(|row| DefinitionRowView {
+                number: row.number,
+                text: row.runs.iter().map(|run| run.text.as_str()).collect(),
+                colors: row.runs.iter().map(|run| run.color).collect(),
+            })
+            .collect();
+        Some(DefinitionView {
+            name: header.name,
+            folder: header.folder,
+            rows,
+        })
     }
 
     /// Ctrl+Alt+Shift+C: the reference to the symbol at the caret.

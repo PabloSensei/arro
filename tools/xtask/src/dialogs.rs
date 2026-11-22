@@ -32,6 +32,10 @@ const EXCEPTIONS: &[(&str, &str)] = &[
         "the documentation popup: an anchored hint next to the caret, closed by Escape",
     ),
     (
+        "crates/ui/editor-view/src/hierarchy.rs",
+        "Quick Definition: an anchored popup next to the caret, and the catcher of its corner drag",
+    ),
+    (
         "crates/ui/editor-view/src/view.rs",
         "completion, Parameter Info and the inline menus: anchored popups, not windows",
     ),

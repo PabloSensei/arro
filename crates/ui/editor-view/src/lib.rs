@@ -68,14 +68,16 @@ pub use state::{
 pub use style::{EditorStyle, SemanticLook};
 // The language data a caller needs to describe its files to the editor, and to build
 // one in a test.
+#[cfg(any(test, feature = "test-support"))]
+pub use hierarchy::{DefinitionRowView, DefinitionView};
 pub use syntax::{FoldStyle, HighlightKind, HighlightSpan, LanguageConfig, StatementRules};
 pub use templates::{ANY as TEMPLATE_ANY, Kind as TemplateKind, Template, TemplateLanguage};
 pub use view::{
     ActionMark, AiProblem, CodeStyleLanguages, CoverageMark, CoverageState, DebugValue,
     DetailedUsage, DocumentationQuery, EditorEvent, EditorOptions, EditorView, EndpointMark,
-    ExtraTemplates, FileBar, GutterKind, GutterMark, InlayPaint, InlineValue, InlineWatchRow,
-    Languages, LineDeclaration, OutlineItem, OutlineKind, PasteText, PlaceMark, PlaceTarget,
-    PlainSyntax, ProblemSummary, RowPaint, RunFiles, RunMark, RunMarkState, Spot, TemplateSettings,
-    Usage, UsagesUpdate, bookmarks, clipboard_history, highlight_text,
+    ExtraTemplates, FileBar, FileIcon, GutterKind, GutterMark, InlayPaint, InlineValue,
+    InlineWatchRow, Languages, LineDeclaration, OutlineItem, OutlineKind, PasteText, PlaceMark,
+    PlaceTarget, PlainSyntax, ProblemSummary, RowPaint, RunFiles, RunMark, RunMarkState, Spot,
+    TemplateSettings, Usage, UsagesUpdate, bookmarks, clipboard_history, highlight_text,
     install_clipboard_history_sink, install_keymap, next_usages_search, set_clipboard_history,
 };

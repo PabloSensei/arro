@@ -16,7 +16,7 @@ use workspace::{COMMIT_TOOL, FileIcons, Settings, Workspace};
 use crate::change_tree::{self, FOLDER_ICON, MODULE_ICON, NodeKind, TreeNode};
 use crate::changelists::{Changelists, Grouping};
 use crate::diff_view::DiffView;
-use crate::git::{GitState, Kind, relative_of, short_commit};
+use crate::git::{CommitOutcome, GitState, Kind, relative_of, short_commit};
 use crate::inspect::ActiveInspect;
 use crate::project_state::project_key;
 use crate::prompt::{Prompt, TextField};
@@ -195,8 +195,22 @@ impl CommitProblem {
 
 /// Whether Amend changes the last commit: its message must be known and differ from the
 /// message in the field. Without ticked files that is the only change an Amend makes.
-fn amend_changes(message: &str, last_subject: Option<&str>) -> bool {
-    last_subject.is_some_and(|subject| subject.trim() != message.trim())
+fn amend_changes(message: &str, last_message: Option<&str>) -> bool {
+    last_message.is_some_and(|last| last.trim() != message.trim())
+}
+
+/// The question before an Amend rewrites a commit the upstream already has. A protected
+/// branch gets a warning: its history is shared, so a force push rewrites what others have.
+pub(crate) fn force_push_question(branch: Option<&str>) -> String {
+    let mut question =
+        String::from("The amended commit was already pushed. Force push with lease?");
+    if let Some(branch @ ("main" | "master")) = branch {
+        question.push_str(&format!(
+            " Warning: {branch} is a protected branch, and a force push \
+             rewrites the history others may have."
+        ));
+    }
+    question
 }
 
 /// Builds the request for git from the message and the ticked files, writing the open
@@ -213,14 +227,14 @@ fn prepare_commit(
 }
 
 /// Like [`prepare_commit`], with `amend` saying whether the last commit is rewritten and
-/// `last_subject` the message it has. An Amend without ticked files only rewrites the
-/// message, so it needs one that differs from `last_subject`.
+/// `last_message` the message it has. An Amend without ticked files only rewrites the
+/// message, so it needs one that differs from `last_message`.
 fn prepare_commit_with(
     message: &str,
     paths: &[String],
     open: Vec<OpenFile>,
     amend: bool,
-    last_subject: Option<&str>,
+    last_message: Option<&str>,
     mut save: impl FnMut(&Path) -> Result<(), String>,
 ) -> Result<CommitRequest, CommitProblem> {
     let message = message.trim();
@@ -231,7 +245,7 @@ fn prepare_commit_with(
         if !amend {
             return Err(CommitProblem::NoFiles);
         }
-        if !amend_changes(message, last_subject) {
+        if !amend_changes(message, last_message) {
             return Err(CommitProblem::NothingToAmend);
         }
     }
@@ -426,8 +440,11 @@ pub struct CommitDraft {
     checked_untracked: HashSet<String>,
     /// Alt+M: the next commit rewrites the last one.
     amend: bool,
-    /// The message of the last commit, which Amend rewrites. Known once Amend is on.
-    last_subject: Option<String>,
+    /// The whole message of the last commit, which Amend rewrites. Known once Amend is on.
+    last_message: Option<String>,
+    /// The text of the field when Amend was ticked. Amend puts the message of the last
+    /// commit in its place, and an untick brings this text back unless the user changed it.
+    message_before_amend: Option<String>,
     /// The switches of the commit options popup.
     sign_off: bool,
     author: Option<String>,
@@ -460,7 +477,8 @@ impl CommitDraft {
             unchecked: HashSet::new(),
             checked_untracked: HashSet::new(),
             amend: false,
-            last_subject: None,
+            last_message: None,
+            message_before_amend: None,
             sign_off: false,
             author: None,
             analysis,
@@ -550,8 +568,8 @@ pub struct CommitPanel {
     files_focused: bool,
     /// Alt+M: the next commit rewrites the last one.
     amend: bool,
-    /// The message of the last commit, copied from the draft.
-    last_subject: Option<String>,
+    /// The whole message of the last commit, copied from the draft.
+    last_message: Option<String>,
     /// The switches of the commit options popup.
     sign_off: bool,
     author: Option<String>,
@@ -612,7 +630,7 @@ impl CommitPanel {
             let checked_untracked = shared.checked_untracked.clone();
             let partial = shared.excluded_hunks.clone();
             let amend = shared.amend;
-            let last_subject = shared.last_subject.clone();
+            let last_message = shared.last_message.clone();
             let sign_off = shared.sign_off;
             let author = shared.author.clone();
             let analysis = shared.analysis;
@@ -637,7 +655,7 @@ impl CommitPanel {
                 scroll_shelf_diff: ScrollHandle::new(),
                 files_focused: false,
                 amend,
-                last_subject,
+                last_message,
                 sign_off,
                 author,
                 analysis,
@@ -688,7 +706,7 @@ impl CommitPanel {
         self.checked_untracked = draft.checked_untracked.clone();
         self.partial = draft.excluded_hunks.clone();
         self.amend = draft.amend;
-        self.last_subject = draft.last_subject.clone();
+        self.last_message = draft.last_message.clone();
         self.sign_off = draft.sign_off;
         self.author = draft.author.clone();
         self.analysis = draft.analysis;
@@ -825,31 +843,34 @@ impl CommitPanel {
         cx.notify();
     }
 
-    /// Alt+M: the last commit is rewritten with the message of the field, which starts as
-    /// the message of that commit.
+    /// Alt+M: the last commit is rewritten with its whole message, which the field takes when
+    /// Amend is ticked. An untick brings back the text the field had, unless the user has
+    /// changed the text Amend put there: that text is theirs.
     fn toggle_amend(&mut self, cx: &mut Context<Self>) {
-        let amend = !self.amend;
-        self.change(cx, |draft| {
-            draft.amend = amend;
-            if !amend {
-                draft.message.text.clear();
-                draft.last_subject = None;
-            }
-        });
-        if !amend {
+        if self.amend {
+            self.change(cx, |draft| {
+                draft.amend = false;
+                let filled = draft.last_message.as_deref() == Some(draft.message.text.as_str());
+                let before = draft.message_before_amend.take();
+                if let Some(before) = before.filter(|_| filled) {
+                    draft.message = TextField::from_text(before);
+                }
+                draft.last_message = None;
+            });
             cx.notify();
             return;
         }
+        self.change(cx, |draft| {
+            draft.amend = true;
+            draft.message_before_amend = Some(draft.message.text.clone());
+        });
         let Some(repo) = self.git.read(cx).repo() else {
             cx.notify();
             return;
         };
-        let job = cx.background_executor().spawn(async move {
-            repo.log(1, 0)
-                .ok()
-                .and_then(|mut commits| commits.pop())
-                .map(|commit| commit.subject)
-        });
+        let job = cx
+            .background_executor()
+            .spawn(async move { repo.last_commit_message().ok().flatten() });
         cx.spawn(async move |this, cx| {
             let message = job.await;
             this.update(cx, |this, cx| {
@@ -857,8 +878,8 @@ impl CommitPanel {
                     && let Some(message) = message
                 {
                     this.change(cx, |draft| {
-                        draft.last_subject = Some(message.clone());
-                        draft.message.text = message;
+                        draft.last_message = Some(message.clone());
+                        draft.message = TextField::from_text(message);
                     });
                 }
                 cx.notify();
@@ -970,7 +991,7 @@ impl CommitPanel {
     /// message of the last commit.
     fn can_commit(&self, checked: &[String]) -> bool {
         !checked.is_empty()
-            || (self.amend && amend_changes(&self.message.text, self.last_subject.as_deref()))
+            || (self.amend && amend_changes(&self.message.text, self.last_message.as_deref()))
     }
 
     /// The text beside the buttons: how many ticked files the commit takes and the branch,
@@ -1744,7 +1765,7 @@ impl CommitPanel {
             &paths,
             open,
             self.amend,
-            self.last_subject.as_deref(),
+            self.last_message.as_deref(),
             |path| {
                 self.workspace
                     .update(cx, |workspace, cx| workspace.save_editor_now(path, cx))
@@ -1767,7 +1788,7 @@ impl CommitPanel {
         if self.analysis && self.start_analysis(&request, push, partial.clone(), cx) {
             return;
         }
-        self.commit_now(request, push, options, partial, cx);
+        self.commit_now(request, push, options, partial, false, cx);
     }
 
     /// The ticked files whose hunks the user picked one by one. A deleted file has no
@@ -1825,30 +1846,51 @@ impl CommitPanel {
     }
 
     /// Sends the request to git. The message field stays as the user left it when git
-    /// fails.
+    /// fails. `force` is the answer to the force push question of an Amend: with it the
+    /// commit goes with a lease.
     fn commit_now(
         &mut self,
         request: CommitRequest,
         push: bool,
         options: CommitOptions,
         partial: Vec<PartialFile>,
+        force: bool,
         cx: &mut Context<Self>,
     ) {
-        let root = self
-            .workspace
-            .read_with(cx, |workspace, _| workspace.root().to_path_buf());
-        if let Ok(root) = root {
-            crate::history::put_label(&root, "Before commit".to_string(), cx);
+        // The answer to the force push question retries the commit on the same state, so the
+        // label of the first try stands for both.
+        if !force {
+            let root = self
+                .workspace
+                .read_with(cx, |workspace, _| workspace.root().to_path_buf());
+            if let Ok(root) = root {
+                crate::history::put_label(&root, "Before commit".to_string(), cx);
+            }
         }
         let me = cx.weak_entity();
         let amend = request.amend;
+        let retry = (request.clone(), options.clone(), partial.clone());
         self.git.update(cx, |git, cx| {
             git.commit_roots(
                 request,
                 options,
                 push,
+                force,
                 partial,
-                move |git: &mut GitState, _ids, cx| {
+                move |git: &mut GitState, outcome, cx| {
+                    if matches!(outcome, CommitOutcome::ForcePushNeeded) {
+                        // Nothing was written. The question opens once this update of the Git
+                        // state is over: the panel reads the Git state, and this update holds it.
+                        let branch = git.status().branch.clone();
+                        let (request, options, partial) = retry;
+                        cx.defer(move |cx| {
+                            me.update(cx, |this, cx| {
+                                this.ask_force_push(branch, request, options, partial, cx)
+                            })
+                            .ok();
+                        });
+                        return;
+                    }
                     let text = if amend && push {
                         "Amended the commit and pushed".to_string()
                     } else if amend {
@@ -1863,7 +1905,8 @@ impl CommitPanel {
                         this.change(cx, |draft| {
                             draft.message.text.clear();
                             draft.amend = false;
-                            draft.last_subject = None;
+                            draft.last_message = None;
+                            draft.message_before_amend = None;
                             draft.excluded_hunks.clear();
                             draft.unchecked.clear();
                             draft.checked_untracked.clear();
@@ -1875,6 +1918,38 @@ impl CommitPanel {
                 cx,
             )
         });
+    }
+
+    /// The question before an Amend rewrites a commit the upstream already has. Force Push
+    /// sends the commit with a lease; Cancel leaves the commit, the remote and the field as
+    /// they were.
+    fn ask_force_push(
+        &mut self,
+        branch: Option<String>,
+        request: CommitRequest,
+        options: CommitOptions,
+        partial: Vec<PartialFile>,
+        cx: &mut Context<Self>,
+    ) {
+        let question = force_push_question(branch.as_deref());
+        let me = cx.weak_entity();
+        let submit = move |cx: &mut App| {
+            let (request, options, partial) = (request.clone(), options.clone(), partial.clone());
+            me.update(cx, |this, cx| {
+                this.commit_now(request, true, options, partial, true, cx)
+            })
+            .ok();
+        };
+        let workspace = self.workspace.clone();
+        self.window
+            .update(cx, |_, window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        Prompt::ask("Force Push", &question, submit, workspace, window, cx);
+                    })
+                    .ok();
+            })
+            .ok();
     }
 
     /// Runs Inspect Code over the files of the commit. `false` means the inspection
@@ -1930,6 +2005,7 @@ impl CommitPanel {
                 pending.push,
                 pending.options,
                 pending.partial,
+                false,
                 cx,
             );
             return;
@@ -1946,6 +2022,7 @@ impl CommitPanel {
                 pending.push,
                 pending.options,
                 pending.partial,
+                false,
                 cx,
             );
             return;
@@ -1982,6 +2059,7 @@ impl CommitPanel {
                     pending.push,
                     pending.options,
                     pending.partial,
+                    false,
                     cx,
                 );
             });

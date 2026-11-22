@@ -94,6 +94,11 @@ pub struct Languages {
 
 impl Global for Languages {}
 
+/// The icon of a file by its path. Set by the application, the editor knows no file types.
+pub struct FileIcon(pub Arc<dyn Fn(&Path) -> &'static str>);
+
+impl Global for FileIcon {}
+
 /// Live templates of a format that a tool adds beside the languages of the application,
 /// such as the SQL console. Every builder is asked in turn and the first answer wins.
 pub struct ExtraTemplates(pub Vec<fn(&Path) -> Option<&'static TemplateLanguage>>);
@@ -6388,6 +6393,7 @@ impl EditorView {
                                 .min_w_0()
                                 .truncate()
                                 .text_color(theme.text)
+                                .when(parts.bold, |line| line.font_weight(FontWeight::BOLD))
                                 .child(left),
                         )
                         .children(parts.right.map(|right| {
@@ -6606,6 +6612,7 @@ impl EditorView {
                 );
             }
             let sections = menu.has_sections();
+            let warning = self.warning_under(menu.at);
             for row in menu.window() {
                 let selected = row == menu.selected;
                 let quick_fix = menu.quick_fix(row);
@@ -6641,15 +6648,8 @@ impl EditorView {
                         theme.text
                     });
                 if sections {
-                    item = item.child(icon_sized(
-                        if quick_fix {
-                            "codeInsight/quickFix"
-                        } else {
-                            "codeInsight/intention"
-                        },
-                        14.,
-                        &theme,
-                    ));
+                    let bulb = crate::actions::bulb_icon(quick_fix, warning);
+                    item = item.child(icon_sized(bulb, 14., &theme));
                 }
                 rows.push(
                     item.child(
@@ -7143,72 +7143,12 @@ impl EditorView {
             );
         }
         if let Some(popup) = &lsp.definition
-            && let Some(position) = self.below(popup.at)
+            && let Some(element) = self.render_definition(popup, window, cx)
         {
-            let mut rows: Vec<AnyElement> = Vec::new();
-            let mut line_start = 0;
-            for line in popup.text.split('\n').take(30) {
-                let line_end = line_start + line.len();
-                let mut runs: Vec<AnyElement> = Vec::new();
-                let mut at = line_start;
-                for span in popup.spans.iter().filter(|span| {
-                    (span.start as usize) < line_end && (span.end as usize) > line_start
-                }) {
-                    let start = (span.start as usize).max(line_start);
-                    let end = (span.end as usize).min(line_end);
-                    if start > at {
-                        runs.push(
-                            div()
-                                .flex_none()
-                                .text_color(self.style.code)
-                                .child(line[at - line_start..start - line_start].to_owned())
-                                .into_any_element(),
-                        );
-                    }
-                    runs.push(
-                        div()
-                            .flex_none()
-                            .text_color(self.style.color_of(span.kind))
-                            .child(line[start - line_start..end - line_start].to_owned())
-                            .into_any_element(),
-                    );
-                    at = end;
-                }
-                if at < line_end {
-                    runs.push(
-                        div()
-                            .flex_none()
-                            .text_color(self.style.code)
-                            .child(line[at - line_start..].to_owned())
-                            .into_any_element(),
-                    );
-                }
-                rows.push(
-                    div()
-                        .flex()
-                        .whitespace_nowrap()
-                        .children(runs)
-                        .into_any_element(),
-                );
-                line_start = line_end + 1;
-            }
-            let body = surface(&theme)
-                .debug_selector(|| "quick-definition".to_owned())
-                .max_w(px(720.))
-                .p_2()
-                .font_family(self.style.font_family.clone())
-                .text_size(px(self.style.font_size))
-                .children(rows);
-            popups.push(
-                deferred(
-                    anchored()
-                        .position(position)
-                        .snap_to_window_with_margin(px(SPACE_M))
-                        .child(body),
-                )
-                .with_priority(1)
-                .into_any_element(),
-            );
+            popups.push(element);
+        }
+        if let Some(catcher) = self.definition_drag_catcher(cx) {
+            popups.push(catcher);
         }
         if let Some(note) = &lsp.note
             && let Some(position) = self.below(note.at)

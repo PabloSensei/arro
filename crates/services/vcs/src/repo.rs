@@ -555,6 +555,16 @@ impl Repository {
             .map(drop)
     }
 
+    /// The whole message of the last commit of the current branch: the subject, the blank
+    /// line and the body, without the line ends after it. `None` on a branch with no commit.
+    pub fn last_commit_message(&self) -> io::Result<Option<String>> {
+        if self.status()?.head.is_none() {
+            return Ok(None);
+        }
+        let message = self.run(["log", "-1", "--format=%B"])?;
+        Ok(Some(message.trim_end_matches(['\r', '\n']).to_owned()))
+    }
+
     /// Whether the commit belongs to the user of the repository.
     pub fn is_own_commit(&self, commit: &str) -> io::Result<bool> {
         let email = self.run(["show", "-s", "--format=%ae", commit])?;
@@ -570,6 +580,19 @@ impl Repository {
     pub fn is_pushed(&self, commit: &str) -> io::Result<bool> {
         let branches = self.run(["branch", "-r", "--contains", commit])?;
         Ok(!branches.trim().is_empty())
+    }
+
+    /// Whether HEAD is the upstream of the current branch or one of its ancestors: the commit
+    /// is on the remote branch Push sends it to. Nothing is fetched, and a branch with no
+    /// upstream has nothing on a remote through it.
+    pub fn head_on_upstream(&self) -> io::Result<bool> {
+        Ok(self
+            .git
+            .run(
+                &self.root,
+                ["merge-base", "--is-ancestor", "HEAD", "@{upstream}"],
+            )
+            .is_ok())
     }
 
     /// Gives the commit another message, as F2 of the log does. The author and the tree
@@ -718,6 +741,13 @@ impl Repository {
         self.git
             .run(&self.root, ["push", "--set-upstream", remote, "HEAD"])?;
         Ok(())
+    }
+
+    /// Sends the current branch to its upstream with a lease: the remote branch is replaced
+    /// only if it is still where this repository last saw it. Amend uses it for a commit the
+    /// upstream already has, after the user agreed to the force push.
+    pub fn push_with_lease(&self) -> io::Result<()> {
+        self.run(["push", "--force-with-lease"]).map(drop)
     }
 
     /// The names of the remotes of the repository.

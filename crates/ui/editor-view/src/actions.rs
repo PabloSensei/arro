@@ -319,8 +319,8 @@ pub(crate) fn server_edits(store: &RopeStore, edits: Vec<DocumentEdit>) -> Optio
 
 const OVERLAPPING: &str = "The language server sent overlapping edits, nothing was changed";
 
-/// Alt+Enter with nothing to offer.
-const NO_ACTIONS: &str = "No actions available here";
+/// Alt+Enter with nothing to offer after the filter, as IDEA says it.
+const NO_ACTIONS: &str = "No intentions available";
 /// The greyed last line of Alt+Enter while the server imports: more actions come later.
 const IMPORTING_ACTIONS: &str = "More actions after the project is imported";
 
@@ -762,6 +762,29 @@ impl EditorView {
             code: mark.code.clone(),
             text: state.text(),
         })
+    }
+
+    /// Whether the problems under the caret are warnings and no error. The bulb of a quick
+    /// fix there is yellow; an error makes it red.
+    pub(crate) fn warning_under(&self, caret: usize) -> bool {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        let mut warning = false;
+        for mark in lsp
+            .server_marks
+            .iter()
+            .chain(lsp.native_marks.values().flatten())
+        {
+            if mark.range.start <= caret && caret <= mark.range.end {
+                match mark.severity {
+                    lang_api::Severity::Error => return false,
+                    lang_api::Severity::Warning => warning = true,
+                    lang_api::Severity::Information | lang_api::Severity::Hint => {}
+                }
+            }
+        }
+        warning
     }
 
     /// Alt+Enter: fixes of the problem under the caret first, then the suppressions of
@@ -1692,21 +1715,73 @@ impl EditorView {
 }
 
 /// The rows of the language's answer for Alt+Enter: the quick fixes first, and the preferred
-/// actions first inside a section. An action with no edit, no rename and no resolve has
-/// nothing to apply, so it is left out.
+/// actions first inside a section. The source actions of the whole file are left out, and so
+/// is an action with no edit, no rename and no resolve, which has nothing to apply.
 fn server_rows(mut entries: Vec<ActionEntry>) -> Vec<(MenuSection, Pick)> {
+    entries.retain(|entry| !is_file_action(entry));
     entries.sort_by_key(|entry| (section_of(entry) != MenuSection::QuickFix, !entry.preferred));
     without_duplicate_actions(entries)
         .into_iter()
-        .filter(|entry| {
-            !entry.edits.is_empty() || !entry.renames.is_empty() || entry.resolve.is_some()
-        })
+        .filter(applicable)
         .map(|entry| (section_of(&entry), Pick::Action(entry)))
         .collect()
 }
 
+/// Whether an action works on the whole file rather than on the place of the caret: the
+/// source actions, Organize Imports and Fix All. Alt+Insert and the Code menu give them.
+fn is_file_action(entry: &ActionEntry) -> bool {
+    matches!(
+        entry.kind,
+        Some(ActionKind::Source | ActionKind::OrganizeImports | ActionKind::FixAll)
+    )
+}
+
+/// Whether an action has something to apply: an edit, a rename, or an edit that the server
+/// gives on resolve.
+fn applicable(entry: &ActionEntry) -> bool {
+    !entry.edits.is_empty() || !entry.renames.is_empty() || entry.resolve.is_some()
+}
+
+/// The codes of the source actions that the fixed rows of Source Generate give already, so
+/// Alt+Insert does not list the server's action for them again.
+const GENERATE_ROW_CODES: [&str; 6] = [
+    "source.generate.accessors",
+    "source.generate.constructors",
+    "source.generate.delegateMethods",
+    "source.generate.hashCodeEquals",
+    "source.generate.toString",
+    "source.overrideMethods",
+];
+
+/// The source actions of the language as rows of Alt+Insert. With the fixed rows of Source
+/// Generate (`fixed`), the actions those rows give are left out.
+pub(crate) fn source_rows(entries: Vec<ActionEntry>, fixed: bool) -> Vec<Pick> {
+    entries
+        .into_iter()
+        .filter(|entry| entry.kind == Some(ActionKind::Source) && applicable(entry))
+        .filter(|entry| {
+            let covered = entry
+                .code
+                .as_deref()
+                .is_some_and(|code| GENERATE_ROW_CODES.contains(&code));
+            !(fixed && covered)
+        })
+        .map(Pick::Action)
+        .collect()
+}
+
+/// The bulb of a row of Alt+Enter: a quick fix of an error is red, a quick fix of a warning
+/// is yellow, and a refactoring or an intention has the plain bulb.
+pub(crate) fn bulb_icon(quick_fix: bool, warning: bool) -> &'static str {
+    match (quick_fix, warning) {
+        (true, false) => "codeInsight/quickFix",
+        (true, true) => "codeInsight/intention",
+        (false, _) => "codeInsight/intentionBulb",
+    }
+}
+
 /// The actions of a language answer. An answer that says it is unknown gives none.
-fn answered_entries(answer: Option<(Vec<ActionEntry>, Confidence)>) -> Vec<ActionEntry> {
+pub(crate) fn answered_entries(answer: Option<(Vec<ActionEntry>, Confidence)>) -> Vec<ActionEntry> {
     match answer {
         Some((entries, confidence)) if confidence != Confidence::Unknown => entries,
         _ => Vec::new(),
@@ -1738,7 +1813,10 @@ mod tests {
     use lang_api::{DocumentEdit, TextPoint, TextSpan};
     use text_core::{FileFormat, RopeStore, TextStore};
 
-    use super::{server_batches, server_edits, without_duplicate_actions};
+    use super::{
+        Pick, bulb_icon, server_batches, server_edits, server_rows, source_rows,
+        without_duplicate_actions,
+    };
     use crate::EditorState;
 
     const TEXT: &str = "import b;\nimport a;\nclass X {}\n";
@@ -1876,6 +1954,90 @@ mod tests {
         );
         state.perform(keymap::editor::UNDO, 10);
         assert_eq!(state.text(), TEXT);
+    }
+
+    #[test]
+    fn alt_enter_lists_only_the_quick_fixes_and_the_refactorings() {
+        use lang_api::{ActionEntry, ActionKind};
+
+        let entry = |title: &str, kind: ActionKind| ActionEntry {
+            title: title.to_owned(),
+            kind: Some(kind),
+            code: None,
+            preferred: false,
+            edits: Vec::new(),
+            renames: Vec::new(),
+            handle: None,
+            resolve: Some(format!("resolve {title}")),
+            rename: None,
+        };
+        let rows = server_rows(vec![
+            entry("Organize imports", ActionKind::OrganizeImports),
+            entry("Sort members", ActionKind::Source),
+            entry("Clean up", ActionKind::FixAll),
+            entry("Inline", ActionKind::Refactor),
+            entry("Add import", ActionKind::QuickFix),
+        ]);
+        let titles: Vec<&str> = rows.iter().map(|(_, pick)| pick.label()).collect();
+        assert_eq!(titles, ["Add import", "Inline"]);
+    }
+
+    #[test]
+    fn alt_insert_lists_each_source_action_once() {
+        use lang_api::{ActionEntry, ActionKind};
+
+        let entry = |title: &str, kind: ActionKind, code: &str| ActionEntry {
+            title: title.to_owned(),
+            kind: Some(kind),
+            code: Some(code.to_owned()),
+            preferred: false,
+            edits: Vec::new(),
+            renames: Vec::new(),
+            handle: None,
+            resolve: Some(format!("resolve {title}")),
+            rename: None,
+        };
+        let answer = || {
+            vec![
+                entry(
+                    "Generate toString()",
+                    ActionKind::Source,
+                    "source.generate.toString",
+                ),
+                entry("Sort members", ActionKind::Source, "source.sortMembers"),
+                entry(
+                    "Organize imports",
+                    ActionKind::OrganizeImports,
+                    "source.organizeImports",
+                ),
+                entry(
+                    "Change modifiers",
+                    ActionKind::Source,
+                    "source.generate.finalModifiers",
+                ),
+            ]
+        };
+        let labels = |rows: Vec<Pick>| -> Vec<String> {
+            rows.iter().map(|pick| pick.label().to_owned()).collect()
+        };
+        // The fixed rows of Source Generate give toString already.
+        assert_eq!(
+            labels(source_rows(answer(), true)),
+            ["Sort members", "Change modifiers"]
+        );
+        // Without them every source action is listed, but not Organize Imports.
+        assert_eq!(
+            labels(source_rows(answer(), false)),
+            ["Generate toString()", "Sort members", "Change modifiers"]
+        );
+    }
+
+    #[test]
+    fn a_quick_fix_of_an_error_is_red_and_of_a_warning_yellow() {
+        assert_eq!(bulb_icon(true, false), "codeInsight/quickFix");
+        assert_eq!(bulb_icon(true, true), "codeInsight/intention");
+        assert_eq!(bulb_icon(false, false), "codeInsight/intentionBulb");
+        assert_eq!(bulb_icon(false, true), "codeInsight/intentionBulb");
     }
 
     #[test]

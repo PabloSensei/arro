@@ -237,3 +237,32 @@ fn a_class_in_the_file_of_its_name_shows_no_file_name(cx: &mut TestAppContext) {
         "a class in a file of another name shows that file"
     );
 }
+
+/// Open tabs do not lift a test or a longer name above `Owner`: the open order only breaks
+/// a tie of names of one length.
+#[ui_kit::gpui::test]
+fn open_tabs_keep_the_shorter_source_name_first(cx: &mut TestAppContext) {
+    let root = scratch("palette-own-open");
+    write_files(
+        &root,
+        &[
+            ("src/main/Owner.txt", "class Owner\n"),
+            ("src/main/OwnerController.txt", "class OwnerController\n"),
+            ("src/test/OwnerTests.txt", "class OwnerTests\n"),
+        ],
+    );
+    let window = open_test_window(cx, root.clone());
+    cx.run_until_parked();
+    draw(cx, window);
+    crate::window_tests::open_path(cx, window, &root.join("src/test/OwnerTests.txt"));
+    crate::window_tests::open_path(cx, window, &root.join("src/main/OwnerController.txt"));
+    wait_for_project_index(cx);
+
+    search(cx, window, keys::GOTO_CLASS, "Own", |rows| rows.len() >= 3);
+
+    assert_eq!(
+        titles(cx, window),
+        ["Owner", "OwnerController", "OwnerTests"],
+        "the shorter source name comes first, the test last, open or not"
+    );
+}

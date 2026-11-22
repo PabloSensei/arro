@@ -59,7 +59,7 @@ pub(crate) struct HierarchyLanguage {
     overridable: Mutex<Vec<OverridableMethod>>,
     add: Mutex<Option<WorkspaceChange>>,
     only_abstract: Mutex<Option<bool>>,
-    preview: Mutex<Option<DefinitionPreview>>,
+    pub(crate) preview: Mutex<Option<DefinitionPreview>>,
     reference: Mutex<Option<String>>,
     type_definitions: Mutex<Vec<SourceSpan>>,
     pub(crate) call_roots: Mutex<Vec<CallHierarchyItem>>,
