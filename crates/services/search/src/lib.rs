@@ -11,7 +11,7 @@ mod text;
 
 pub use everywhere::{ActionItem, Found, Group, Sources, Tab, search_everywhere};
 pub use files::{GotoQuery, rank_files};
-pub use fuzzy::{FuzzyMatcher, NameMatcher, Ranked, rank};
+pub use fuzzy::{FuzzyMatcher, MatchKind, NameMatcher, Ranked, rank};
 pub use source::{
     IndexedSymbols, NATIVE, SymbolRequest, SymbolRow, SymbolScope, SymbolSource, Target, merge_rows,
 };

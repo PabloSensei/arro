@@ -396,7 +396,7 @@ impl LivePanel {
         window.defer(cx, move |window, cx| {
             if !file.is_file() {
                 let _ = workspace.update(cx, |workspace, cx| {
-                    workspace.notify_user(
+                    workspace.notify_error(
                         "Live Data",
                         format!("{} does not exist", file.display()),
                         cx,
@@ -428,7 +428,7 @@ impl LivePanel {
             }
             _ => {
                 let section = self.section;
-                if self.filters[section.index()].key_with_clipboard(event, false, cx) {
+                if self.filters[section.index()].key_tool_field(event, false, cx) {
                     self.selected[section.index()] = None;
                     cx.stop_propagation();
                     cx.notify();

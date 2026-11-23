@@ -722,12 +722,12 @@ fn build_files_and_the_makefile_carry_their_language_icons_in_the_tree(cx: &mut 
         })
         .unwrap();
     assert_eq!(
-        gradle_icon, "fileTypes/groovy",
-        "a Gradle build script carries the Groovy icon"
+        gradle_icon, "fileTypes/gradle",
+        "a Gradle build script carries its own icon"
     );
     assert_eq!(
-        kotlin_icon, "fileTypes/kotlin",
-        "a Gradle Kotlin script carries the Kotlin icon"
+        kotlin_icon, "fileTypes/gradle",
+        "a Gradle Kotlin script carries the Gradle icon, not the Kotlin one"
     );
     assert_eq!(
         make_icon, "fileTypes/makefile",

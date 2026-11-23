@@ -87,19 +87,19 @@ fn a_theme_is_chosen_from_a_dropdown(cx: &mut TestAppContext) {
     let window = open_settings(cx, "settings-polish-theme");
     let file = settings_file(cx, window);
 
-    click(cx, window, "settings-theme");
+    click(cx, window, "settings-theme-light");
     draw(cx, window);
     assert!(
         has(cx, window, "settings-choice-option-nord"),
-        "the Theme row opens the list of themes"
+        "the light theme row opens the list of themes"
     );
 
     click(cx, window, "settings-choice-option-nord");
     draw(cx, window);
     assert_eq!(
-        settings(cx).theme,
+        settings(cx).theme_light,
         "nord",
-        "the value of the list is the theme of the window"
+        "the value of the list is the theme of the light system look"
     );
     assert!(
         !has(cx, window, "settings-choice-option-nord"),
@@ -109,29 +109,23 @@ fn a_theme_is_chosen_from_a_dropdown(cx: &mut TestAppContext) {
     click(cx, window, "settings-apply");
     draw(cx, window);
     wait_for_signal(cx, "the saved theme", |_| {
-        fs::read_to_string(&file).is_ok_and(|text| text.contains("\"theme\": \"nord\""))
+        fs::read_to_string(&file).is_ok_and(|text| text.contains("\"theme_light\": \"nord\""))
     });
 }
 
 #[gpui::test]
 fn the_keys_of_a_dropdown_walk_its_values(cx: &mut TestAppContext) {
     let window = open_settings(cx, "settings-polish-keys");
-    let dark = cx.read(|cx| cx.global::<ui_kit::Theme>().dark);
-    let expected = if dark { "light" } else { "high-contrast" };
 
-    click(cx, window, "settings-theme");
+    click(cx, window, "settings-theme-light");
     draw(cx, window);
     press(cx, window, "down");
     press(cx, window, "enter");
     draw(cx, window);
     assert_eq!(
-        settings(cx).theme,
-        expected,
+        settings(cx).theme_light,
+        "high-contrast",
         "Down and Enter pick the next theme of the list"
-    );
-    assert!(
-        !settings(cx).theme_sync_with_os,
-        "a theme of the list turns the sync off"
     );
 }
 

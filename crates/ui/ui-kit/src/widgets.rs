@@ -79,8 +79,21 @@ pub fn checkbox_row(
     on: bool,
     theme: &Theme,
 ) -> Stateful<Div> {
-    let (hover, pressed) = (theme.hover, theme.pressed);
     let label = label.into();
+    checkbox_row_labelled(id, label.clone(), label, on, theme)
+}
+
+/// [`checkbox_row`] with a label of its own, such as one that marks the words of a search. The
+/// test probe of the row names the plain `text` of the label.
+pub fn checkbox_row_labelled(
+    id: impl Into<ElementId>,
+    label: impl IntoElement,
+    text: impl Into<SharedString>,
+    on: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let (hover, pressed) = (theme.hover, theme.pressed);
+    let text = text.into();
     let id = id.into();
     #[cfg(any(test, feature = "test-support"))]
     let name = id.to_string();
@@ -108,9 +121,11 @@ pub fn checkbox_row(
         .hover(move |style| style.bg(hover))
         .active(move |style| style.bg(pressed))
         .child(box_)
-        .child(div().min_w_0().text_color(theme.text).child(label.clone()));
+        .child(div().min_w_0().text_color(theme.text).child(label));
     #[cfg(any(test, feature = "test-support"))]
-    let row = row.child(crate::bounds_probe(name, Some(label)));
+    let row = row.child(crate::bounds_probe(name, Some(text)));
+    #[cfg(not(any(test, feature = "test-support")))]
+    let _ = text;
     row
 }
 

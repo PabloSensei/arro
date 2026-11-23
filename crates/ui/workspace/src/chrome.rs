@@ -34,13 +34,13 @@ use crate::window::{
     RebuildProject, ReopenTab, Rerun, RerunTests, ResizeStep, ResizeToolWindowDown,
     ResizeToolWindowLeft, ResizeToolWindowRight, ResizeToolWindowUp, Resume, Run,
     RunTestsWithCoverage, RunTestsWithProfiler, RunToCursor, RunWithCoverage, SERVICES_TOOL,
-    STRUCTURE_TOOL, SaveAll, ShowAllApps, ShowBranches, ShowCommit, ShowExecutionPoint, ShowSearch,
-    ShowSettings, SmartStepInto, SplitDown, SplitRight, StepInto, StepOut, StepOver, Stop,
-    StopBackgroundProcesses, Synchronize, TASKS_TOOL, TERMINAL_TOOL, TabLeft, TabRight, ToggleAi,
-    ToggleBookmarks, ToggleBreakpoint, ToggleCommit, ToggleCoverage, ToggleDatabase, ToggleDebug,
-    ToggleFullScreen, ToggleLog, ToggleProject, ToggleRun, ToggleServices, ToggleStructure,
-    ToggleTemporaryLineBreakpoint, ToggleTerminal, ToggleTheme, ToggleUsages, USAGES_TOOL,
-    UpdateProject, VcsQuickList, ViewBreakpoints, Workspace, ZoomWindow,
+    STRUCTURE_TOOL, SaveAll, SelectInProject, ShowAllApps, ShowBranches, ShowCommit,
+    ShowExecutionPoint, ShowSearch, ShowSettings, SmartStepInto, SplitDown, SplitRight, StepInto,
+    StepOut, StepOver, Stop, StopBackgroundProcesses, Synchronize, TASKS_TOOL, TERMINAL_TOOL,
+    TabLeft, TabRight, ToggleAi, ToggleBookmarks, ToggleBreakpoint, ToggleCommit, ToggleCoverage,
+    ToggleDatabase, ToggleDebug, ToggleFullScreen, ToggleLog, ToggleProject, ToggleRun,
+    ToggleServices, ToggleStructure, ToggleTemporaryLineBreakpoint, ToggleTerminal, ToggleTheme,
+    ToggleUsages, USAGES_TOOL, UpdateProject, VcsQuickList, ViewBreakpoints, Workspace, ZoomWindow,
 };
 use crate::window::{
     ENDPOINTS_TOOL, RunWithProfiler, TODO_TOOL, ToggleEndpoints, ToggleHttp, ToggleProblems,
@@ -1915,6 +1915,7 @@ impl Workspace {
                 MenuEntry::separator(),
                 command(workspace_keys::RECENT_FILES, "Recent Files"),
                 command(workspace_keys::RECENT_LOCATIONS, "Recent Locations"),
+                command(workspace_keys::RECENT_CHANGES, "Recent Changes"),
                 command(workspace_keys::BACK, "Back"),
                 command(workspace_keys::FORWARD, "Forward"),
                 MenuEntry::separator(),
@@ -1951,6 +1952,7 @@ impl Workspace {
                 MenuEntry::separator(),
                 command(workspace_keys::SEARCH_EVERYWHERE, "Search Everywhere"),
                 command(workspace_keys::FILE_STRUCTURE, "File Structure"),
+                self.action_row("Select Opened File", SelectInProject),
                 MenuEntry::separator(),
                 command(workspace_keys::BACK, "Back"),
                 command(workspace_keys::FORWARD, "Forward"),
@@ -1996,6 +1998,8 @@ impl Workspace {
                 command(editor_keys::REFORMAT, "Reformat Code"),
                 command(workspace_keys::SHOW_REFORMAT_DIALOG, "Reformat File..."),
                 command(editor_keys::OPTIMIZE_IMPORTS, "Optimize Imports"),
+                command(editor_keys::SORT_MEMBERS, "Sort Members"),
+                command(editor_keys::ADD_FINAL_MODIFIERS, "Add final Modifiers"),
                 command(editor_keys::AUTO_INDENT, "Auto-Indent Lines"),
                 MenuEntry::separator(),
                 command(workspace_keys::INSPECT_CODE, "Inspect Code..."),
@@ -3112,6 +3116,7 @@ impl Workspace {
                 state,
                 geometry,
                 bar,
+                title,
                 ..
             } => {
                 let weak = cx.weak_entity();
@@ -3138,7 +3143,16 @@ impl Workspace {
                     on_hover,
                     on_open,
                 };
-                let body = menu(entries, state, geometry, &callbacks, theme, window, cx);
+                let body = menu_titled(
+                    title.as_ref(),
+                    entries,
+                    state,
+                    geometry,
+                    &callbacks,
+                    theme,
+                    window,
+                    cx,
+                );
                 let backdrop = deferred(
                     div()
                         .id("menu-backdrop")
@@ -3189,9 +3203,13 @@ impl Workspace {
         if !self.balloon_visible {
             return None;
         }
-        let (title, text) = match &self.balloon {
-            Some(balloon) => (balloon.title.clone(), balloon.text.clone()),
-            None => ("Notifications".into(), "Nothing new.".into()),
+        let (title, text, level) = match &self.balloon {
+            Some(balloon) => (balloon.title.clone(), balloon.text.clone(), balloon.level),
+            None => (
+                "Notifications".into(),
+                "Nothing new.".into(),
+                NotificationLevel::Info,
+            ),
         };
         let close = cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_balloon(cx));
         let mut actions = Vec::new();
@@ -3247,6 +3265,7 @@ impl Workspace {
         let body = notification(
             title,
             text,
+            level,
             actions,
             close,
             cx.has_global::<ScriptSpots>(),

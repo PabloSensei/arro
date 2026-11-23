@@ -47,18 +47,14 @@ mod tests {
             true,
             Some(InspectionLevel::Error),
         );
-        settings.set(
-            "org.eclipse.jdt.core.compiler.problem.unusedImport",
-            false,
-            None,
-        );
+        settings.set("example.problem.unusedImport", false, None);
 
         save_inspections(&root, &settings).unwrap();
         let read = load_inspections(&root);
 
         assert_eq!(read, settings);
         assert_eq!(
-            read.setting("org.eclipse.jdt.core.compiler.problem.unusedImport"),
+            read.setting("example.problem.unusedImport"),
             Some(InspectionSetting {
                 enabled: false,
                 level: None,

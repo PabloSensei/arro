@@ -410,6 +410,45 @@ impl TextField {
         self.key(event, multiline)
     }
 
+    /// The keys a field of a tool window takes: printing characters, Backspace and
+    /// Delete, the arrows, Home and End, and Ctrl+A, C, V, X and Z. Every other
+    /// combination with Ctrl, Alt or Ctrl+Shift goes on to the window bindings, so
+    /// Ctrl+Shift+A opens Find Action while the field has the focus. Enter and Escape stay
+    /// with the owner of the field: the panel opens its selected row on Enter, and the
+    /// window takes Escape to give the focus back to the editor. Returns whether the key
+    /// was taken.
+    pub fn key_tool_field(&mut self, event: &KeyDownEvent, multiline: bool, cx: &mut App) -> bool {
+        let stroke = &event.keystroke;
+        let modifiers = stroke.modifiers;
+        let primary = modifiers.control || modifiers.platform;
+        if modifiers.alt {
+            return false;
+        }
+        if primary {
+            // Ctrl+Shift is a key of the window even for a letter the field takes with Ctrl.
+            if modifiers.shift {
+                return false;
+            }
+            return match stroke.key.as_str() {
+                // The field has no undo of its own, but Ctrl+Z must not reach the editor
+                // behind the window either.
+                "a" | "c" | "v" | "x" | "z" => {
+                    self.key_with_clipboard(event, multiline, cx);
+                    true
+                }
+                _ => false,
+            };
+        }
+        match stroke.key.as_str() {
+            "backspace" | "delete" | "left" | "right" | "up" | "down" | "home" | "end" => {
+                self.key_with_clipboard(event, multiline, cx);
+                true
+            }
+            "enter" | "escape" => false,
+            _ => self.key_with_clipboard(event, multiline, cx),
+        }
+    }
+
     /// [`key_with_clipboard`](Self::key_with_clipboard) for a password: Copy and Cut do
     /// nothing, so the secret never reaches the clipboard; Paste and the other keys work.
     pub fn key_secret(&mut self, event: &KeyDownEvent, cx: &mut App) -> bool {

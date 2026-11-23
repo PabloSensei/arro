@@ -55,6 +55,7 @@ mod git_history;
 mod git_log;
 mod gutter_menu;
 pub mod heap_dump;
+mod hierarchy_scope;
 mod history;
 mod history_view;
 mod http;
@@ -95,12 +96,14 @@ mod project_structure;
 mod prompt;
 mod proposal;
 mod push;
+mod recent_changes;
 mod refactor_form;
 mod refactor_undo;
 mod reformat;
 mod run;
 mod run_configs;
 mod script;
+mod select_in;
 mod sequence_diagram;
 mod sequence_export;
 mod sequence_layout;
@@ -726,6 +729,9 @@ mod window_tests_project_compact;
 mod window_tests_daily;
 
 #[cfg(test)]
+mod window_tests_problems;
+
+#[cfg(test)]
 mod window_tests_annotate_idea;
 
 #[cfg(test)]
@@ -734,6 +740,8 @@ mod window_tests_git_log_icons;
 mod bookmarks;
 #[cfg(test)]
 mod window_tests_build_profiles;
+#[cfg(test)]
+mod window_tests_scratch_languages;
 
 mod choice;
 mod invalidate;
@@ -783,6 +791,7 @@ pub use start::{
 };
 pub use tree_ops::{Creates, FileTemplate};
 pub use usages::{ActiveUsages, UsagesHub};
+pub use window_popups::{ScratchFileType, ScratchFileTypes};
 
 /// Names the build tools of the language for the pages and the search of Settings.
 pub fn set_build_tool_names(first: impl Into<String>, second: impl Into<String>) {
@@ -825,9 +834,11 @@ pub struct StartedServer {
 /// search needs to know about the language, `project` how it builds and runs, `server` answers
 /// about the code, `script`
 /// drives the window without real input, see `script.rs`.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     launch: Launch,
     languages: Languages,
+    scratch: ScratchFileTypes,
     search: SearchSetup,
     project: ProjectSetup,
     server: Option<LanguageServer>,
@@ -838,6 +849,7 @@ pub fn run(
         launch,
         OpenRequests::default(),
         languages,
+        scratch,
         search,
         project,
         server,
@@ -858,6 +870,7 @@ pub fn run_with_setup(
     launch: Launch,
     requests: OpenRequests,
     languages: Languages,
+    scratch: ScratchFileTypes,
     search: SearchSetup,
     project: ProjectSetup,
     server: Option<LanguageServer>,
@@ -882,6 +895,7 @@ pub fn run_with_setup(
     workspace::run(launch, requests, move |workspace, window, cx| {
         cx.set_global(claude);
         cx.set_global(languages);
+        cx.set_global(scratch);
         cx.set_global(editor_view::CodeStyleLanguages(code_style_language));
         cx.set_global(cache);
         cx.set_global(templates.initial());
@@ -1002,7 +1016,7 @@ pub fn apply_setup(workspace: &mut Workspace, setup: LanguageSetup, cx: &mut Con
                 while let Some(started) = receiver.next().await {
                     let Some(started) = started else {
                         let updated = workspace.update(cx, |workspace, cx| {
-                            workspace.notify_user(
+                            workspace.notify_warning(
                                 "Language Server",
                                 "The tool was not found. Install it, then press Check again.",
                                 cx,
@@ -1043,7 +1057,7 @@ fn watch_status(
             };
             let shown = workspace.update(cx, |workspace, cx| {
                 if let Some(reason) = reason.clone() {
-                    workspace.notify_user_with_command(
+                    workspace.notify_error_with_command(
                         "Language Server",
                         reason,
                         "Retry",
@@ -1207,7 +1221,7 @@ fn notify_project_problem(
         ),
     ];
     match &problem.log {
-        Some(log) => workspace.notify_user_with_action_and_commands(
+        Some(log) => workspace.notify_error_with_action_and_commands(
             "Language Server",
             text,
             "Show Log",
@@ -1215,7 +1229,7 @@ fn notify_project_problem(
             buttons,
             cx,
         ),
-        None => workspace.notify_user_with_commands("Language Server", text, buttons, cx),
+        None => workspace.notify_error_with_commands("Language Server", text, buttons, cx),
     }
 }
 
@@ -1232,6 +1246,12 @@ fn install(
     editor_view::install_find_history(&agents.state_dir, cx);
     editor_view::install_completion_usage(&agents.state_dir, cx);
     finder::install_history(&agents.state_dir, cx);
+    // The editor draws the icon of a file it shows outside its own text, such as the
+    // header of Quick Definition, and knows no file types of its own.
+    let icons = std::sync::Arc::new(workspace.icons().clone());
+    cx.set_global(editor_view::FileIcon(std::sync::Arc::new(
+        move |path: &std::path::Path| icons.icon_for(path),
+    )));
     // The bookmarks of the project open before the first editor reads them.
     let project_name = workspace.root().file_name().map_or_else(
         || "Bookmarks".to_owned(),
@@ -1305,6 +1325,7 @@ fn install(
         cx,
     );
     project::bind_actions(panel.clone(), weak.clone(), window.window_handle(), cx);
+    select_in::bind_actions(weak.clone(), window.window_handle(), cx);
     cx.set_global(project::ActiveProjectPanel(panel));
     let root = workspace.root().to_path_buf();
     let draft = commit::CommitDraft::create(&root, workspace.store(), cx);
@@ -1816,7 +1837,8 @@ fn install(
             palette::Palette::show(mode, index.clone(), files.clone(), workspace, window, cx)
         }
     });
-    workspace.set_tab_listener(|path, cx| {
+    workspace.set_tab_listener(|workspace, path, cx| {
+        places::remember_path(workspace, path, cx);
         cx.default_global::<Navigator>().activated(path);
         project::follow_active_file(path, cx);
         if let Some(problems) = cx.try_global::<problems::ActiveProblems>() {
@@ -1836,6 +1858,7 @@ fn install(
             git.update(cx, |git, cx| git.active_editor_changed(path, cx));
         }
     });
+    navigation::bind_recent(workspace, cx);
     // What the watcher missed shows up when the window comes back to the front.
     let rescan = index.clone();
     cx.observe_window_activation(window, move |_, window, _| {
@@ -2291,3 +2314,132 @@ mod window_tests_find_action_new;
 
 #[cfg(test)]
 mod window_tests_usages_searching;
+
+#[cfg(test)]
+mod window_tests_recent_places;
+
+#[cfg(test)]
+mod window_tests_goto;
+
+#[cfg(test)]
+mod window_tests_switcher_tabs;
+
+#[cfg(test)]
+mod window_tests_commit_untracked;
+
+#[cfg(test)]
+mod window_tests_quick_doc_header;
+
+#[cfg(test)]
+mod window_tests_settings_appearance;
+
+#[cfg(test)]
+mod window_tests_run_config_form;
+
+#[cfg(test)]
+mod window_tests_settings_search;
+
+#[cfg(test)]
+mod window_tests_find_action_ranking;
+
+#[cfg(test)]
+mod window_tests_tool_polish;
+
+#[cfg(test)]
+mod window_tests_tool_field_keys;
+
+#[cfg(test)]
+mod window_tests_dialog_escape;
+
+#[cfg(test)]
+mod window_tests_services_offline;
+
+#[cfg(test)]
+mod window_tests_items_hint;
+
+#[cfg(test)]
+mod window_tests_commit_amend;
+
+#[cfg(test)]
+mod window_tests_notification_levels;
+
+#[cfg(test)]
+mod window_tests_switcher_columns;
+
+#[cfg(test)]
+mod window_tests_terminal_focus;
+
+#[cfg(test)]
+mod window_tests_find_bar;
+
+#[cfg(test)]
+mod window_tests_call_hierarchy_scope;
+
+#[cfg(test)]
+mod window_tests_palette_ranking;
+
+#[cfg(test)]
+mod window_tests_amend_message;
+
+#[cfg(test)]
+mod window_tests_amend_push;
+
+#[cfg(test)]
+mod window_tests_alt_enter_kinds;
+
+#[cfg(test)]
+mod window_tests_definition;
+
+#[cfg(test)]
+mod window_tests_caret_restore;
+
+#[cfg(test)]
+mod window_tests_signature_gap_reformat;
+
+#[cfg(test)]
+mod window_tests_git_log_details;
+
+#[cfg(test)]
+mod window_tests_introduce_variable;
+
+#[cfg(test)]
+mod window_tests_services_contexts;
+
+#[cfg(test)]
+mod window_tests_definition_layout;
+
+#[cfg(test)]
+mod window_tests_source_inline;
+
+#[cfg(test)]
+mod window_tests_signature_visibility;
+
+#[cfg(test)]
+mod window_tests_introduce_wait;
+
+#[cfg(test)]
+mod window_tests_real_expressions;
+
+#[cfg(test)]
+mod window_tests_select_in;
+
+#[cfg(test)]
+mod window_tests_find_in_files_highlight;
+
+#[cfg(test)]
+mod window_tests_extract_name;
+
+#[cfg(test)]
+mod window_tests_refactor_popups;
+
+#[cfg(test)]
+mod window_tests_goto_menu;
+
+#[cfg(test)]
+mod window_tests_type_info;
+
+#[cfg(test)]
+mod window_tests_insert_template;
+
+#[cfg(test)]
+mod window_tests_recent_changes;

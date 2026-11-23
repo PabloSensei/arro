@@ -125,6 +125,8 @@ pub struct JavaProject {
     pub(crate) move_members: crate::move_members::MoveMembers,
     /// A move to a parameter or a field of the type of a method.
     pub(crate) move_targets: crate::move_targets::MoveTargets,
+    /// Change Signature: the server's signature with the levels the place allows.
+    pub(crate) change_signature: crate::change_signature::ChangeSignatureSupport,
     /// The Lombok agent: found in the project dependencies and applied with a restart.
     lombok: Arc<LombokSupport>,
     /// Stack traces and thread dumps: the frames of a trace, and `jcmd` for a running
@@ -675,6 +677,11 @@ impl JavaProject {
             providers.clone(),
             Handle::current(),
         );
+        let change_signature = crate::change_signature::ChangeSignatureSupport::new(
+            router.clone(),
+            providers.clone(),
+            Handle::current(),
+        );
         let stack = crate::stack::StackService::new(
             root.clone(),
             router.clone(),
@@ -708,6 +715,7 @@ impl JavaProject {
             members,
             move_members,
             move_targets,
+            change_signature,
             lombok,
             stack,
             spring,

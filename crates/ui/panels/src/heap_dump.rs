@@ -1479,7 +1479,7 @@ pub fn capture(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<
         return;
     };
     let Some(request) = runs.read(cx).heap_request() else {
-        workspace.notify_user(
+        workspace.notify_warning(
             "Memory Snapshot",
             "Run a program first: a heap dump needs a running JVM.",
             cx,
@@ -1504,7 +1504,7 @@ pub fn capture_pid(
         return;
     };
     let Some(request) = pid.and_then(|pid| runs.read(cx).heap_request_for(pid)) else {
-        workspace.notify_user(
+        workspace.notify_warning(
             "Memory Snapshot",
             "The debugger did not report the process of the program.",
             cx,
@@ -1563,7 +1563,7 @@ fn capture_request(
                         cx,
                     );
                 }
-                Err(error) => workspace.notify_user(
+                Err(error) => workspace.notify_error(
                     "Memory Snapshot",
                     format!("Cannot capture the heap: {error}"),
                     cx,

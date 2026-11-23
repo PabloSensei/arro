@@ -155,15 +155,19 @@ pub struct FileIcons {
 }
 
 impl FileIcons {
+    /// The icon of a file. A whole file name wins over the extension, so a build script
+    /// written in the Kotlin DSL is not taken for a Kotlin file.
     pub fn icon_for(&self, path: &Path) -> &'static str {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         let extension = path.extension().unwrap_or_default().to_string_lossy();
-        let key = |key: &&(&str, &str)| {
-            key.0.eq_ignore_ascii_case(&name) || key.0.eq_ignore_ascii_case(&extension)
-        };
         self.by_name
             .iter()
-            .find(key)
+            .find(|(key, _)| key.eq_ignore_ascii_case(&name))
+            .or_else(|| {
+                self.by_name
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(&extension))
+            })
             .map_or(self.fallback, |entry| entry.1)
     }
 
@@ -239,6 +243,37 @@ const LANGUAGE_ICONS: &[(&str, &str)] = &[
     ("zsh", "fileTypes/shell"),
     ("fish", "fileTypes/shell"),
     ("dockerfile", "fileTypes/dockerfile"),
+    ("properties", "fileTypes/properties"),
+    ("jar", "fileTypes/archive"),
+    ("zip", "fileTypes/archive"),
+    ("war", "fileTypes/archive"),
+    ("ear", "fileTypes/archive"),
+    ("tar", "fileTypes/archive"),
+    ("gz", "fileTypes/archive"),
+    ("tgz", "fileTypes/archive"),
+    ("7z", "fileTypes/archive"),
+    ("png", "fileTypes/image"),
+    ("jpg", "fileTypes/image"),
+    ("jpeg", "fileTypes/image"),
+    ("gif", "fileTypes/image"),
+    ("svg", "fileTypes/image"),
+    ("ico", "fileTypes/image"),
+    ("webp", "fileTypes/image"),
+    ("bmp", "fileTypes/image"),
+    ("csv", "fileTypes/csv"),
+    ("tsv", "fileTypes/csv"),
+    (".editorconfig", "fileTypes/editorConfig"),
+    ("MANIFEST.MF", "fileTypes/manifest"),
+    ("patch", "fileTypes/patch"),
+    ("diff", "fileTypes/patch"),
+    ("cmd", "fileTypes/microsoftWindows"),
+    ("bat", "fileTypes/microsoftWindows"),
+    ("xsd", "fileTypes/xsd"),
+    ("graphql", "fileTypes/graphql"),
+    ("gql", "fileTypes/graphql"),
+    ("tf", "fileTypes/terraform"),
+    ("hprof", "fileTypes/hprof"),
+    ("jfr", "fileTypes/jfr"),
 ];
 
 #[cfg(test)]
@@ -255,5 +290,16 @@ mod tests {
         assert_eq!(icons.icon_for(Path::new("a/.gitignore")), "git");
         assert_eq!(icons.icon_for(Path::new("a/pom.xml")), "xml");
         assert_eq!(icons.icon_for(Path::new("a/readme")), "text");
+    }
+
+    #[test]
+    fn a_whole_file_name_wins_over_its_extension() {
+        let icons = FileIcons {
+            by_name: vec![("kts", "kotlin"), ("build.spec.kts", "script")],
+            fallback: "text",
+        };
+        assert_eq!(icons.icon_for(Path::new("a/build.spec.kts")), "script");
+        assert_eq!(icons.icon_for(Path::new("a/other.kts")), "kotlin");
+        assert_eq!(icons.icon_for(Path::new("a/.editorconfig")), "text");
     }
 }

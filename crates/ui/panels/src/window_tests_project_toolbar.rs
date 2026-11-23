@@ -183,8 +183,8 @@ fn collapse_all_leaves_only_the_root_open(cx: &mut TestAppContext) {
 }
 
 #[ui_kit::gpui::test]
-fn alt_f1_selects_the_open_file_in_the_tree(cx: &mut TestAppContext) {
-    let (root, deep) = deep_project("select-opened-alt-f1");
+fn select_opened_file_action_selects_the_open_file_in_the_tree(cx: &mut TestAppContext) {
+    let (root, deep) = deep_project("select-opened-action");
     let window = project_window(cx, root.clone());
     let panel = project_panel(cx);
     open_path(cx, window, &deep);
@@ -192,12 +192,17 @@ fn alt_f1_selects_the_open_file_in_the_tree(cx: &mut TestAppContext) {
     assert_eq!(
         panel.read_with(cx, |panel, _| panel.tree().index_of(&deep)),
         None,
-        "the file is hidden before Alt+F1"
+        "the file is hidden before the action"
     );
 
-    // The key that the tooltip of Select Opened File shows.
-    press(cx, window, "alt-f1");
-    wait_for_signal(cx, "the open file selected by Alt+F1", |cx| {
+    // The Find Action and Navigate row. Alt+F1 opens Select In, whose first row runs it too.
+    let ran = window
+        .update(cx, |workspace, window, cx| {
+            workspace.run_command("workspace.select_opened_file", window, cx)
+        })
+        .unwrap();
+    assert!(ran, "Select Opened File is a registered command");
+    wait_for_signal(cx, "the open file selected by the action", |cx| {
         panel.read_with(cx, |panel, _| {
             panel.selected_path() == Some(deep.as_path()) && panel.tree().index_of(&deep).is_some()
         })
@@ -205,11 +210,16 @@ fn alt_f1_selects_the_open_file_in_the_tree(cx: &mut TestAppContext) {
 }
 
 #[test]
-fn the_select_opened_file_hint_names_the_key_of_the_window_table() {
+fn alt_f1_is_the_select_in_key_and_select_opened_file_has_none() {
+    assert_eq!(
+        workspace::window_key("workspace::SelectIn", keymap::Platform::Windows),
+        Some("alt-f1"),
+        "the window binds Alt+F1 to Select In"
+    );
     assert_eq!(
         workspace::window_key("workspace::SelectInProject", keymap::Platform::Windows),
-        Some("alt-f1"),
-        "the window binds Alt+F1"
+        None,
+        "Select Opened File has no key of its own"
     );
     assert_eq!(
         keymap::shortcut_label("alt-f1", keymap::Platform::Windows),

@@ -2,7 +2,7 @@
 //! ones found in it, and the fields their providers describe. The dialog knows no
 //! language: a provider reads and writes every field in the settings of a configuration.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use project_model::ProjectModel;
@@ -22,6 +22,17 @@ const WIDTH: f32 = 980.;
 const HEIGHT_SHARE: f32 = 0.8;
 const LIST_WIDTH: f32 = 260.;
 const CHECKBOX: f32 = 14.;
+/// The keys of the optional fields of the Modify options menu, as a configuration keeps
+/// them in `shown_options`.
+const ENVIRONMENT_FILE: &str = "environment_file";
+const ALLOW_MULTIPLE_INSTANCES: &str = "allow_multiple_instances";
+/// The optional fields in the order of the menu, with their labels.
+const OPTIONS: [(&str, &str); 2] = [
+    (ENVIRONMENT_FILE, "Environment file"),
+    (ALLOW_MULTIPLE_INSTANCES, "Allow multiple instances"),
+];
+/// What the buttons of the steps say while no step is selected.
+const STEP_HINT: &str = "Select a step to move or remove it";
 
 /// One configuration of the dialog and what the last read of it was.
 #[derive(Clone)]
@@ -106,6 +117,29 @@ fn slug_of(name: &str) -> String {
     slug.trim_end_matches('-').to_owned()
 }
 
+/// The optional fields a configuration shows when the dialog opens it: the ones it keeps
+/// on show and the ones that hold a value. Keys the dialog does not know are left out.
+fn options_implied(config: &RunConfig) -> BTreeSet<&'static str> {
+    OPTIONS
+        .iter()
+        .map(|&(key, _)| key)
+        .filter(|&key| {
+            config
+                .shown_options
+                .iter()
+                .any(|shown| shown.as_str() == key)
+                || match key {
+                    ENVIRONMENT_FILE => config
+                        .environment_file
+                        .as_ref()
+                        .is_some_and(|path| !path.as_os_str().is_empty()),
+                    ALLOW_MULTIPLE_INSTANCES => config.allow_multiple_instances,
+                    _ => false,
+                }
+        })
+        .collect()
+}
+
 /// The Run/Debug Configurations dialog over the workspace.
 pub struct RunConfigDialog {
     items: Vec<Item>,
@@ -123,6 +157,12 @@ pub struct RunConfigDialog {
     compound: Vec<String>,
     allow_multiple_instances: bool,
     environment_file: TextField,
+    /// The optional fields the form shows: the ones the menu checked, and the ones that held
+    /// a value when the configuration was read. A field stays shown until the menu unchecks
+    /// it, so clearing its text does not make it vanish under the caret.
+    options_shown: BTreeSet<&'static str>,
+    /// The Modify options menu is open.
+    options_open: bool,
     rows: Vec<FieldRow>,
     /// `0` is the name, then one per row, then the environment file.
     active: usize,
@@ -222,6 +262,8 @@ impl RunConfigDialog {
                 compound: Vec::new(),
                 allow_multiple_instances: false,
                 environment_file: TextField::default(),
+                options_shown: BTreeSet::new(),
+                options_open: false,
                 rows: Vec::new(),
                 active: usize::MAX,
                 templates,
@@ -259,6 +301,12 @@ impl RunConfigDialog {
         self.selected.and_then(|index| self.items.get(index))
     }
 
+    /// The text of the Name field, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn name_text(&self) -> &str {
+        &self.name.text
+    }
+
     /// Reads the fields of the selected configuration into the dialog.
     fn load_fields(&mut self) {
         self.name = TextField::default();
@@ -269,6 +317,7 @@ impl RunConfigDialog {
         self.compound.clear();
         self.allow_multiple_instances = false;
         self.environment_file = TextField::default();
+        self.options_shown.clear();
         self.rows.clear();
         self.active = usize::MAX;
         let Some(index) = self.selected else {
@@ -303,6 +352,7 @@ impl RunConfigDialog {
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_default(),
         );
+        self.options_shown = options_implied(&config);
         let Some(provider) = self.provider_of(&config).cloned() else {
             return;
         };
@@ -357,6 +407,16 @@ impl RunConfigDialog {
         config.allow_multiple_instances = self.allow_multiple_instances;
         let file = self.environment_file.text.trim();
         config.environment_file = (!file.is_empty()).then(|| file.into());
+        // The list is written only when the menu changed which optional fields show, so an
+        // untouched configuration keeps its list, keys the dialog does not know included.
+        if self.options_shown != options_implied(base) {
+            config.shown_options = OPTIONS
+                .iter()
+                .map(|(key, _)| *key)
+                .filter(|key| self.options_shown.contains(key))
+                .map(str::to_owned)
+                .collect();
+        }
         if config.is_compound() {
             config.compound = self.compound.clone();
         }
@@ -418,6 +478,9 @@ impl RunConfigDialog {
         if self.environment_file.text.trim() != stored_file {
             return true;
         }
+        if self.options_shown != options_implied(&item.config) {
+            return true;
+        }
         if item.config.is_compound() && self.compound != item.config.compound {
             return true;
         }
@@ -436,6 +499,31 @@ impl RunConfigDialog {
             }
         }
         false
+    }
+
+    /// Whether an optional field holds a value. Such a field stays shown and checked.
+    fn option_has_value(&self, key: &str) -> bool {
+        match key {
+            ENVIRONMENT_FILE => !self.environment_file.text.trim().is_empty(),
+            ALLOW_MULTIPLE_INSTANCES => self.allow_multiple_instances,
+            _ => false,
+        }
+    }
+
+    /// Shows or hides an optional field from the Modify options menu. A field that holds
+    /// a value cannot be unchecked: clear it first.
+    fn toggle_option(&mut self, key: &'static str) {
+        if self.option_has_value(key) {
+            return;
+        }
+        if self.options_shown.remove(key) {
+            // A hidden field takes no keys: the caret leaves it.
+            if key == ENVIRONMENT_FILE && self.active == self.rows.len() + 1 {
+                self.active = usize::MAX;
+            }
+        } else {
+            self.options_shown.insert(key);
+        }
     }
 
     /// Whether the dialog holds a change that OK or Apply would write.
@@ -848,15 +936,36 @@ impl RunConfigDialog {
             .ok();
     }
 
+    /// Escape closes the list or menu open inside the dialog, the topmost first: the Add
+    /// menu of the configurations, the kinds of a new step, then Modify options. Returns
+    /// whether one was open; with none, the window closes the dialog.
+    fn close_nested(&mut self, cx: &mut Context<Self>) -> bool {
+        let closed = if self.templates_open {
+            self.templates_open = false;
+            true
+        } else if self.steps_add_open {
+            self.steps_add_open = false;
+            true
+        } else if self.options_open {
+            self.options_open = false;
+            true
+        } else {
+            false
+        };
+        if closed {
+            cx.notify();
+        }
+        closed
+    }
+
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let stroke = &event.keystroke;
         let primary = stroke.modifiers.control || stroke.modifiers.platform;
         if self.templates_open {
             match stroke.key.as_str() {
                 "escape" => {
-                    self.templates_open = false;
+                    self.close_nested(cx);
                     cx.stop_propagation();
-                    cx.notify();
                 }
                 "up" => {
                     self.move_template_mark(-1, cx);
@@ -905,9 +1014,8 @@ impl RunConfigDialog {
             return;
         }
         if self.steps_add_open && stroke.key.as_str() == "escape" {
-            self.steps_add_open = false;
+            self.close_nested(cx);
             cx.stop_propagation();
-            cx.notify();
             return;
         }
         if !matches!(event.keystroke.key.as_str(), "escape" | "enter")
@@ -922,7 +1030,11 @@ impl RunConfigDialog {
         }
         let env_active = self.rows.len() + 1;
         match event.keystroke.key.as_str() {
-            "escape" => self.close(window, cx),
+            "escape" => {
+                if !self.close_nested(cx) {
+                    self.close(window, cx);
+                }
+            }
             // Enter presses OK, which takes no press while the configuration has a problem.
             "enter" if self.problem().is_none() => self.apply(true, window, cx),
             "space" if self.active > 0 && self.active <= self.rows.len() => {
@@ -1281,6 +1393,16 @@ impl Render for RunConfigDialog {
             })
             .collect::<Vec<_>>();
         let step_selected = self.step_selected;
+        // Without a selected step the buttons of the list say which step they need.
+        let (remove_tip, up_tip, down_tip) = if step_selected.is_some() {
+            (
+                "Remove Before Launch Step",
+                "Move Step Up",
+                "Move Step Down",
+            )
+        } else {
+            (STEP_HINT, STEP_HINT, STEP_HINT)
+        };
         let add_step = icon_button(
             "run-config-step-add",
             "general/add",
@@ -1296,7 +1418,7 @@ impl Render for RunConfigDialog {
         let remove_step = icon_button(
             "run-config-step-remove",
             "general/minus",
-            "Remove Before Launch Step",
+            remove_tip,
             None,
             &theme,
         )
@@ -1309,7 +1431,7 @@ impl Render for RunConfigDialog {
         let step_up = icon_button(
             "run-config-step-up",
             "general/arrowUp",
-            "Move Step Up",
+            up_tip,
             None,
             &theme,
         )
@@ -1322,7 +1444,7 @@ impl Render for RunConfigDialog {
         let step_down = icon_button(
             "run-config-step-down",
             "general/arrowDown",
-            "Move Step Down",
+            down_tip,
             None,
             &theme,
         )
@@ -1385,32 +1507,8 @@ impl Render for RunConfigDialog {
             .flex()
             .flex_col()
             .gap(px(SPACE_XS))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(SPACE_XS))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_color(theme.text_muted)
-                            .child("Before launch"),
-                    )
-                    .child(add_step)
-                    .child(remove_step)
-                    .child(step_up)
-                    .child(step_down),
-            )
             .children(add_menu)
-            .children(step_rows)
-            .when(step_selected.is_none() && !self.steps.is_empty(), |this| {
-                this.child(
-                    div()
-                        .text_size(px(TEXT_SMALL))
-                        .text_color(theme.text_muted)
-                        .child("Select a step to move or remove it"),
-                )
-            });
+            .children(step_rows);
 
         let multiple = checkbox_row(
             "run-config-multiple",
@@ -1439,6 +1537,20 @@ impl Render for RunConfigDialog {
             window.focus(&this.focus, cx);
             cx.notify();
         }));
+
+        // The optional fields show while the form keeps them on show, see `options_shown`.
+        let environment_row = self.options_shown.contains(ENVIRONMENT_FILE).then(|| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(SPACE_M))
+                .child(form_label(label_width, "Environment file", &theme))
+                .child(environment)
+        });
+        let multiple_row = self
+            .options_shown
+            .contains(ALLOW_MULTIPLE_INSTANCES)
+            .then_some(multiple);
 
         let compound = self
             .item()
@@ -1784,6 +1896,34 @@ impl Render for RunConfigDialog {
             );
         }
 
+        let options_link =
+            toolbar_dropdown("run-config-modify-options", None, "Modify options", &theme)
+                .debug_selector(|| "run-config-modify-options".to_owned())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.options_open = !this.options_open;
+                    cx.notify();
+                }));
+        let options_menu = self.options_open.then(|| {
+            let menu_rows = OPTIONS.iter().map(|&(key, label)| {
+                let on = self.options_shown.contains(key);
+                // A field with a value stays checked: its row is dimmed until it is empty.
+                let locked = self.option_has_value(key);
+                checkbox_row(format!("run-config-option-{key}"), label, on, &theme)
+                    .debug_selector(move || format!("run-config-option-{key}"))
+                    .when(locked, |row| row.opacity(0.5))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_option(key);
+                        cx.notify();
+                    }))
+            });
+            surface(&theme)
+                .mt(px(SPACE_XS))
+                .p(px(SPACE_XS))
+                .gap(px(2.))
+                .children(menu_rows)
+                .into_any_element()
+        });
+
         let shell = surface(&theme)
             .id("run-configs")
             .debug_selector(|| "run-configs".to_owned())
@@ -1791,7 +1931,11 @@ impl Render for RunConfigDialog {
             .track_focus(&self.focus)
             .text_size(px(UI_SIZE))
             .text_color(theme.text)
-            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)));
+            .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
+            .on_action(cx.listener(|this, _: &workspace::Dismiss, _, cx| {
+                let closed = this.close_nested(cx);
+                workspace::forward_dismiss(closed, cx);
+            }));
         let contents = div()
             .flex()
             .flex_col()
@@ -1857,28 +2001,18 @@ impl Render for RunConfigDialog {
                                         .child(store),
                                 )
                                 .children(error)
-                                .child(section_header("Build and run", &theme))
+                                .child(section_header("Build and run", [options_link], &theme))
+                                .children(options_menu)
                                 .children(rows)
                                 .children(compound)
-                                .child(section_header("Modify options", &theme))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(SPACE_M))
-                                        .child(form_label(label_width, "Environment file", &theme))
-                                        .child(environment),
-                                )
-                                .child(multiple)
-                                .child(section_header("Before launch", &theme))
-                                .child(steps)
-                                .child(section_header("Logs", &theme))
-                                .child(
-                                    div()
-                                        .text_size(px(TEXT_SMALL))
-                                        .text_color(theme.text_muted)
-                                        .child("The console output is shown in the Run window."),
-                                ),
+                                .children(environment_row)
+                                .children(multiple_row)
+                                .child(section_header(
+                                    "Before launch",
+                                    [add_step, remove_step, step_up, step_down],
+                                    &theme,
+                                ))
+                                .child(steps),
                             &theme,
                             window,
                             cx,
@@ -1927,16 +2061,30 @@ impl Render for RunConfigDialog {
     }
 }
 
-/// The title of one part of the form.
-fn section_header(label: &str, theme: &Theme) -> Div {
+/// The title of one part of the form, with the controls of the part in its row at the
+/// right.
+fn section_header(
+    label: &str,
+    controls: impl IntoIterator<Item = impl IntoElement>,
+    theme: &Theme,
+) -> Div {
+    let title = div().flex_1().min_w_0().child(label.to_owned());
+    // The layout tests read the title from the drawn frame.
+    #[cfg(test)]
+    let title = title.child(bounds_probe(
+        format!("run-config-section-{}", slug_of(label)),
+        Some(label.to_owned().into()),
+    ));
     div()
         .flex()
         .items_center()
+        .gap(px(SPACE_XS))
         .h(px(CONTROL_HEIGHT))
         .mt(px(SPACE_S))
         .text_color(theme.text)
         .font_weight(FontWeight::MEDIUM)
-        .child(label.to_owned())
+        .child(title)
+        .children(controls)
 }
 
 /// A text input of the dialog.

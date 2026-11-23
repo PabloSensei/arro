@@ -77,6 +77,9 @@ pub struct EndpointsPanel {
     selected: Option<usize>,
     rows: Vec<EndpointRow>,
     endpoints: Vec<Shown>,
+    /// Every handler of the project, before the filter: the header says how many the tree
+    /// of a narrowed list leaves of it.
+    total: usize,
     scroll: UniformListScrollHandle,
     _files: Subscription,
 }
@@ -101,6 +104,7 @@ impl EndpointsPanel {
                 selected: None,
                 rows: Vec::new(),
                 endpoints: Vec::new(),
+                total: 0,
                 scroll: UniformListScrollHandle::new(),
                 _files,
             }
@@ -119,6 +123,12 @@ impl EndpointsPanel {
     /// The rows of the tree, group rows included.
     pub fn rows(&self) -> &[EndpointRow] {
         &self.rows
+    }
+
+    /// The text of the filter, for a test of the keys of the field.
+    #[cfg(test)]
+    pub(crate) fn filter_text(&self) -> &str {
+        &self.query.text
     }
 
     /// The language is up: the scan of the project can start.
@@ -279,6 +289,7 @@ impl EndpointsPanel {
 
     /// Builds the tree from the scans, the filter and the method.
     fn rebuild(&mut self) {
+        self.total = self.scans.values().map(|scan| scan.endpoints.len()).sum();
         let mut modules: BTreeMap<String, BTreeMap<String, Vec<Shown>>> = BTreeMap::new();
         for (path, scan) in &self.scans {
             let module = self.module_of(path);
@@ -338,6 +349,24 @@ impl EndpointsPanel {
 
     fn first_endpoint_row(&self) -> Option<usize> {
         self.rows.iter().position(|row| row.endpoint.is_some())
+    }
+
+    /// The count the header shows: how many handlers the tree has, and how many of the
+    /// whole project while the filter narrows the list.
+    fn count_text(&self) -> String {
+        let shown = self.handlers();
+        let narrowed = !self.query.text.trim().is_empty() || self.method.is_some();
+        if narrowed {
+            let noun = if self.total == 1 {
+                "endpoint"
+            } else {
+                "endpoints"
+            };
+            format!("{shown} of {} {noun}", self.total)
+        } else {
+            let noun = if shown == 1 { "endpoint" } else { "endpoints" };
+            format!("{shown} {noun}")
+        }
     }
 
     fn shown_at(&self, row: usize) -> Option<&Shown> {
@@ -514,7 +543,7 @@ impl EndpointsPanel {
                 cx.stop_propagation();
             }
             _ => {
-                if self.query.key_with_clipboard(event, false, cx) {
+                if self.query.key_tool_field(event, false, cx) {
                     self.rebuild();
                     cx.stop_propagation();
                     cx.notify();
@@ -624,7 +653,7 @@ impl Render for EndpointsPanel {
         #[cfg(test)]
         workspace::note_view_render(cx, "endpoints");
         let theme = *cx.global::<Theme>();
-        let count = self.handlers();
+        let count = self.count_text();
         let workspace = self.workspace.clone();
         let hide = {
             let workspace = workspace.clone();
@@ -642,7 +671,8 @@ impl Render for EndpointsPanel {
             div()
                 .text_color(theme.text_secondary)
                 .text_size(px(TEXT_SMALL))
-                .child(format!("{count}")),
+                .child(count.clone())
+                .children(count_probe(&count)),
             GROUP,
             "endpoints",
             options,
@@ -776,6 +806,20 @@ fn variable(name: &str) -> String {
     format!("{{{{{name}}}}}")
 }
 
+/// The probe of the count in the header: a test reads what the number says.
+#[cfg(test)]
+fn count_probe(text: &str) -> Option<AnyElement> {
+    Some(bounds_probe(
+        "endpoints-count",
+        Some(text.to_owned().into()),
+    ))
+}
+
+#[cfg(not(test))]
+fn count_probe(_text: &str) -> Option<AnyElement> {
+    None
+}
+
 /// The URL of a handler with the placeholders of its path and query.
 fn url_of(endpoint: &Endpoint, port: Option<u16>) -> String {
     let mut url = format!(
@@ -861,7 +905,7 @@ fn append_request(
 ) {
     let folder = workspace.state_dir().join("scratches");
     if let Err(error) = fs::create_dir_all(&folder) {
-        workspace.notify_user(
+        workspace.notify_error(
             "HTTP Client",
             format!("The request file cannot be created: {error}"),
             cx,
@@ -880,7 +924,7 @@ fn append_request(
     content.push_str(title);
     content.push_str(text);
     if let Err(error) = fs::write(&file, content) {
-        workspace.notify_user(
+        workspace.notify_error(
             "HTTP Client",
             format!("The request file cannot be written: {error}"),
             cx,

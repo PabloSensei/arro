@@ -274,12 +274,17 @@ fn goto_keys_recent_windows_structure_and_alt_left_right(cx: &mut TestAppContext
     press(cx, window, "alt-right");
     assert_eq!(active_path(cx, window), Some(readme.clone()));
 
-    // Alt+F1 selects the open file in the project tree.
+    // Alt+F1 opens Select In. Its first row, Project View, shows the project tree.
     press(cx, window, "alt-f1");
+    draw(cx, window);
+    press(cx, window, "1");
     let project_open = window
         .read_with(cx, |workspace, _| workspace.tool_open(PROJECT_TOOL))
         .unwrap();
-    assert!(project_open, "Alt+F1 shows the project tree");
+    assert!(
+        project_open,
+        "the digit 1 of Select In shows the project tree"
+    );
 
     // Ctrl+Alt+Shift+Left and Right move the focus between the split groups.
     run_command(cx, window, "window.split_right");

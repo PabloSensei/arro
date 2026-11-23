@@ -5,7 +5,7 @@
 //! form turns into, so the test checks what the window does with them.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use editor_view::Languages;
@@ -240,6 +240,44 @@ pub(crate) fn action(title: &str, code: &str, handle: Option<&str>) -> ActionEnt
     }
 }
 
+/// Moves the selection of the open Refactor This list down until the row `label` is
+/// selected. The rows of the server sit among the editor's own rows in their groups, so a
+/// test names the row it picks instead of counting the Down presses.
+pub(crate) fn select_refactoring(
+    cx: &mut TestAppContext,
+    window: WindowHandle<Workspace>,
+    path: &Path,
+    label: &str,
+) {
+    let view = editor_of(cx, window, path);
+    for _ in 0..40 {
+        if view
+            .read_with(cx, |view, _| view.actions_selected())
+            .as_deref()
+            == Some(label)
+        {
+            return;
+        }
+        press(cx, window, "down");
+    }
+    panic!("the list has no row {label} to select");
+}
+
+/// The labels of the open Refactor This list of the file at `path`, from the top.
+fn listed_labels(
+    cx: &mut TestAppContext,
+    window: WindowHandle<Workspace>,
+    path: &Path,
+) -> Vec<String> {
+    let view = editor_of(cx, window, path);
+    view.read_with(cx, |view, _| view.actions_visible())
+        .expect("the list is open")
+        .rows
+        .into_iter()
+        .map(|(_, label)| label)
+        .collect()
+}
+
 #[ui_kit::gpui::test]
 fn refactor_this_opens_the_form_of_a_server_action_and_applies_its_change(cx: &mut TestAppContext) {
     let root = project(
@@ -312,6 +350,9 @@ fn refactor_this_opens_the_form_of_a_server_action_and_applies_its_change(cx: &m
         bounds_of(cx, window, "actions-popup").size.height > px(0.),
         "Refactor This lists the refactorings"
     );
+    // The row of the server is an extraction, after the editor's own extractions, so the
+    // list does not select it at once.
+    select_refactoring(cx, window, &shape, "Extract Interface...");
     press(cx, window, "enter");
     draw(cx, window);
     assert!(
@@ -388,4 +429,148 @@ fn refactor_this_lists_the_refactorings_of_the_editor_with_their_keys(cx: &mut T
         "Change Signature is a row of the list"
     );
     press(cx, window, "escape");
+}
+
+#[ui_kit::gpui::test]
+fn refactor_this_has_its_heading_and_selects_the_first_row_of_the_names(cx: &mut TestAppContext) {
+    let root = project("refactor-this-heading", &[("src/Own.txt", "alpha beta\n")]);
+    let own = root.join("src").join("Own.txt");
+    let window = open_window(cx, root.clone(), RefactorLanguage::new());
+    cx.run_until_parked();
+    draw(cx, window);
+    open_path(cx, window, &own);
+    let view = editor_of(cx, window, &own);
+
+    press(cx, window, "ctrl-alt-shift-t");
+    draw(cx, window);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.actions_title()),
+        Some("Refactor This"),
+        "the list is headed Refactor This"
+    );
+    let labels = listed_labels(cx, window, &own);
+    let names: Vec<&str> = labels.iter().take(5).map(String::as_str).collect();
+    assert_eq!(
+        names,
+        [
+            "Rename...",
+            "Change Signature...",
+            "Move...",
+            "Copy...",
+            "Safe Delete..."
+        ],
+        "the names of the element come first, in IDEA's order"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.actions_selected()),
+        Some("Rename...".to_owned()),
+        "the first row of the first group is selected when the list opens"
+    );
+}
+
+#[ui_kit::gpui::test]
+fn refactor_this_puts_the_server_extract_interface_after_the_editor_extractions(
+    cx: &mut TestAppContext,
+) {
+    let root = project(
+        "refactor-this-extract-interface",
+        &[("src/Own.txt", "alpha beta\n")],
+    );
+    let own = root.join("src").join("Own.txt");
+    let language = RefactorLanguage::new();
+    language.set_actions(vec![action(
+        "Extract interface...",
+        "refactor.extract.interface",
+        Some("handle"),
+    )]);
+    let window = open_window(cx, root.clone(), language);
+    cx.run_until_parked();
+    draw(cx, window);
+    open_path(cx, window, &own);
+    let view = editor_of(cx, window, &own);
+
+    press(cx, window, "ctrl-alt-shift-t");
+    draw(cx, window);
+    let labels = listed_labels(cx, window, &own);
+    let place = |label: &str| {
+        labels
+            .iter()
+            .position(|row| row == label)
+            .unwrap_or_else(|| panic!("no row {label} in {labels:?}"))
+    };
+    assert!(
+        labels.iter().all(|row| row != "Extract interface..."),
+        "the label of the server takes the spelling of the menu: {labels:?}"
+    );
+    assert!(
+        place("Extract Method...") < place("Extract Interface...")
+            && place("Introduce Parameter...") < place("Extract Interface...")
+            && place("Extract Interface...") < place("Pull Members Up..."),
+        "the server's extraction comes after the editor's own extractions: {labels:?}"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.actions_selected()),
+        Some("Rename...".to_owned()),
+        "the first row of the names is selected, not the row of the server"
+    );
+}
+
+#[ui_kit::gpui::test]
+fn refactor_this_separates_its_groups_with_a_line(cx: &mut TestAppContext) {
+    let root = project("refactor-this-lines", &[("src/Own.txt", "alpha beta\n")]);
+    let own = root.join("src").join("Own.txt");
+    let window = open_window(cx, root.clone(), RefactorLanguage::new());
+    cx.run_until_parked();
+    draw(cx, window);
+    open_path(cx, window, &own);
+    let view = editor_of(cx, window, &own);
+
+    press(cx, window, "ctrl-alt-shift-t");
+    draw(cx, window);
+    // The names, the extractions, the hierarchy and Inline, each after a line.
+    let labels = listed_labels(cx, window, &own);
+    assert_eq!(labels[5], "Extract Method...", "{labels:?}");
+    assert_eq!(labels[12], "Pull Members Up...", "{labels:?}");
+    assert_eq!(labels[14], "Inline...", "{labels:?}");
+    assert_eq!(
+        view.read_with(cx, |view, _| view.actions_separators()),
+        Some(vec![5, 12, 14]),
+        "a line goes above each group but the first: {labels:?}"
+    );
+    assert!(
+        bounds_of(cx, window, "actions-separator").size.height > px(0.),
+        "the line is drawn"
+    );
+}
+
+#[ui_kit::gpui::test]
+fn refactor_this_draws_no_line_for_a_group_the_server_left_empty(cx: &mut TestAppContext) {
+    let root = project("refactor-this-empty", &[("src/Own.txt", "alpha beta\n")]);
+    let own = root.join("src").join("Own.txt");
+    let language = RefactorLanguage::new();
+    // The server answers the hierarchy with no change: its rows are left out, and the
+    // editor's own rows of the same kinds are left out with them.
+    language.set_actions(vec![
+        action("Pull Members Up", "refactor.pull.up", None),
+        action("Push Members Down", "refactor.push.down", None),
+    ]);
+    let window = open_window(cx, root.clone(), language);
+    cx.run_until_parked();
+    draw(cx, window);
+    open_path(cx, window, &own);
+    let view = editor_of(cx, window, &own);
+
+    press(cx, window, "ctrl-alt-shift-t");
+    draw(cx, window);
+    let labels = listed_labels(cx, window, &own);
+    assert_eq!(
+        labels.last().map(String::as_str),
+        Some("Inline..."),
+        "{labels:?}"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| view.actions_separators()),
+        Some(vec![5, 12]),
+        "one line above Inline, and none for the empty hierarchy: {labels:?}"
+    );
 }

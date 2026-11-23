@@ -4,6 +4,7 @@
 //! their own windows and files do. The window opens with the caret in the search field,
 //! and a click on a page or a setting takes it out until the field is clicked again.
 
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use editor_view::Semantic;
@@ -231,6 +232,9 @@ pub struct SettingsView {
     pub(crate) templates_page: crate::settings_templates::TemplatesPage,
     pub(crate) file_types_page: FileTypesPage,
     page: SettingsPage,
+    /// The page in force was chosen by the user (a row, the arrows or the setting the
+    /// window came for), not by the search: the search keeps it while it holds a match.
+    page_chosen: bool,
     /// The row the window came for, drawn as chosen while the window is open.
     highlight: Option<&'static str>,
     /// The checks of the language, read when the window opens.
@@ -339,6 +343,7 @@ impl SettingsView {
         let settings_dir = workspace.settings_dir().to_path_buf();
         let settings = cx.global::<Settings>().clone();
         let font_family = settings.editor_font_family.clone();
+        let inspection_highlight_set = inspection.is_some();
         let page = if inspection.is_some() {
             SettingsPage::EditorInspections
         } else {
@@ -387,6 +392,7 @@ impl SettingsView {
             templates_page,
             file_types_page: FileTypesPage::default(),
             page,
+            page_chosen: target.is_some() || inspection_highlight_set,
             highlight: target,
             inspections,
             inspection_settings: inspection_settings.clone(),
@@ -751,7 +757,9 @@ impl SettingsView {
         };
         let (count, marked) = (open.values.len(), open.marked);
         match event.keystroke.key.as_str() {
-            "escape" => self.choice_open = None,
+            "escape" => {
+                self.close_nested(cx);
+            }
             "up" => {
                 if let Some(open) = self.choice_open.as_mut() {
                     open.marked = marked.saturating_sub(1);
@@ -1008,6 +1016,49 @@ impl SettingsView {
             .ok();
     }
 
+    /// Escape closes the topmost layer open in the window and returns whether one closed:
+    /// the list of a dropdown, an inline editor, the question of the MCP server, the layers
+    /// of the Keymap and template pages, then a filled search. With none open, the window
+    /// closes.
+    fn close_nested(&mut self, cx: &mut Context<Self>) -> bool {
+        let closed = if self.choice_open.take().is_some() {
+            true
+        } else if self.spelling_editing {
+            self.spelling_editing = false;
+            true
+        } else if self.todo_new_editing {
+            self.todo_new_editing = false;
+            true
+        } else if self.inspection_editing {
+            // The filter of the Inspections page clears first; an empty one lets the window go.
+            if self.inspection_search.text.is_empty() {
+                false
+            } else {
+                self.inspection_search = TextField::default();
+                true
+            }
+        } else if self.editing == Some(IGNORED_FIELD) {
+            self.editing = None;
+            true
+        } else if self.mcp_confirm_enable {
+            self.mcp_confirm_enable = false;
+            true
+        } else if (self.page == SettingsPage::Keymap && self.keymap_page.escape(cx))
+            || (TemplateSection::section(self.page).is_some() && self.templates_page.escape(cx))
+        {
+            true
+        } else if !self.search.text.is_empty() {
+            self.search = TextField::default();
+            true
+        } else {
+            false
+        };
+        if closed {
+            cx.notify();
+        }
+        closed
+    }
+
     /// The search field over the tree of pages.
     fn search_field(&self, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
         let empty = self.search.text.is_empty();
@@ -1057,11 +1108,8 @@ impl SettingsView {
     /// window, as the close button does. Up and Down walk the pages the query keeps.
     fn search_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if event.keystroke.key == "escape" {
-            if self.search.text.is_empty() {
+            if !self.close_nested(cx) {
                 self.close(window, cx);
-            } else {
-                self.search = TextField::default();
-                cx.notify();
             }
             cx.stop_propagation();
             return;
@@ -1078,15 +1126,7 @@ impl SettingsView {
             return;
         }
         if self.search.key_with_clipboard(event, false, cx) {
-            let pages = settings_catalog::pages_matching(&self.search.text);
-            if !pages.contains(&self.page) {
-                let page = pages
-                    .first()
-                    .copied()
-                    .unwrap_or(SettingsPage::Appearance)
-                    .target();
-                self.set_page(page, cx);
-            }
+            self.follow_query(cx);
             cx.notify();
         }
         cx.stop_propagation();
@@ -1095,6 +1135,7 @@ impl SettingsView {
     /// Moves the window to a page. The MCP rows read the client files the first time the
     /// page is reached, whether a click, the search field or the arrows brought it here.
     fn set_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
+        self.page_chosen = true;
         if self.page == page {
             return;
         }
@@ -1106,9 +1147,41 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// Keeps the open page while it holds a match of the query. Otherwise the first page that
+    /// holds a match opens. An empty query is the whole tree, so the page open stays; a query
+    /// without a match keeps the page too, and the right side says that nothing was found.
+    fn follow_query(&mut self, cx: &mut Context<Self>) {
+        if self.search.text.trim().is_empty() {
+            return;
+        }
+        let matching = settings_catalog::matching_pages(&self.search.text);
+        if self.page_chosen && matching.contains(&self.page) {
+            return;
+        }
+        // The page of the first field that matches comes before the first page in the tree,
+        // so that a field moved to a page of its own is found there. The row the window
+        // came for stays marked.
+        let first = settings_catalog::page_matching(&self.search.text)
+            .filter(|page| matching.contains(page))
+            .or_else(|| matching.first().copied());
+        if let Some(first) = first {
+            let highlight = self.highlight;
+            self.set_page(first, cx);
+            self.highlight = highlight;
+            self.page_chosen = false;
+        }
+    }
+
+    /// Opens the page a row of the tree opens, within the tree the query keeps.
+    fn open_tree_row(&mut self, row: SettingsPage, cx: &mut Context<Self>) {
+        let kept = settings_catalog::pages_matching(&self.search.text);
+        self.set_page(settings_catalog::opened_by(row, &kept), cx);
+    }
+
     /// Up and Down in the search walk the pages of the tree the query keeps, in its order.
     fn step_page(&mut self, step: isize, cx: &mut Context<Self>) {
-        let pages = settings_catalog::pages_matching(&self.search.text);
+        let kept = settings_catalog::pages_matching(&self.search.text);
+        let pages = settings_catalog::shown_pages(&kept);
         let Some(last) = pages.len().checked_sub(1) else {
             return;
         };
@@ -1123,7 +1196,7 @@ impl SettingsView {
         };
         let page = pages[next];
         if page != self.page {
-            self.set_page(page.target(), cx);
+            self.set_page(page, cx);
         }
     }
 
@@ -1184,7 +1257,7 @@ impl SettingsView {
         }
         if self.spelling_editing {
             if event.keystroke.key == "escape" {
-                self.spelling_editing = false;
+                self.close_nested(cx);
             } else if event.keystroke.key == "enter" {
                 self.add_spelling_word(cx);
             } else if self.spelling_word.key_with_clipboard(event, false, cx) {
@@ -1195,7 +1268,7 @@ impl SettingsView {
         }
         if self.todo_new_editing {
             if event.keystroke.key == "escape" {
-                self.todo_new_editing = false;
+                self.close_nested(cx);
             } else if event.keystroke.key == "enter" {
                 self.add_todo_template(cx);
             } else if self.todo_new.key_with_clipboard(event, false, cx) {
@@ -1206,11 +1279,8 @@ impl SettingsView {
         }
         if self.inspection_editing {
             if event.keystroke.key == "escape" {
-                if self.inspection_search.text.is_empty() {
+                if !self.close_nested(cx) {
                     self.close(window, cx);
-                } else {
-                    self.inspection_search = TextField::default();
-                    cx.notify();
                 }
             } else if self.inspection_search.key_with_clipboard(event, false, cx) {
                 cx.notify();
@@ -1224,8 +1294,7 @@ impl SettingsView {
         }
         if self.editing == Some(IGNORED_FIELD) {
             if event.keystroke.key == "escape" {
-                self.editing = None;
-                cx.notify();
+                self.close_nested(cx);
             } else if event.keystroke.key == "enter" {
                 self.add_ignored_pattern(cx);
             } else if self
@@ -1276,7 +1345,9 @@ impl SettingsView {
             return;
         }
         if event.keystroke.key == "escape" {
-            self.close(window, cx);
+            if !self.close_nested(cx) {
+                self.close(window, cx);
+            }
             cx.stop_propagation();
         }
     }
@@ -1809,7 +1880,7 @@ fn field(
         })
 }
 
-fn row(label: &'static str, control: impl IntoElement, theme: &Theme) -> Div {
+fn row(label: impl IntoElement, control: impl IntoElement, theme: &Theme) -> Div {
     div()
         .flex()
         .items_center()
@@ -1884,7 +1955,7 @@ fn git_test_row(
         .into_any_element()
 }
 
-fn heading(text: &'static str, theme: &Theme) -> Div {
+fn heading(text: impl IntoElement, theme: &Theme) -> Div {
     div()
         .mt(px(DIALOG_GAP))
         .pb(px(SPACE_S))
@@ -1892,6 +1963,47 @@ fn heading(text: &'static str, theme: &Theme) -> Div {
         .border_color(theme.border)
         .font_weight(FontWeight::MEDIUM)
         .child(text)
+}
+
+/// The byte ranges of `title` where a word of `query` is, ignoring the case of ASCII letters.
+/// The ranges come in order and never overlap, as a [`StyledText`] wants them.
+pub(crate) fn match_ranges(title: &str, query: &str) -> Vec<Range<usize>> {
+    // Lowering ASCII letters keeps every byte where it was, so the ranges count in the title.
+    let lower = title.to_ascii_lowercase();
+    let mut found: Vec<Range<usize>> = Vec::new();
+    for word in query.split_whitespace() {
+        let word = word.to_ascii_lowercase();
+        found.extend(
+            lower
+                .match_indices(word.as_str())
+                .map(|(start, text)| start..start + text.len()),
+        );
+    }
+    found.sort_by_key(|range| range.start);
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for range in found {
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
+/// The title of a row or of a page, with the words of `query` it holds in the search colours of
+/// the theme, as the lists of Arro mark a search.
+fn title_with_matches(title: &'static str, query: &str, theme: &Theme) -> StyledText {
+    let highlights = match_ranges(title, query).into_iter().map(|range| {
+        (
+            range,
+            HighlightStyle {
+                color: Some(theme.match_text),
+                background_color: Some(theme.match_bg),
+                ..HighlightStyle::default()
+            },
+        )
+    });
+    StyledText::new(title).with_highlights(highlights)
 }
 
 /// The width of the tree of pages: the longest title with the indent of its row and the
@@ -1946,12 +2058,13 @@ fn slug(text: &str) -> String {
     out.trim_matches('-').to_owned()
 }
 
-/// A row of a setting. A text value stands in the label column of `label_width`, so the
-/// fields of a page start on one vertical line; other rows put the control at the right edge.
+/// A row of a setting, with its `label`, which marks the words of a search. A text value stands in
+/// the label column of `label_width`, so the fields of a page start on one vertical line; other
+/// rows put the control at the right edge.
 fn setting_row(
     entry: &Setting,
+    label: impl IntoElement,
     control: impl IntoElement,
-    highlighted: bool,
     chosen: bool,
     label_width: Option<f32>,
     theme: &Theme,
@@ -1959,41 +2072,47 @@ fn setting_row(
     let id = entry.id;
     let line = match label_width {
         // The labels of the pages read as text, not as a hint of the form.
-        Some(width) => form_row_colored(width, entry.title, theme.text, control),
-        None => row(entry.title, control, theme),
+        Some(width) => form_row_labelled(width, label, theme.text, control),
+        None => row(label, control, theme),
     };
     line.px(px(ROW_PADDING_X))
         .rounded(px(CONTROL_RADIUS))
         .when(chosen, |this| {
             this.debug_selector(move || format!("settings-chosen-{}", id.replace('_', "-")))
+                .bg(theme.selection)
         })
-        .when(highlighted, |this| this.bg(theme.selection))
 }
 
 fn toggle_setting_row(
     entry: &Setting,
     on: bool,
-    highlighted: bool,
     chosen: bool,
+    label: impl IntoElement,
     theme: &Theme,
     cx: &mut Context<SettingsView>,
 ) -> Div {
     let id = entry.id;
     let selector = format!("settings-{}", id.replace('_', "-"));
-    let row = checkbox_row(SharedString::from(selector.clone()), entry.title, on, theme)
-        .min_h(px(30.))
-        .px(px(ROW_PADDING_X))
-        .rounded(px(CONTROL_RADIUS))
-        .debug_selector(move || selector.clone())
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.change(
-                |settings| {
-                    settings_catalog::toggle(settings, id);
-                },
-                cx,
-            );
-        }))
-        .when(highlighted, |this| this.bg(theme.selection));
+    let row = checkbox_row_labelled(
+        SharedString::from(selector.clone()),
+        label,
+        entry.title,
+        on,
+        theme,
+    )
+    .min_h(px(30.))
+    .px(px(ROW_PADDING_X))
+    .rounded(px(CONTROL_RADIUS))
+    .debug_selector(move || selector.clone())
+    .on_click(cx.listener(move |this, _, _, cx| {
+        this.change(
+            |settings| {
+                settings_catalog::toggle(settings, id);
+            },
+            cx,
+        );
+    }))
+    .when(chosen, |this| this.bg(theme.selection));
     div()
         .when(chosen, |this| {
             this.debug_selector(move || format!("settings-chosen-{}", id.replace('_', "-")))
@@ -2092,7 +2211,7 @@ impl SettingsView {
     fn theme_section(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<Div> {
         let library = ThemeCatalog::library_of(cx);
         let mut rows = vec![
-            heading("Themes", theme),
+            heading("Theme", theme),
             note(crate::theme_import::THEMES_NOTE, theme),
         ];
         for (dark, title) in [(false, "Light appearance"), (true, "Dark appearance")] {
@@ -2201,6 +2320,54 @@ impl SettingsView {
         rows
     }
 
+    /// The sample text under the fields of the Editor Font page: the code in the
+    /// typeface, the size and the line height of the draft, so a step shows at once.
+    fn font_sample(&self, theme: &Theme) -> Div {
+        let style = editor_view::EditorStyle::from_theme(theme);
+        let ratio = style.line_height / style.font_size;
+        let size = self.draft.font_size.round().max(6.);
+        let spacing = self
+            .draft
+            .line_spacing
+            .clamp(workspace::MIN_LINE_SPACING, workspace::MAX_LINE_SPACING);
+        let line_height = (size * ratio * spacing).round();
+        let family = if self.draft.editor_font_family.trim().is_empty() {
+            SharedString::from(MONO_FONT)
+        } else {
+            SharedString::from(self.draft.editor_font_family.clone())
+        };
+        const SAMPLE: [&str; 5] = [
+            "class Sample {",
+            "    static void main(String[] args) {",
+            "        System.out.println(\"Hello\");",
+            "    }",
+            "}",
+        ];
+        let mut sample = div()
+            .debug_selector(|| "settings-font-sample".to_owned())
+            .flex()
+            .flex_col()
+            .p(px(SPACE_M))
+            .rounded(px(CONTROL_RADIUS))
+            .border_1()
+            .border_color(theme.popup_border)
+            .bg(theme.popup_bg)
+            .font_family(family)
+            .text_size(px(size))
+            .text_color(theme.text)
+            .overflow_hidden();
+        for line in SAMPLE {
+            sample = sample.child(
+                div()
+                    .h(px(line_height))
+                    .flex()
+                    .items_center()
+                    .child(SharedString::from(line)),
+            );
+        }
+        sample
+    }
+
     /// The icon sets of the Appearance page: every built-in set and every folder of the
     /// `icons` folder of the settings. A click applies the set at once.
     fn icon_section(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<Div> {
@@ -2266,12 +2433,6 @@ impl SettingsView {
     /// it does.
     pub(crate) fn theme_card_chosen(&self, id: &str, dark: bool, theme: &Theme) -> bool {
         settings_catalog::chosen_theme(&self.draft, dark, theme.id()) == id
-    }
-
-    /// The text of the Theme row.
-    #[cfg(test)]
-    pub(crate) fn theme_label(&self, theme: &Theme) -> String {
-        settings_catalog::theme_label(&self.draft, theme.dark, theme.id())
     }
 
     /// A card of a theme takes the slot of its look: Sync with OS keeps choosing between
@@ -3157,6 +3318,7 @@ impl Render for SettingsView {
         };
 
         let navigation = settings_catalog::pages_matching(&query);
+        let nothing_found = !query.is_empty() && navigation.is_empty();
         let pages: Vec<_> = navigation
             .iter()
             .enumerate()
@@ -3191,20 +3353,41 @@ impl Render for SettingsView {
                     .tooltip(move |_, cx| tooltip(page.title(), None, cx))
                     .tooltip_show_delay(TOOLTIP_CREATE_DELAY)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_page(page.target(), cx);
+                        this.open_tree_row(page, cx);
                         this.editing = None;
                         this.search_editing = false;
                         this.todo_new_editing = false;
                         this.choice_open = None;
                         cx.notify();
                     }))
-                    .child(div().min_w_0().truncate().child(page.title()))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .when(chosen, |this| {
+                                this.debug_selector(move || {
+                                    format!(
+                                        "settings-page-chosen-{}",
+                                        page.title().to_lowercase().replace(' ', "-")
+                                    )
+                                })
+                            })
+                            .child(page.title()),
+                    )
                     .child(page_title_probe(page))
             })
             .collect();
 
         let mut content: Vec<Div> = Vec::new();
         match self.page {
+            // The query keeps no page: the right side says so, and the page last open waits.
+            _ if nothing_found => content.push(
+                div()
+                    .py(px(SPACE_S))
+                    .text_color(theme.text_secondary)
+                    .debug_selector(|| "settings-nothing-found".to_owned())
+                    .child("Nothing found"),
+            ),
             SettingsPage::Plugins => {
                 content.extend(self.plugins.iter().enumerate().map(|(index, plugin)| {
                     div().child(
@@ -3329,19 +3512,11 @@ impl Render for SettingsView {
                         content.push(heading(section, &theme));
                         last_section = Some(section);
                     }
-                    let highlighted = self.highlight == Some(entry.id)
-                        || (!query.is_empty() && entry.matches(&query));
                     let chosen_row = self.highlight == Some(entry.id);
+                    let label = title_with_matches(entry.title, &query, &theme);
                     if entry.kind == SettingKind::Toggle {
                         let on = settings_catalog::value(&settings, entry.id).unwrap_or(false);
-                        content.push(toggle_setting_row(
-                            entry,
-                            on,
-                            highlighted,
-                            chosen_row,
-                            &theme,
-                            cx,
-                        ));
+                        content.push(toggle_setting_row(entry, on, chosen_row, label, &theme, cx));
                         continue;
                     }
                     let control = match entry.kind {
@@ -3451,8 +3626,8 @@ impl Render for SettingsView {
                     let label_width = (entry.kind == SettingKind::Text).then_some(value_width);
                     content.push(setting_row(
                         entry,
+                        label,
                         control,
-                        highlighted,
                         chosen_row,
                         label_width,
                         &theme,
@@ -3471,6 +3646,10 @@ impl Render for SettingsView {
                 }
                 if self.page == SettingsPage::Mcp {
                     content.extend(self.mcp_section(&settings, &theme, cx));
+                }
+                if self.page == SettingsPage::EditorFont {
+                    content.push(heading("Sample", &theme));
+                    content.push(self.font_sample(&theme));
                 }
             }
         }
@@ -3547,7 +3726,15 @@ impl Render for SettingsView {
                 .pb(px(DIALOG_GAP))
                 .overflow_y_scroll()
                 .track_scroll(&self.scroll_content)
-                .child(heading(self.page.title(), &theme).mt(px(0.)))
+                .when(!nothing_found, |this| {
+                    this.child(
+                        heading(
+                            title_with_matches(self.page.title(), &query, &theme),
+                            &theme,
+                        )
+                        .mt(px(0.)),
+                    )
+                })
                 .children(content),
             &theme,
             window,
@@ -3607,17 +3794,8 @@ impl Render for SettingsView {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event, window, cx| this.key(event, window, cx)))
             .on_action(cx.listener(|this, _: &workspace::Dismiss, window, cx| {
-                if this.page == SettingsPage::Keymap && this.keymap_page.escape(cx) {
-                    return;
-                }
-                if TemplateSection::section(this.page).is_some() && this.templates_page.escape(cx) {
-                    return;
-                }
-                if this.search.text.is_empty() {
+                if !this.close_nested(cx) {
                     this.close(window, cx);
-                } else {
-                    this.search = TextField::default();
-                    cx.notify();
                 }
             }))
             .on_mouse_down(

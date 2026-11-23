@@ -26,7 +26,7 @@ struct State {
 }
 
 /// A language that knows two SDK folders.
-struct FakeEnvironment {
+pub(crate) struct FakeEnvironment {
     root: PathBuf,
     runtimes: Vec<RuntimeInfo>,
     state: Mutex<State>,
@@ -138,7 +138,7 @@ impl EnvironmentProvider for FakeEnvironment {
     }
 }
 
-fn window_with_environment(
+pub(crate) fn window_with_environment(
     cx: &mut TestAppContext,
     name: &str,
 ) -> (PathBuf, WindowHandle<Workspace>, Arc<FakeEnvironment>) {
@@ -168,7 +168,7 @@ fn dialog_of(
     view.downcast::<ProjectStructureDialog>().ok()
 }
 
-fn wait_for_dialog(cx: &mut TestAppContext, window: WindowHandle<Workspace>) {
+pub(crate) fn wait_for_dialog(cx: &mut TestAppContext, window: WindowHandle<Workspace>) {
     wait_for_signal(cx, "Project Structure", |cx| {
         dialog_of(cx, window)
             .is_some_and(|dialog| dialog.read_with(cx, |dialog, _| dialog.runtime_count() > 0))

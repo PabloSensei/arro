@@ -158,7 +158,7 @@ impl Plugins {
         });
         problems.extend(register(&plugins, &commands, workspace, cx));
         if !problems.is_empty() {
-            workspace.notify_user("Plugins", problems.join("\n"), cx);
+            workspace.notify_error("Plugins", problems.join("\n"), cx);
         }
         plugins.update(cx, |plugins, _| plugins.problems = problems);
         plugins
@@ -203,7 +203,12 @@ impl Plugins {
                     Ok(()) => this.last = Some(format!("{id} ok")),
                     Err(error) => {
                         this.last = Some(format!("{id} failed: {error}"));
-                        this.tell(format!("{id} failed"), error.to_string(), cx);
+                        this.tell(
+                            NotificationLevel::Error,
+                            format!("{id} failed"),
+                            error.to_string(),
+                            cx,
+                        );
                     }
                 }
                 cx.notify();
@@ -229,12 +234,18 @@ impl Plugins {
             self.settings.disabled.insert(id.to_owned());
         }
         let off = self.settings.disabled.contains(id);
-        let text = match self.settings.save(&self.settings_path) {
-            Ok(()) if off => format!("{id} is off after a restart"),
-            Ok(()) => format!("{id} is on after a restart"),
-            Err(error) => format!("Not saved: {error}"),
+        let (level, text) = match self.settings.save(&self.settings_path) {
+            Ok(()) if off => (
+                NotificationLevel::Info,
+                format!("{id} is off after a restart"),
+            ),
+            Ok(()) => (
+                NotificationLevel::Info,
+                format!("{id} is on after a restart"),
+            ),
+            Err(error) => (NotificationLevel::Error, format!("Not saved: {error}")),
         };
-        self.tell("Plugins", text, cx);
+        self.tell(level, "Plugins", text, cx);
     }
 
     fn answer(&mut self, requests: &Receiver<HostRequest>, cx: &mut Context<Self>) {
@@ -255,6 +266,7 @@ impl Plugins {
 
     fn tell(
         &self,
+        level: NotificationLevel,
         title: impl Into<SharedString>,
         text: impl Into<SharedString>,
         cx: &mut Context<Self>,
@@ -263,7 +275,11 @@ impl Plugins {
         let workspace = self.workspace.clone();
         cx.defer(move |cx| {
             workspace
-                .update(cx, |workspace, cx| workspace.notify_user(title, text, cx))
+                .update(cx, |workspace, cx| match level {
+                    NotificationLevel::Info => workspace.notify_user(title, text, cx),
+                    NotificationLevel::Warning => workspace.notify_warning(title, text, cx),
+                    NotificationLevel::Error => workspace.notify_error(title, text, cx),
+                })
                 .ok();
         });
     }
@@ -343,7 +359,7 @@ fn register(
             };
             if !unknown.is_empty() {
                 let text = format!("No such tokens: {}", unknown.join(", "));
-                workspace.notify_user(name.clone(), text, cx);
+                workspace.notify_warning(name.clone(), text, cx);
             }
             workspace.set_theme(theme, cx);
         });

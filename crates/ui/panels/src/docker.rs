@@ -73,6 +73,9 @@ enum Selected {
     Run(String),
     /// A group of configurations, by the id its provider gave it.
     RunGroup(String),
+    /// The Docker node of the tree. While the daemon does not answer, its reason is on the
+    /// right side with a Retry button.
+    Daemon,
 }
 
 impl Selected {
@@ -84,6 +87,7 @@ impl Selected {
             Self::Image(id) => format!("image:{id}"),
             Self::Run(name) => format!("run:{name}"),
             Self::RunGroup(group) => format!("run-group:{group}"),
+            Self::Daemon => "daemon:".to_owned(),
         }
     }
 
@@ -95,6 +99,7 @@ impl Selected {
             "image" => Some(Self::Image(value.to_owned())),
             "run" => Some(Self::Run(value.to_owned())),
             "run-group" => Some(Self::RunGroup(value.to_owned())),
+            "daemon" => Some(Self::Daemon),
             _ => None,
         }
     }
@@ -803,6 +808,7 @@ impl DockerPanel {
             Some(Selected::Image(_))
             | Some(Selected::Run(_))
             | Some(Selected::RunGroup(_))
+            | Some(Selected::Daemon)
             | None => Vec::new(),
         };
         for (index, (label, id, prefix)) in targets.into_iter().enumerate() {
@@ -851,7 +857,7 @@ impl DockerPanel {
                 .update(cx, |_, window, cx| {
                     workspace.update(cx, |workspace, cx| match sent {
                         Ok(()) => workspace.show_tool(TERMINAL_TOOL, window, cx),
-                        Err(error) => workspace.notify_user("Terminal", error, cx),
+                        Err(error) => workspace.notify_error("Terminal", error, cx),
                     })
                 })
                 .ok();
@@ -862,7 +868,7 @@ impl DockerPanel {
         let workspace = self.workspace.clone();
         cx.defer(move |cx| {
             workspace
-                .update(cx, |workspace, cx| workspace.notify_user(title, text, cx))
+                .update(cx, |workspace, cx| workspace.notify_error(title, text, cx))
                 .ok();
         });
     }
@@ -964,11 +970,60 @@ impl DockerPanel {
         Some(format!("{}:{}", image.repository, image.tag))
     }
 
+    /// The reason on the right of the Docker node while Docker does not answer: the reason of
+    /// a daemon that is down, or the line that the CLI is missing. It is read from the
+    /// snapshot, so it follows Docker when Docker comes up or goes down.
+    fn daemon_problem(&self) -> Option<String> {
+        if self.selected != Some(Selected::Daemon) {
+            return None;
+        }
+        match &self.snapshot.daemon {
+            DaemonState::Up { .. } => None,
+            DaemonState::NoCli => Some(daemon_text(&self.snapshot.daemon)),
+            DaemonState::Down { reason } => Some(reason.clone()),
+        }
+    }
+
+    /// The text of the right side when it has no log to show. Without a container there is
+    /// no container to choose.
+    fn empty_text(&self) -> &'static str {
+        match &self.selected {
+            Some(Selected::Container(_) | Selected::Compose(_) | Selected::Image(_)) => {
+                "No log for the selection"
+            }
+            _ if self.snapshot.containers.is_empty() => "Select a service to see its details",
+            _ => "Select a container or a compose project",
+        }
+    }
+
+    /// Asks Docker again now, from the Retry button of a daemon that does not answer.
+    fn ask_daemon(&mut self, cx: &mut Context<Self>) {
+        if let Some(watch) = &self.watch {
+            watch.refresh();
+        } else {
+            self.start(cx);
+        }
+        cx.notify();
+    }
+
+    /// The text the right side shows in place of a log, for a test.
+    #[cfg(all(test, windows))]
+    pub(crate) fn placeholder_text(&self) -> String {
+        self.daemon_problem()
+            .unwrap_or_else(|| self.empty_text().to_owned())
+    }
+
     /// The name of the node on the right and its state.
     fn selection_title(&self) -> (SharedString, SharedString) {
         if self.kube.selected().is_some() {
             let (title, hint) = self.kube.selection_title();
             return (title.into(), hint.into());
+        }
+        if self.selected == Some(Selected::Daemon) {
+            return (
+                daemon_text(&self.snapshot.daemon).into(),
+                String::new().into(),
+            );
         }
         if let Some(name) = self.selected_run() {
             return (name.into(), String::new().into());
@@ -1117,31 +1172,41 @@ impl DockerPanel {
             }
         }
         let up = matches!(self.snapshot.daemon, DaemonState::Up { .. });
+        // A daemon that does not answer has no branches. Its reason is in the tooltip of the
+        // row and on the right side once the node is chosen, not cut beside the label.
         let reason = match &self.snapshot.daemon {
-            DaemonState::Down { reason } => Some(reason.clone().into()),
+            DaemonState::Down { reason } => Some(reason.clone()),
             _ => None,
         };
         let daemon_open = up && !self.collapsed.contains(DAEMON);
-        rows.push(
-            tree_row(
-                TreeRow {
-                    id: DAEMON.into(),
-                    depth: 0,
-                    label: daemon_text(&self.snapshot.daemon).into(),
-                    hint: reason,
-                    icon: "toolwindows/services",
-                    expandable: up,
-                    open: daemon_open,
-                    selected: false,
-                },
-                theme,
-            )
-            .debug_selector(|| DAEMON.to_owned())
-            .when(up, |this| {
-                this.on_click(cx.listener(|this, _, _, cx| this.toggle_section(DAEMON, cx)))
-            })
-            .into_any_element(),
-        );
+        let daemon = tree_row(
+            TreeRow {
+                id: DAEMON.into(),
+                depth: 0,
+                label: daemon_text(&self.snapshot.daemon).into(),
+                hint: None,
+                icon: "toolwindows/services",
+                expandable: up,
+                open: daemon_open,
+                selected: self.selected == Some(Selected::Daemon),
+            },
+            theme,
+        )
+        .debug_selector(|| DAEMON.to_owned())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if up {
+                this.toggle_section(DAEMON, cx)
+            } else {
+                this.select(Selected::Daemon, cx)
+            }
+        }));
+        let daemon = match reason {
+            Some(reason) => daemon
+                .tooltip(move |_, cx| tooltip(reason.clone(), None, cx))
+                .tooltip_show_delay(TOOLTIP_CREATE_DELAY),
+            None => daemon,
+        };
+        rows.push(daemon.into_any_element());
         if !up || !daemon_open {
             rows.extend(self.kube.tree(theme, cx));
             return rows;
@@ -1493,6 +1558,12 @@ impl DockerPanel {
     /// The actions of the selected node, each with its icon and its name. The name goes
     /// away when the window is narrow, so the buttons keep their place and never overlap.
     fn header_actions(&self, cx: &App) -> Vec<(&'static str, &'static str, &'static str, bool)> {
+        if self.selected == Some(Selected::Daemon) {
+            return match &self.snapshot.daemon {
+                DaemonState::Down { .. } => vec![("retry", "run/restart", "Retry", true)],
+                _ => Vec::new(),
+            };
+        }
         if let Some(name) = self.selected_run() {
             let state = self.run_state(name, cx);
             let running = state.active();
@@ -1614,6 +1685,12 @@ impl DockerPanel {
     }
 
     fn header_action(&mut self, action: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected == Some(Selected::Daemon) {
+            if action == "retry" {
+                self.ask_daemon(cx);
+            }
+            return;
+        }
         if let Some(name) = self.selected_run().map(str::to_owned) {
             self.run_action(action, &name, window, cx);
             return;
@@ -1904,6 +1981,11 @@ impl DockerPanel {
         if self.selected_run_group().is_some() {
             return empty_state("Select a configuration of the group", theme);
         }
+        if self.tab != RightTab::Console
+            && let Some(problem) = self.daemon_problem()
+        {
+            return problem_view(problem, theme);
+        }
         match self.tab {
             RightTab::Dashboard | RightTab::Actuator | RightTab::RunConsole => {
                 self.dashboard(theme, window, cx)
@@ -1984,14 +2066,7 @@ impl DockerPanel {
 
     fn dashboard(&self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
         if self.lines.is_empty() {
-            return empty_state(
-                if self.selected.is_some() {
-                    "No log for the selection"
-                } else {
-                    "Select a container or a compose project"
-                },
-                theme,
-            );
+            return empty_state(self.empty_text(), theme);
         }
         let theme = *theme;
         let count = self.lines.len() + 1;
@@ -2446,6 +2521,20 @@ pub(crate) fn empty_state(text: &'static str, theme: &Theme) -> Div {
         .justify_center()
         .text_color(theme.text_secondary)
         .child(text)
+}
+
+/// The reason of a Docker daemon or of a Kubernetes cluster that does not answer. It is a
+/// column of its own that fills the pane, so a reason of any length wraps inside the pane.
+pub(crate) fn problem_view(text: impl Into<SharedString>, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w_0()
+        .p(px(SPACE_M))
+        .text_color(theme.text_secondary)
+        .debug_selector(|| "services-problem".to_owned())
+        .child(text.into())
 }
 
 /// Puts the name of the container in front of a line of the log of a compose project.

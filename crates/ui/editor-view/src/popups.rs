@@ -241,8 +241,10 @@ impl EditorView {
         }
     }
 
-    /// Every popup goes away: the tab leaves the screen or the window loses the focus.
+    /// Every popup goes away: the tab leaves the screen or the window loses the focus. A
+    /// refactoring that waits for the language goes with them.
     pub fn dismiss_popups(&mut self, cx: &mut Context<Self>) {
+        self.leave_refactor(cx);
         self.dismiss_list_popups(cx);
         if self.popup_open(Popup::QuickDoc) {
             self.close_quick_doc(cx);
@@ -273,7 +275,17 @@ impl EditorView {
         match top {
             Popup::Actions => {
                 if let Some(lsp) = &mut self.lsp {
+                    // The mark of a preview goes with the list it belongs to. A usage
+                    // highlight of Ctrl+Shift+F7 stays under the other lists.
+                    let marked = lsp.actions.as_ref().is_some_and(|menu| {
+                        menu.rows
+                            .get(menu.selected)
+                            .is_some_and(crate::actions::Pick::marks_text)
+                    });
                     lsp.actions = None;
+                    if marked {
+                        lsp.highlights.clear();
+                    }
                 }
             }
             Popup::Note => {

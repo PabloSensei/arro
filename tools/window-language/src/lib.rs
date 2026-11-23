@@ -380,6 +380,21 @@ pub fn message_bundles_with_roots(root: &Path, roots: Vec<PathBuf>) -> Arc<dyn L
     support
 }
 
+/// The file name of a source of the language: `Owner.java`.
+pub fn source_name(class: &str) -> String {
+    format!("{class}.java")
+}
+
+/// The path of a source of the main folder, relative to the root of the project.
+pub fn main_source(package: &str, class: &str) -> PathBuf {
+    let mut path = PathBuf::from("src/main/java");
+    for part in package.split('.') {
+        path.push(part);
+    }
+    path.push(source_name(class));
+    path
+}
+
 /// The path of a source file of a test project, under the source root of its only module.
 pub fn source_path(root: &Path, name: &str) -> PathBuf {
     root.join("src")
@@ -387,7 +402,7 @@ pub fn source_path(root: &Path, name: &str) -> PathBuf {
         .join("java")
         .join("com")
         .join("example")
-        .join(format!("{name}.java"))
+        .join(source_name(name))
 }
 
 /// Writes a source file of a test project and returns its path.
@@ -1092,6 +1107,12 @@ pub fn language_for(path: &Path) -> Option<LanguageConfig> {
     java_lang::language_for(path)
 }
 
+/// The extension and the name of a scratch file of the language of the application, for
+/// the window tests of neutral crates that must not name it.
+pub fn scratch_file_type() -> (&'static str, &'static str) {
+    ("java", "Java")
+}
+
 pub fn templates_for(path: &Path) -> Option<&'static TemplateLanguage> {
     java_lang::templates_for(path)
 }
@@ -1369,11 +1390,12 @@ public class Movable {
 
 /// A class of the main sources by its package and simple name.
 pub fn main_class(root: &Path, package: &str, class: &str) -> PathBuf {
-    let mut path = root.join("src/main/java");
-    for part in package.split('.') {
-        path.push(part);
-    }
-    path.join(format!("{class}.java"))
+    root.join(main_source(package, class))
+}
+
+/// A class with an import its code does not use, for the setting of the compiler problem.
+pub fn unused_import_source() -> &'static str {
+    "package com.example;\n\nimport java.util.List;\n\nclass Main {\n}\n"
 }
 
 fn write_source(root: &Path, relative: &str, text: &str) -> PathBuf {

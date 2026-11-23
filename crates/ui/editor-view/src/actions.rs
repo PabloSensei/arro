@@ -13,11 +13,19 @@ use lang_api::{
 use text_core::{Edit, RopeStore, TextStore, editing};
 use ui_kit::*;
 
+use crate::declaration::Declaration;
 use crate::semantic::{NO_ANSWER, first, offset_at, point_at, uri_path};
 use crate::view::{AiProblem, EditorEvent, EditorView};
 
 /// The caret rests this long before its occurrences are asked for.
 const HIGHLIGHT_DELAY: Duration = Duration::from_millis(250);
+
+/// The kind of the source action that Code → Sort Members runs.
+pub(crate) const SORT_MEMBERS_KIND: &str = "source.sortMembers";
+
+/// The kind of the source action that Code → Add final Modifiers runs. It changes the
+/// modifiers of the members, so it is a row of Code and not of Alt+Insert.
+pub(crate) const FINAL_MODIFIERS_KIND: &str = "source.generate.finalModifiers";
 
 /// A refactoring the editor runs itself, by the same code as its key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -194,6 +202,19 @@ impl Pick {
         }
     }
 
+    /// Whether the selected row marks the text in the editor: the expression or the
+    /// construct it would take, or the places an extract would replace.
+    pub fn marks_text(&self) -> bool {
+        match self {
+            Self::Expression { .. } | Self::Unwrap { .. } => true,
+            Self::Action(entry) => entry
+                .code
+                .as_deref()
+                .is_some_and(|code| code.starts_with("refactor.extract.variable")),
+            _ => false,
+        }
+    }
+
     /// The section a row belongs to. A correction of a misspelled word is a quick fix;
     /// everything the editor adds itself, such as Create Test, is an intention.
     fn section(&self) -> MenuSection {
@@ -214,6 +235,9 @@ pub(crate) struct ActionMenu {
     /// The section of every row, of the same length as `rows`. Empty for the flat
     /// lists that have no sections.
     pub sections: Vec<MenuSection>,
+    /// The group of every row, of the same length as `rows`, for a list whose rows fall into
+    /// groups such as Refactor This. Empty for the lists without groups.
+    pub groups: Vec<usize>,
     pub selected: usize,
     /// The question for the preview of the selected row, while the language computes
     /// the edit on resolve. Dropping it cancels the question.
@@ -221,6 +245,9 @@ pub(crate) struct ActionMenu {
     /// The wait for the server's actions while the server imports. Dropping the list ends
     /// the wait, so a list that closed never takes the actions of another place.
     pub waiting_task: Option<Task<()>>,
+    /// The question for the declaration at the caret, which the inline rows of the list wait
+    /// for. Dropping the list cancels it, so a closed list never takes the rows.
+    pub declaration_task: Option<Task<()>>,
     /// The heading of the list, for the menus that have one, such as Generate.
     pub title: Option<&'static str>,
 }
@@ -257,6 +284,17 @@ impl ActionMenu {
     /// Whether the row is a quick fix, which carries the red bulb and comes first.
     pub fn quick_fix(&self, row: usize) -> bool {
         self.sections.get(row) == Some(&MenuSection::QuickFix)
+    }
+
+    /// Whether a separator goes above the row: the quick fixes of Alt+Enter end there, or
+    /// the groups of the list meet there. A group with no row in the list makes no separator.
+    pub fn separated(&self, row: usize) -> bool {
+        if row == 0 {
+            return false;
+        }
+        let quick_fixes = self.has_sections() && self.quick_fix(row) != self.quick_fix(row - 1);
+        let groups = self.groups.get(row) != self.groups.get(row - 1);
+        quick_fixes || groups
     }
 
     /// Whether the row is an item under another one, such as the fix of a whole file
@@ -305,13 +343,19 @@ pub(crate) fn server_edits(store: &RopeStore, edits: Vec<DocumentEdit>) -> Optio
 
 const OVERLAPPING: &str = "The language server sent overlapping edits, nothing was changed";
 
-/// Alt+Enter with nothing to offer.
-const NO_ACTIONS: &str = "No actions available here";
+/// Alt+Enter with nothing to offer after the filter, as IDEA says it.
+const NO_ACTIONS: &str = "No intentions available";
 /// The greyed last line of Alt+Enter while the server imports: more actions come later.
 const IMPORTING_ACTIONS: &str = "More actions after the project is imported";
 
 /// Fix all found no fix it could apply to every place of the check.
 const NO_FIX_ALL: &str = "The language gave no fix for every place of the check";
+
+/// The byte range a span of the text covers.
+fn expression_range(store: &RopeStore, span: TextSpan) -> Range<usize> {
+    let start = offset_at(store, span.start);
+    start..offset_at(store, span.end).max(start)
+}
 
 /// Whole-word occurrences of `needle` in `text`, in text order.
 pub(crate) fn word_ranges(text: &str, needle: &str) -> Vec<Range<usize>> {
@@ -462,14 +506,19 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         // The place the server marks is the name of the extract. The parameter of
-        // Introduce Parameter is placed by its type, which is not a name to type.
+        // Introduce Parameter is placed by its type, which is not a name to type: its name
+        // is the expression the action replaced, found in `start_extract_name`.
         let introduces_a_name = entry.code.as_deref().is_some_and(|code| {
             code.starts_with("refactor.extract.variable")
                 || code.starts_with("refactor.extract.constant")
                 || code.starts_with("refactor.extract.field")
                 || code.starts_with("refactor.extract.function")
         });
-        if entry.rename.is_some() && introduces_a_name {
+        let introduces_parameter = entry.code.as_deref().is_some_and(|code| {
+            code.starts_with("refactor.introduce.parameter")
+                && !code.starts_with("refactor.introduce.parameter.object")
+        });
+        if (entry.rename.is_some() && introduces_a_name) || introduces_parameter {
             self.start_extract_name(version, entry, label, cx);
             return;
         }
@@ -591,9 +640,11 @@ impl EditorView {
                 at,
                 rows,
                 sections: Vec::new(),
+                groups: Vec::new(),
                 selected: 0,
                 preview_task: None,
                 waiting_task: None,
+                declaration_task: None,
                 title: None,
             });
             cx.notify();
@@ -671,12 +722,24 @@ impl EditorView {
         cx: &mut Context<Self>,
         done: impl FnOnce(&mut Self, i32, usize, Vec<ActionEntry>, &mut Context<Self>) + 'static,
     ) {
-        let Some((uri, version, caret)) = self.asked_version() else {
-            return;
-        };
-        let Some(provider) = self.lsp.as_ref().and_then(|lsp| lsp.support.actions()) else {
-            return;
-        };
+        if let Some(task) = self.ask_actions_task(None, span, only, cx, done) {
+            task.detach();
+        }
+    }
+
+    /// The question of [`EditorView::ask_actions`] as a task. The wait `wait` keeps it, so
+    /// that taking the wait back cancels the question at the language. An answer that comes
+    /// after the wait was taken back is dropped; an answer that decides nothing ends the wait.
+    pub(crate) fn ask_actions_task(
+        &mut self,
+        wait: Option<u64>,
+        span: TextSpan,
+        only: Option<ActionKind>,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(&mut Self, i32, usize, Vec<ActionEntry>, &mut Context<Self>) + 'static,
+    ) -> Option<Task<()>> {
+        let (uri, version, caret) = self.asked_version()?;
+        let provider = self.lsp.as_ref().and_then(|lsp| lsp.support.actions())?;
         let query = ActionQuery {
             uri,
             version,
@@ -684,16 +747,32 @@ impl EditorView {
             only,
         };
         let replies = ask(provider, query);
-        cx.spawn(async move |this, cx| {
+        Some(cx.spawn(async move |this, cx| {
             let answer = first(replies).await;
-            this.update(cx, |this, cx| match answer {
-                Some((_, Confidence::Unknown)) => this.show_note(caret, NO_ANSWER, cx),
-                Some((entries, _)) => done(this, version, caret, entries, cx),
-                None => {}
+            this.update(cx, |this, cx| {
+                if wait.is_some() {
+                    this.follow_refactor_wait(cx);
+                }
+                if wait.is_some_and(|token| !this.refactor_waits(token)) {
+                    return;
+                }
+                match answer {
+                    Some((_, Confidence::Unknown)) => {
+                        if let Some(token) = wait {
+                            this.end_refactor_wait(token, cx);
+                        }
+                        this.show_note(caret, NO_ANSWER, cx)
+                    }
+                    Some((entries, _)) => done(this, version, caret, entries, cx),
+                    None => {
+                        if let Some(token) = wait {
+                            this.end_refactor_wait(token, cx);
+                        }
+                    }
+                }
             })
             .ok();
-        })
-        .detach();
+        }))
     }
 
     /// Ctrl+Alt+O.
@@ -747,6 +826,29 @@ impl EditorView {
             code: mark.code.clone(),
             text: state.text(),
         })
+    }
+
+    /// Whether the problems under the caret are warnings and no error. The bulb of a quick
+    /// fix there is yellow; an error makes it red.
+    pub(crate) fn warning_under(&self, caret: usize) -> bool {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        let mut warning = false;
+        for mark in lsp
+            .server_marks
+            .iter()
+            .chain(lsp.native_marks.values().flatten())
+        {
+            if mark.range.start <= caret && caret <= mark.range.end {
+                match mark.severity {
+                    lang_api::Severity::Error => return false,
+                    lang_api::Severity::Warning => warning = true,
+                    lang_api::Severity::Information | lang_api::Severity::Hint => {}
+                }
+            }
+        }
+        warning
     }
 
     /// Alt+Enter: fixes of the problem under the caret first, then the suppressions of
@@ -817,16 +919,59 @@ impl EditorView {
                 let unknown = answer
                     .as_ref()
                     .is_none_or(|(_, confidence)| *confidence == Confidence::Unknown);
-                let mut rows = server_rows(answered_entries(answer));
+                let mut entries = answered_entries(answer);
+                // Inline rows wait for the declaration at the caret; the list does not wait.
+                let waiting = this.gate_inline(&mut entries);
+                let mut rows = server_rows(entries);
                 rows.extend(own);
+                if rows.is_empty() && !waiting.is_empty() {
+                    // The declaration decides the only rows there are, so the list waits for it.
+                    let task = this.ask_declaration(cx, move |this, declaration, cx| {
+                        let rows = if declaration == Declaration::Project {
+                            server_rows(waiting)
+                        } else {
+                            Vec::new()
+                        };
+                        if rows.is_empty() {
+                            if unknown {
+                                this.show_unanswered(caret, true, cx);
+                            } else {
+                                this.show_transient_note(caret, NO_ACTIONS, cx);
+                            }
+                        } else {
+                            this.show_action_sections(caret, rows, cx);
+                        }
+                    });
+                    if let Some(task) = task {
+                        task.detach();
+                    }
+                    return;
+                }
                 if rows.is_empty() {
                     if unknown {
                         this.show_unanswered(caret, true, cx);
                     } else {
                         this.show_transient_note(caret, NO_ACTIONS, cx);
                     }
+                    return;
+                }
+                // The question goes out before the list shows; the list does not wait for it.
+                let task = if waiting.is_empty() {
+                    None
                 } else {
-                    this.show_action_sections(caret, rows, cx);
+                    let version = this
+                        .state
+                        .as_ref()
+                        .map_or(0, |state| state.version() as i32);
+                    this.ask_declaration(cx, move |this, declaration, cx| {
+                        if declaration == Declaration::Project {
+                            this.join_declared_rows(caret, version, server_rows(waiting), cx);
+                        }
+                    })
+                };
+                this.show_action_sections(caret, rows, cx);
+                if let Some(task) = task {
+                    this.keep_declaration_task(Some(task));
                 }
             })
             .ok();
@@ -857,9 +1002,11 @@ impl EditorView {
             at,
             rows,
             sections,
+            groups: Vec::new(),
             selected: 0,
             preview_task: None,
             waiting_task: None,
+            declaration_task: None,
             title: None,
         });
         cx.notify();
@@ -923,6 +1070,8 @@ impl EditorView {
         answer: Option<(Vec<ActionEntry>, Confidence)>,
         cx: &mut Context<Self>,
     ) {
+        let mut entries = answered_entries(answer);
+        let waiting = self.gate_inline(&mut entries);
         if self
             .state
             .as_ref()
@@ -942,7 +1091,7 @@ impl EditorView {
         let selected = menu.selected;
         // The rows are sorted by section again, as the list builds them: the sort is stable,
         // so the language's rows keep their order and come before the editor's rows.
-        let mut rows: Vec<(MenuSection, bool, Pick)> = server_rows(answered_entries(answer))
+        let mut rows: Vec<(MenuSection, bool, Pick)> = server_rows(entries)
             .into_iter()
             .map(|(section, pick)| (section, false, pick))
             .collect();
@@ -960,6 +1109,14 @@ impl EditorView {
         menu.preview_task = None;
         cx.notify();
         self.request_action_preview(cx);
+        if !waiting.is_empty() {
+            let task = self.ask_declaration(cx, move |this, declaration, cx| {
+                if declaration == Declaration::Project {
+                    this.join_declared_rows(caret, version, server_rows(waiting), cx);
+                }
+            });
+            self.keep_declaration_task(task);
+        }
     }
 
     /// The change the selected row would make, in the current document, when the
@@ -1096,6 +1253,130 @@ impl EditorView {
             .ok();
         })
         .detach();
+    }
+
+    /// Runs a row of a list the way Enter does: an action whose edits come on resolve is
+    /// resolved first, and any other is applied at once.
+    fn apply_picked(&mut self, entry: ActionEntry, version: i32, cx: &mut Context<Self>) {
+        if entry.edits.is_empty() && entry.renames.is_empty() && entry.resolve.is_some() {
+            self.resolve_and_apply(entry, version, cx);
+        } else {
+            self.apply_entry(version, entry, cx);
+        }
+    }
+
+    /// Code → Sort Members and Add final Modifiers: the source action of the file with `code`,
+    /// run as Enter runs a row. A file the server gives no such action for says `missing` at
+    /// the caret.
+    pub(crate) fn source_action(
+        &mut self,
+        code: &'static str,
+        missing: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(span) = self.state.as_ref().map(|state| whole(&state.store())) else {
+            return;
+        };
+        let only = Some(ActionKind::Source);
+        self.ask_actions(
+            span,
+            only,
+            cx,
+            move |this, version, caret, entries, cx| match entries
+                .into_iter()
+                .find(|entry| entry.code.as_deref() == Some(code))
+            {
+                Some(entry) => this.apply_picked(entry, version, cx),
+                None => this.show_note(caret, missing, cx),
+            },
+        );
+    }
+
+    /// Takes the inline rows out of a language answer while the declaration at the caret is
+    /// not known. The rows the declaration allows stay in `entries`, the rows it does not
+    /// allow are dropped, and the rows of an unknown declaration are returned to wait for it.
+    pub(crate) fn gate_inline(&self, entries: &mut Vec<ActionEntry>) -> Vec<ActionEntry> {
+        if !entries.iter().any(is_inline_action) {
+            return Vec::new();
+        }
+        match self.known_declaration() {
+            Some(declaration) => {
+                if !declaration.offers_inline() {
+                    entries.retain(|entry| !is_inline_action(entry));
+                }
+                Vec::new()
+            }
+            None => {
+                let (waiting, kept): (Vec<ActionEntry>, Vec<ActionEntry>) = std::mem::take(entries)
+                    .into_iter()
+                    .partition(is_inline_action);
+                *entries = kept;
+                waiting
+            }
+        }
+    }
+
+    /// Adds the inline rows that the declaration allowed to the list that is open at the same
+    /// caret and text. They join the list the way the answer of a waiting list joins it: the
+    /// rows come first in their section, and the selection stays on its row.
+    fn join_declared_rows(
+        &mut self,
+        caret: usize,
+        version: i32,
+        rows: Vec<(MenuSection, Pick)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .state
+            .as_ref()
+            .is_none_or(|state| state.version() as i32 != version)
+        {
+            return;
+        }
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        let Some(menu) = &mut lsp.actions else {
+            return;
+        };
+        // Only the list of Alt+Enter: it has sections and no heading.
+        if menu.at != caret
+            || menu.title.is_some()
+            || !menu.has_sections()
+            || menu.rows.iter().any(Pick::is_waiting)
+        {
+            return;
+        }
+        let selected = menu.selected;
+        let mut all: Vec<(MenuSection, bool, Pick)> = rows
+            .into_iter()
+            .map(|(section, pick)| (section, false, pick))
+            .collect();
+        let sections = std::mem::take(&mut menu.sections);
+        all.extend(
+            std::mem::take(&mut menu.rows)
+                .into_iter()
+                .zip(sections)
+                .enumerate()
+                .map(|(row, (pick, section))| (section, row == selected, pick)),
+        );
+        all.sort_by_key(|(section, _, _)| *section != MenuSection::QuickFix);
+        menu.selected = all.iter().position(|(_, chosen, _)| *chosen).unwrap_or(0);
+        menu.sections = all.iter().map(|(section, _, _)| *section).collect();
+        menu.rows = all.into_iter().map(|(_, _, pick)| pick).collect();
+        menu.preview_task = None;
+        cx.notify();
+        self.request_action_preview(cx);
+    }
+
+    /// Keeps the question of a declaration in the list that waits for its answer. Closing the
+    /// list drops the task, and the question with it.
+    pub(crate) fn keep_declaration_task(&mut self, task: Option<Task<()>>) {
+        if let Some(lsp) = &mut self.lsp
+            && let Some(menu) = &mut lsp.actions
+        {
+            menu.declaration_task = task;
+        }
     }
 
     /// The rows of ALT+Enter that the window adds beside the language actions, such as
@@ -1404,17 +1685,12 @@ impl EditorView {
                     let selected = menu.selected;
                     menu.rows.swap_remove(selected)
                 });
+                // The marks of the list belong to the choice it made.
+                lsp.highlights.clear();
                 let version = self.state.as_ref().map(|state| state.version() as i32);
                 match (picked, version) {
                     (Some(Pick::Action(entry)), Some(version)) => {
-                        if entry.edits.is_empty()
-                            && entry.renames.is_empty()
-                            && entry.resolve.is_some()
-                        {
-                            self.resolve_and_apply(entry, version, cx);
-                        } else {
-                            self.apply_entry(version, entry, cx);
-                        }
+                        self.apply_picked(entry, version, cx)
                     }
                     (Some(Pick::ChangeSignature { .. }), _) => self.change_signature(cx),
                     (Some(Pick::Refactor { own, .. }), _) => self.run_own(own, cx),
@@ -1474,8 +1750,9 @@ impl EditorView {
         true
     }
 
-    /// Marks the text an Unwrap choice leaves in place, so the pick list shows what
-    /// stays before Enter applies it.
+    /// Marks the text a pick list choice would take, so the list shows what it acts on
+    /// before Enter applies it: the construct an Unwrap leaves, or the expression an
+    /// extract takes.
     pub(crate) fn highlight_action_row(&mut self) {
         let Some(lsp) = &mut self.lsp else {
             return;
@@ -1483,10 +1760,45 @@ impl EditorView {
         let Some(menu) = &lsp.actions else {
             return;
         };
-        let Some(Pick::Unwrap { edit, .. }) = menu.rows.get(menu.selected) else {
+        let Some(pick) = menu.rows.get(menu.selected) else {
             return;
         };
-        lsp.highlights = std::iter::once(edit.start..edit.end).collect();
+        let uri = lsp.uri.clone();
+        let ranges: Vec<Range<usize>> = match pick {
+            Pick::Unwrap { edit, .. } => std::iter::once(edit.start..edit.end).collect(),
+            Pick::Expression { span, .. } => {
+                let Some(state) = &self.state else {
+                    return;
+                };
+                let store = state.store();
+                std::iter::once(expression_range(&store, *span)).collect()
+            }
+            // An extract of a value replaces the expression at this place or at every
+            // place: the list shows the places the selected row would change.
+            Pick::Action(entry)
+                if entry
+                    .code
+                    .as_deref()
+                    .is_some_and(|code| code.starts_with("refactor.extract.variable")) =>
+            {
+                let Some(state) = &self.state else {
+                    return;
+                };
+                let store = state.store();
+                entry
+                    .edits
+                    .iter()
+                    .filter(|source| source.uri == uri)
+                    .flat_map(|source| &source.edits)
+                    .filter(|edit| edit.span.start != edit.span.end)
+                    .map(|edit| expression_range(&store, edit.span))
+                    .collect()
+            }
+            _ => return,
+        };
+        if !ranges.is_empty() {
+            lsp.highlights = ranges;
+        }
     }
 
     /// Ctrl+Shift+F7: shows every occurrence of the thing under the caret, from the
@@ -1676,21 +1988,91 @@ impl EditorView {
 }
 
 /// The rows of the language's answer for Alt+Enter: the quick fixes first, and the preferred
-/// actions first inside a section. An action with no edit, no rename and no resolve has
-/// nothing to apply, so it is left out.
+/// actions first inside a section. The source actions of the whole file are left out, and so
+/// is an action with no edit, no rename and no resolve, which has nothing to apply.
 fn server_rows(mut entries: Vec<ActionEntry>) -> Vec<(MenuSection, Pick)> {
+    entries.retain(|entry| !is_file_action(entry));
     entries.sort_by_key(|entry| (section_of(entry) != MenuSection::QuickFix, !entry.preferred));
     without_duplicate_actions(entries)
         .into_iter()
-        .filter(|entry| {
-            !entry.edits.is_empty() || !entry.renames.is_empty() || entry.resolve.is_some()
-        })
+        .filter(applicable)
         .map(|entry| (section_of(&entry), Pick::Action(entry)))
         .collect()
 }
 
+/// Whether an action works on the whole file rather than on the place of the caret: the
+/// source actions, Organize Imports and Fix All. Alt+Insert and the Code menu give them.
+fn is_file_action(entry: &ActionEntry) -> bool {
+    matches!(
+        entry.kind,
+        Some(ActionKind::Source | ActionKind::OrganizeImports | ActionKind::FixAll)
+    )
+}
+
+/// Whether an action has something to apply: an edit, a rename, or an edit that the server
+/// gives on resolve.
+fn applicable(entry: &ActionEntry) -> bool {
+    !entry.edits.is_empty() || !entry.renames.is_empty() || entry.resolve.is_some()
+}
+
+/// The codes of the source actions that the fixed rows of Source Generate give already, so
+/// Alt+Insert does not list the server's action for them again.
+const GENERATE_ROW_CODES: [&str; 6] = [
+    "source.generate.accessors",
+    "source.generate.constructors",
+    "source.generate.delegateMethods",
+    "source.generate.hashCodeEquals",
+    "source.generate.toString",
+    "source.overrideMethods",
+];
+
+/// Whether a source action is a part of Source Generate, which Alt+Insert lists: the kinds
+/// that write code. Code → Sort Members and Code → Add final Modifiers are other source
+/// actions, and the Code menu gives them.
+fn is_generate_kind(code: &str) -> bool {
+    code.starts_with("source.generate.") && code != FINAL_MODIFIERS_KIND
+}
+
+/// Whether a row of the server inlines a symbol: Inline Method, Inline Variable or Inline
+/// Constant. Whether it is offered depends on the declaration of the symbol.
+pub(crate) fn is_inline_action(entry: &ActionEntry) -> bool {
+    entry
+        .code
+        .as_deref()
+        .is_some_and(|code| code.starts_with("refactor.inline"))
+}
+
+/// The source actions of the language as rows of Alt+Insert: only the kinds of Source
+/// Generate. With the fixed rows of Source Generate (`fixed`), the actions those rows give
+/// are left out.
+pub(crate) fn source_rows(entries: Vec<ActionEntry>, fixed: bool) -> Vec<Pick> {
+    entries
+        .into_iter()
+        .filter(|entry| entry.kind == Some(ActionKind::Source) && applicable(entry))
+        .filter(|entry| entry.code.as_deref().is_some_and(is_generate_kind))
+        .filter(|entry| {
+            let covered = entry
+                .code
+                .as_deref()
+                .is_some_and(|code| GENERATE_ROW_CODES.contains(&code));
+            !(fixed && covered)
+        })
+        .map(Pick::Action)
+        .collect()
+}
+
+/// The bulb of a row of Alt+Enter: a quick fix of an error is red, a quick fix of a warning
+/// is yellow, and a refactoring or an intention has the plain bulb.
+pub(crate) fn bulb_icon(quick_fix: bool, warning: bool) -> &'static str {
+    match (quick_fix, warning) {
+        (true, false) => "codeInsight/quickFix",
+        (true, true) => "codeInsight/intention",
+        (false, _) => "codeInsight/intentionBulb",
+    }
+}
+
 /// The actions of a language answer. An answer that says it is unknown gives none.
-fn answered_entries(answer: Option<(Vec<ActionEntry>, Confidence)>) -> Vec<ActionEntry> {
+pub(crate) fn answered_entries(answer: Option<(Vec<ActionEntry>, Confidence)>) -> Vec<ActionEntry> {
     match answer {
         Some((entries, confidence)) if confidence != Confidence::Unknown => entries,
         _ => Vec::new(),
@@ -1722,7 +2104,10 @@ mod tests {
     use lang_api::{DocumentEdit, TextPoint, TextSpan};
     use text_core::{FileFormat, RopeStore, TextStore};
 
-    use super::{server_batches, server_edits, without_duplicate_actions};
+    use super::{
+        Pick, bulb_icon, server_batches, server_edits, server_rows, source_rows,
+        without_duplicate_actions,
+    };
     use crate::EditorState;
 
     const TEXT: &str = "import b;\nimport a;\nclass X {}\n";
@@ -1860,6 +2245,89 @@ mod tests {
         );
         state.perform(keymap::editor::UNDO, 10);
         assert_eq!(state.text(), TEXT);
+    }
+
+    #[test]
+    fn alt_enter_lists_only_the_quick_fixes_and_the_refactorings() {
+        use lang_api::{ActionEntry, ActionKind};
+
+        let entry = |title: &str, kind: ActionKind| ActionEntry {
+            title: title.to_owned(),
+            kind: Some(kind),
+            code: None,
+            preferred: false,
+            edits: Vec::new(),
+            renames: Vec::new(),
+            handle: None,
+            resolve: Some(format!("resolve {title}")),
+            rename: None,
+        };
+        let rows = server_rows(vec![
+            entry("Organize imports", ActionKind::OrganizeImports),
+            entry("Sort members", ActionKind::Source),
+            entry("Clean up", ActionKind::FixAll),
+            entry("Inline", ActionKind::Refactor),
+            entry("Add import", ActionKind::QuickFix),
+        ]);
+        let titles: Vec<&str> = rows.iter().map(|(_, pick)| pick.label()).collect();
+        assert_eq!(titles, ["Add import", "Inline"]);
+    }
+
+    #[test]
+    fn alt_insert_lists_only_the_generate_kinds_and_each_once() {
+        use lang_api::{ActionEntry, ActionKind};
+
+        let entry = |title: &str, kind: ActionKind, code: &str| ActionEntry {
+            title: title.to_owned(),
+            kind: Some(kind),
+            code: Some(code.to_owned()),
+            preferred: false,
+            edits: Vec::new(),
+            renames: Vec::new(),
+            handle: None,
+            resolve: Some(format!("resolve {title}")),
+            rename: None,
+        };
+        let answer = || {
+            vec![
+                entry(
+                    "Generate toString()",
+                    ActionKind::Source,
+                    "source.generate.toString",
+                ),
+                entry("Sort members", ActionKind::Source, "source.sortMembers"),
+                entry(
+                    "Organize imports",
+                    ActionKind::OrganizeImports,
+                    "source.organizeImports",
+                ),
+                entry(
+                    "Change modifiers",
+                    ActionKind::Source,
+                    "source.generate.finalModifiers",
+                ),
+            ]
+        };
+        let labels = |rows: Vec<Pick>| -> Vec<String> {
+            rows.iter().map(|pick| pick.label().to_owned()).collect()
+        };
+        // The fixed rows of Source Generate give toString already, and Sort Members and the
+        // final modifiers belong to Code, so nothing is left.
+        assert!(labels(source_rows(answer(), true)).is_empty());
+        // Without the fixed rows the generate kind is listed; neither Organize Imports nor the
+        // other source actions are.
+        assert_eq!(
+            labels(source_rows(answer(), false)),
+            ["Generate toString()"]
+        );
+    }
+
+    #[test]
+    fn a_quick_fix_of_an_error_is_red_and_of_a_warning_yellow() {
+        assert_eq!(bulb_icon(true, false), "codeInsight/quickFix");
+        assert_eq!(bulb_icon(true, true), "codeInsight/intention");
+        assert_eq!(bulb_icon(false, false), "codeInsight/intentionBulb");
+        assert_eq!(bulb_icon(false, true), "codeInsight/intentionBulb");
     }
 
     #[test]

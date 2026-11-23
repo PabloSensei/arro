@@ -94,6 +94,11 @@ pub struct Languages {
 
 impl Global for Languages {}
 
+/// The icon of a file by its path. Set by the application, the editor knows no file types.
+pub struct FileIcon(pub Arc<dyn Fn(&Path) -> &'static str>);
+
+impl Global for FileIcon {}
+
 /// Live templates of a format that a tool adds beside the languages of the application,
 /// such as the SQL console. Every builder is asked in turn and the first answer wins.
 pub struct ExtraTemplates(pub Vec<fn(&Path) -> Option<&'static TemplateLanguage>>);
@@ -1208,6 +1213,8 @@ pub struct EditorView {
     pub(crate) usages: Option<Vec<std::ops::Range<usize>>>,
     /// A `go_to` that came before the file was read.
     pending_spot: Option<Spot>,
+    /// The command that came before the file was read; `loaded` runs it once the text is there.
+    pending_action: Option<String>,
     /// The buffer rows the last inlay question covered, so a scroll asks only when
     /// another part of the document shows.
     pub(crate) inlay_range: Option<(usize, usize)>,
@@ -1219,6 +1226,11 @@ pub struct EditorView {
     pub(crate) completion_doc_task: Option<Task<()>>,
     /// The message under the caret that closes by itself.
     pub(crate) note_task: Option<Task<()>>,
+    /// Counts the waits of the refactorings, so that an answer of an earlier wait is dropped.
+    /// It lives on the view, not in `Lsp`, which is rebuilt for the language.
+    pub(crate) refactor_tokens: u64,
+    /// The refactoring that waits for the language, see [`crate::refactor::RefactorWait`].
+    pub(crate) refactor_wait: Option<crate::refactor::RefactorWait>,
     /// The labels above declarations, as the language gave them for this text.
     pub(crate) code_lens: Vec<crate::code_lens::CodeLensItem>,
     /// The parts of each block row, in the order the row draws them.
@@ -1442,6 +1454,9 @@ impl EditorView {
         // it when the user clicks away.
         let focus = view.focus_handle.clone();
         cx.on_blur(&focus, window, |view, _window, cx| {
+            // A refactoring that waits for the language, and the name it opened, end with
+            // the focus: a late answer must not open the name again.
+            view.leave_refactor(cx);
             if view
                 .lsp
                 .as_ref()
@@ -1792,11 +1807,14 @@ impl EditorView {
             hippie: None,
             usages: None,
             pending_spot: None,
+            pending_action: None,
             inlay_range: None,
             inlays_task: None,
             completion_task: None,
             completion_doc_task: None,
             note_task: None,
+            refactor_tokens: 0,
+            refactor_wait: None,
             code_lens: Vec::new(),
             code_vision_labels: Vec::new(),
             code_vision_hovered: None,
@@ -1924,6 +1942,8 @@ impl EditorView {
         self.reveal_center = true;
         self.caret_on = true;
         self.inlays_if_needed(cx);
+        // The status line shows the caret and redraws only on this event.
+        cx.emit(EditorEvent::Moved);
         cx.notify();
     }
 
@@ -2325,6 +2345,23 @@ impl EditorView {
         Some(completion.labels())
     }
 
+    /// The headings of the groups of an open Override or Implement list, as the window
+    /// shows them. A test reads them; the paint uses the same names.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn override_headers(&self) -> Option<Vec<String>> {
+        let popup = self.lsp.as_ref()?.overrides.as_ref()?;
+        let mut headers = Vec::new();
+        let mut owner: Option<&str> = None;
+        for index in &popup.shown {
+            let method = &popup.methods[*index];
+            if owner != Some(method.owner.as_str()) {
+                owner = Some(method.owner.as_str());
+                headers.push(crate::hierarchy::owner_heading(&method.owner).0);
+            }
+        }
+        Some(headers)
+    }
+
     /// The text of the note under the caret, when one is on screen. A test reads it; nothing
     /// else does.
     #[cfg(any(test, feature = "test-support"))]
@@ -2396,6 +2433,42 @@ impl EditorView {
         menu.rows
             .get(menu.selected)
             .map(|pick| pick.label().to_owned())
+    }
+
+    /// The heading of an open list, such as Refactor This. A test reads it; nothing else
+    /// does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn actions_title(&self) -> Option<&'static str> {
+        self.lsp.as_ref()?.actions.as_ref()?.title
+    }
+
+    /// The place the selected row of an open list marks in the text, such as the
+    /// expression an extract takes. A test reads it; nothing else does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn action_highlight(&self) -> Option<std::ops::Range<usize>> {
+        self.action_highlights()?.into_iter().next()
+    }
+
+    /// The places the selected row of an open list marks in the text: one expression,
+    /// or every occurrence an extract would replace. A test reads them; nothing else
+    /// does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn action_highlights(&self) -> Option<Vec<std::ops::Range<usize>>> {
+        let lsp = self.lsp.as_ref()?;
+        lsp.actions.as_ref()?;
+        Some(lsp.highlights.clone())
+    }
+
+    /// The rows of an open list above which a separator is drawn, counted from zero. A test
+    /// reads them; nothing else does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn actions_separators(&self) -> Option<Vec<usize>> {
+        let menu = self.lsp.as_ref()?.actions.as_ref()?;
+        Some(
+            (0..menu.rows.len())
+                .filter(|row| menu.separated(*row))
+                .collect(),
+        )
     }
 
     /// The places of an open Ctrl+B list, from zero. A test reads them; nothing else does.
@@ -2642,10 +2715,15 @@ impl EditorView {
                 }
                 self.remember_text(cx);
                 cx.emit(EditorEvent::Loaded);
+                // A command that came before the text runs now, at the place the file opens at.
+                if let Some(action) = self.pending_action.take() {
+                    self.run(&action, cx);
+                }
             }
             Err(LoadError(message)) => {
                 let message: SharedString = message.into();
                 self.failed = Some(message.clone());
+                self.pending_action = None;
                 cx.emit(EditorEvent::Failed(message));
             }
         }
@@ -2902,11 +2980,15 @@ impl EditorView {
     }
 
     /// Where the caret goes once the file is read: a restored session, a jump from a list.
+    /// A file that is read already moves the caret now, and the status line shows it.
     pub fn restore_caret(&mut self, line: usize, column: usize, cx: &mut Context<Self>) {
         match &mut self.state {
             Some(state) => {
                 state.set_caret(line, column);
                 self.autoscroll = true;
+                self.caret_on = true;
+                // The status line shows the caret and redraws only on this event.
+                cx.emit(EditorEvent::Moved);
                 cx.notify();
             }
             None => self.pending_caret = Some((line, column)),
@@ -3130,6 +3212,11 @@ impl EditorView {
     /// inside it; a file opened alone has no root and no such check.
     pub fn set_project_root(&mut self, root: Option<PathBuf>) {
         self.project_root = root;
+    }
+
+    /// The root of the project the file belongs to, when the window knows it.
+    pub fn project_root(&self) -> Option<&Path> {
+        self.project_root.as_deref()
     }
 
     fn apply_zoom(&mut self) {
@@ -3517,6 +3604,9 @@ impl EditorView {
     }
 
     fn finish_change(&mut self, change: Option<Change>, cx: &mut Context<Self>) {
+        // A refactoring that waits for the language was asked about the text and the caret it
+        // stood on: an edit or a move takes it back.
+        self.follow_refactor_wait(cx);
         // The menu of Alt+Enter belongs to the text and the word it opened on.
         if change.is_some() {
             self.dismiss_actions_popup(cx);
@@ -4370,15 +4460,14 @@ impl EditorView {
             cx.stop_propagation();
             return;
         }
-        // Escape closes the topmost popup of the editor and nothing else.
-        if stroke.key == "escape"
-            && !stroke.ctrl
-            && !stroke.alt
-            && !stroke.shift
-            && self.close_top_popup(cx)
-        {
-            cx.stop_propagation();
-            return;
+        // Escape closes the topmost popup of the editor and nothing else, except a refactoring
+        // that waits for the language: Escape takes it back, with its hint, and is used up.
+        if stroke.key == "escape" && !stroke.ctrl && !stroke.alt && !stroke.shift {
+            let waiting = self.cancel_refactor_wait(cx);
+            if self.close_top_popup(cx) || waiting {
+                cx.stop_propagation();
+                return;
+            }
         }
         // The second key of a chord: Ctrl+* then a digit, for instance.
         if !self.chords.is_empty() {
@@ -4514,8 +4603,23 @@ impl EditorView {
         self.on_key(event, window, cx);
     }
 
+    /// The commands that read the caret or the text to act on it. Pressed before the file is
+    /// read, they wait for the text instead of finding nothing to act on.
+    fn waits_for_text(action: &str) -> bool {
+        matches!(
+            action,
+            actions::RENAME
+                | actions::SHOW_ACTIONS
+                | actions::EXTRACT_VARIABLE
+                | actions::GOTO_DECLARATION
+        )
+    }
+
     /// Runs a keymap action.
     pub fn run(&mut self, action: &str, cx: &mut Context<Self>) {
+        // Any action of the editor takes back a refactoring that waits for the language; the
+        // refactoring that the action starts begins a new wait.
+        self.cancel_refactor_wait(cx);
         // A refactoring of several files is one step of the window's history: this file
         // asks the window for it instead of taking back its own buffer alone.
         if action == actions::UNDO
@@ -4528,6 +4632,12 @@ impl EditorView {
             && let Some(group) = self.workspace_redo()
         {
             cx.emit(EditorEvent::RedoRefactoring(group));
+            return;
+        }
+        // Before the file is read there is no place to act on: a command that reads the caret
+        // or the text waits for the text, and `loaded` runs it then.
+        if !self.is_loaded() && Self::waits_for_text(action) {
+            self.pending_action = Some(action.to_owned());
             return;
         }
         // A command counts its edits from the carets and folds here, so the changes of
@@ -4648,6 +4758,20 @@ impl EditorView {
             }
             actions::REFORMAT => return self.reformat(cx),
             actions::OPTIMIZE_IMPORTS => return self.optimize_imports(cx),
+            actions::SORT_MEMBERS => {
+                return self.source_action(
+                    crate::actions::SORT_MEMBERS_KIND,
+                    "Nothing to sort here",
+                    cx,
+                );
+            }
+            actions::ADD_FINAL_MODIFIERS => {
+                return self.source_action(
+                    crate::actions::FINAL_MODIFIERS_KIND,
+                    "Nothing to change to final here",
+                    cx,
+                );
+            }
             actions::SHOW_ACTIONS => return self.show_actions(cx),
             actions::FIND_USAGES => return self.find_usages(cx),
             actions::SHOW_USAGES => return self.show_usages(cx),
@@ -4707,6 +4831,7 @@ impl EditorView {
         }
         let rows = self.page_rows();
         if let Some(change) = self.template_action(action, cx) {
+            self.template_note(cx);
             self.changed(change, cx);
             return;
         }
@@ -5238,6 +5363,7 @@ impl EditorView {
                     event.click_count,
                 );
             }
+            self.follow_refactor_wait(cx);
             self.drag = drag_of(event.click_count, offset);
             if let Some(lsp) = &mut self.lsp {
                 lsp.actions = None;
@@ -5390,6 +5516,7 @@ impl EditorView {
             add_caret,
             event.click_count,
         );
+        self.follow_refactor_wait(cx);
         self.drag = drag_of(event.click_count, offset);
         self.block_drag = block.then(|| (offset, if modifiers.alt { kept } else { Vec::new() }));
         if let Some(bar) = &mut self.bar {
@@ -5438,6 +5565,7 @@ impl EditorView {
             if let Some(state) = &mut self.state {
                 state.click(offset, false, false, 1);
             }
+            self.follow_refactor_wait(cx);
             self.caret_on = true;
             self.highlight_later(cx);
             cx.notify();
@@ -5579,6 +5707,8 @@ impl EditorView {
                 (None, Some(DragUnit::Lines(anchor))) => state.drag_lines(anchor, offset),
                 (None, None) => state.drag_to(offset),
             }
+            // A drag moves the caret: a refactoring that waits for the language lets go.
+            self.follow_refactor_wait(cx);
             self.autoscroll = true;
             cx.notify();
         }
@@ -6352,6 +6482,7 @@ impl EditorView {
                                 .min_w_0()
                                 .truncate()
                                 .text_color(theme.text)
+                                .when(parts.bold, |line| line.font_weight(FontWeight::BOLD))
                                 .child(left),
                         )
                         .children(parts.right.map(|right| {
@@ -6570,11 +6701,12 @@ impl EditorView {
                 );
             }
             let sections = menu.has_sections();
+            let warning = self.warning_under(menu.at);
             for row in menu.window() {
                 let selected = row == menu.selected;
                 let quick_fix = menu.quick_fix(row);
                 let nested = menu.nested(row);
-                if sections && row > 0 && quick_fix != menu.quick_fix(row - 1) {
+                if menu.separated(row) {
                     rows.push(
                         div()
                             .debug_selector(|| "actions-separator".to_owned())
@@ -6605,15 +6737,8 @@ impl EditorView {
                         theme.text
                     });
                 if sections {
-                    item = item.child(icon_sized(
-                        if quick_fix {
-                            "codeInsight/quickFix"
-                        } else {
-                            "codeInsight/intention"
-                        },
-                        14.,
-                        &theme,
-                    ));
+                    let bulb = crate::actions::bulb_icon(quick_fix, warning);
+                    item = item.child(icon_sized(bulb, 14., &theme));
                 }
                 rows.push(
                     item.child(
@@ -6810,7 +6935,11 @@ impl EditorView {
             );
         }
         if let Some(field) = &lsp.name
-            && let Some(position) = self.below(field.at)
+            && let Some((position, anchor)) = self.popup_position(
+                field.at,
+                (3. + f32::from(field.visibility_line().is_some())) * (self.style.line_height + 4.)
+                    + 12.,
+            )
         {
             let body = surface(&theme)
                 .debug_selector(|| "extract-name-popup".to_owned())
@@ -6843,6 +6972,7 @@ impl EditorView {
             popups.push(
                 deferred(
                     anchored()
+                        .anchor(anchor)
                         .position(position)
                         .snap_to_window_with_margin(px(SPACE_M))
                         .child(body),
@@ -6860,19 +6990,42 @@ impl EditorView {
         {
             let mut rows: Vec<AnyElement> = Vec::new();
             let mut owner: Option<&str> = None;
+            let mut group = 0usize;
             for (row, index) in popup.shown.iter().enumerate() {
                 let method = &popup.methods[*index];
                 if owner != Some(method.owner.as_str()) {
                     owner = Some(method.owner.as_str());
+                    let (heading, package) = crate::hierarchy::owner_heading(&method.owner);
+                    let mut text = heading;
+                    let mut highlights = Vec::new();
+                    if let Some(package) = package {
+                        text.push_str("  ");
+                        let start = text.len();
+                        text.push_str(&package);
+                        highlights.push((
+                            start..text.len(),
+                            HighlightStyle {
+                                color: Some(theme.text_muted),
+                                ..HighlightStyle::default()
+                            },
+                        ));
+                    }
                     rows.push(
                         div()
                             .px_2()
                             .pt_1()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text_secondary)
-                            .child(method.owner.clone())
+                            .debug_selector(move || format!("override-owner-{group}"))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.text_secondary)
+                                    .child(StyledText::new(text).with_highlights(highlights)),
+                            )
                             .into_any_element(),
                     );
+                    group += 1;
                 }
                 let selected = row == popup.selected;
                 let checked = popup.checked[*index];
@@ -7084,72 +7237,12 @@ impl EditorView {
             );
         }
         if let Some(popup) = &lsp.definition
-            && let Some(position) = self.below(popup.at)
+            && let Some(element) = self.render_definition(popup, window, cx)
         {
-            let mut rows: Vec<AnyElement> = Vec::new();
-            let mut line_start = 0;
-            for line in popup.text.split('\n').take(30) {
-                let line_end = line_start + line.len();
-                let mut runs: Vec<AnyElement> = Vec::new();
-                let mut at = line_start;
-                for span in popup.spans.iter().filter(|span| {
-                    (span.start as usize) < line_end && (span.end as usize) > line_start
-                }) {
-                    let start = (span.start as usize).max(line_start);
-                    let end = (span.end as usize).min(line_end);
-                    if start > at {
-                        runs.push(
-                            div()
-                                .flex_none()
-                                .text_color(self.style.code)
-                                .child(line[at - line_start..start - line_start].to_owned())
-                                .into_any_element(),
-                        );
-                    }
-                    runs.push(
-                        div()
-                            .flex_none()
-                            .text_color(self.style.color_of(span.kind))
-                            .child(line[start - line_start..end - line_start].to_owned())
-                            .into_any_element(),
-                    );
-                    at = end;
-                }
-                if at < line_end {
-                    runs.push(
-                        div()
-                            .flex_none()
-                            .text_color(self.style.code)
-                            .child(line[at - line_start..].to_owned())
-                            .into_any_element(),
-                    );
-                }
-                rows.push(
-                    div()
-                        .flex()
-                        .whitespace_nowrap()
-                        .children(runs)
-                        .into_any_element(),
-                );
-                line_start = line_end + 1;
-            }
-            let body = surface(&theme)
-                .debug_selector(|| "quick-definition".to_owned())
-                .max_w(px(720.))
-                .p_2()
-                .font_family(self.style.font_family.clone())
-                .text_size(px(self.style.font_size))
-                .children(rows);
-            popups.push(
-                deferred(
-                    anchored()
-                        .position(position)
-                        .snap_to_window_with_margin(px(SPACE_M))
-                        .child(body),
-                )
-                .with_priority(1)
-                .into_any_element(),
-            );
+            popups.push(element);
+        }
+        if let Some(catcher) = self.definition_drag_catcher(cx) {
+            popups.push(catcher);
         }
         if let Some(note) = &lsp.note
             && let Some(position) = self.below(note.at)
@@ -7272,6 +7365,13 @@ impl Render for EditorView {
         // never took the focus.
         if self.list_popups_open() && !self.focus_handle.is_focused(window) {
             self.dismiss_list_popups(cx);
+        }
+        // The name of a refactoring and its wait end with the focus too, as the list does.
+        if !self.focus_handle.is_focused(window)
+            && (self.refactor_wait.is_some()
+                || self.lsp.as_ref().is_some_and(|lsp| lsp.name.is_some()))
+        {
+            self.leave_refactor(cx);
         }
         self.prepare_preview(cx);
         let head = self.state.as_ref().map(EditorState::head);

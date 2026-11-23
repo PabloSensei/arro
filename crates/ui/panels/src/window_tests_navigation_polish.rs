@@ -5,7 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use lang_api::SymbolKind;
-use search::{SymbolRow, Target};
+use search::{MatchKind, SymbolRow, Target};
 use ui_kit::gpui;
 use ui_kit::gpui::{ModifiersChangedEvent, TestAppContext, VisualTestContext, WindowHandle};
 use ui_kit::{Modifiers, px};
@@ -182,6 +182,7 @@ fn a_late_group_keeps_the_row_the_keys_chose(cx: &mut TestAppContext) {
                     offset: 0,
                 },
                 score: u32::MAX,
+                match_kind: MatchKind::Prefix,
             }],
             cx,
         );
@@ -264,6 +265,9 @@ fn the_switcher_lists_the_tool_windows(cx: &mut TestAppContext) {
 
     press(cx, window, "ctrl-tab");
     draw(cx, window);
+    // The tool windows are the left column of the Switcher: Left moves the selection there,
+    // and Tab walks down that column to Commit.
+    press(cx, window, "left");
     let rows = palette(cx, window).read_with(cx, |palette, _| palette.rows_text());
     let commit = rows
         .iter()
@@ -271,7 +275,7 @@ fn the_switcher_lists_the_tool_windows(cx: &mut TestAppContext) {
         .expect("the tool windows are in the list");
     let selected = palette(cx, window).read_with(cx, |palette, _| palette.selected_row());
     for _ in selected..commit {
-        press(cx, window, "ctrl-tab");
+        press(cx, window, "tab");
     }
     release_ctrl(cx, window);
     assert!(

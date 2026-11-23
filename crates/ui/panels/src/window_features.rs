@@ -164,6 +164,13 @@ pub fn register(workspace: &mut Workspace, _window: &mut Window, cx: &mut Contex
         "Show File Path",
         window_popups::show_file_path,
     );
+    // Find Action and Navigate: the action of the project tree that selects the file of the
+    // editor. Alt+F1 opens the Select In popup instead, whose first row runs the same action.
+    workspace.register_command(
+        "workspace.select_opened_file",
+        "Select Opened File",
+        |_, window, cx| window.dispatch_action(Box::new(workspace::SelectInProject), cx),
+    );
     workspace.register_command(
         keys::SHOW_NAV_BAR,
         "Show Navigation Bar",
@@ -266,7 +273,7 @@ fn save_as(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Work
                 let text = format!("{}: {error}", path.display());
                 workspace
                     .update(cx, |workspace, cx| {
-                        workspace.notify_user("Cannot save", text, cx)
+                        workspace.notify_error("Cannot save", text, cx)
                     })
                     .ok();
             }

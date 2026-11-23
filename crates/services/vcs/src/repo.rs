@@ -51,11 +51,18 @@ pub struct CommitChange {
 }
 
 /// What the details pane of the log shows about one commit besides the fields of
-/// [`Commit`]: the whole message and the branches the commit belongs to.
+/// [`Commit`]: the whole message, the person who committed it and the branches the commit
+/// belongs to.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CommitDetails {
     /// The message without its trailing line ends.
     pub message: String,
+    /// The name of the person who committed it, which differs from the author after an
+    /// amend or a rebase by another person.
+    pub committer: String,
+    pub committer_email: String,
+    /// Seconds since 1970, the time the commit itself was made.
+    pub committer_time: i64,
     /// The local and remote branches whose history contains the commit.
     pub branches: Vec<String>,
 }
@@ -517,6 +524,54 @@ impl Repository {
             .map(drop)
     }
 
+    /// Gives the last commit the new message, as an Amend without files does: its tree and
+    /// its parents stay, and the index and the working tree are not touched, so a change
+    /// that is only there stays out of the commit. Returns the new commit.
+    pub fn amend_message(&self, message: &str, options: &CommitOptions) -> io::Result<String> {
+        let index = temp_path("amend-index");
+        let _ = std::fs::remove_file(&index);
+        let env = [("GIT_INDEX_FILE", index.as_os_str())];
+        let result = self.amend_message_with(message, options, &env);
+        let _ = std::fs::remove_file(&index);
+        result?;
+        Ok(self.run(["rev-parse", "HEAD"])?.trim().to_owned())
+    }
+
+    /// The body of [`Repository::amend_message`] with the temporary index in `env`.
+    fn amend_message_with(
+        &self,
+        message: &str,
+        options: &CommitOptions,
+        env: &[(&str, &std::ffi::OsStr)],
+    ) -> io::Result<()> {
+        self.run_env_check(&["read-tree", "HEAD"], env)?;
+        let mut commit = vec!["commit", "--amend", "-F", "-"];
+        if options.sign_off {
+            commit.push("--signoff");
+        }
+        let author = options
+            .author
+            .as_deref()
+            .map(str::trim)
+            .filter(|author| !author.is_empty());
+        if let Some(author) = author {
+            commit.push("--author");
+            commit.push(author);
+        }
+        self.run_env_with_input(&commit, env, Some(message.as_bytes()))
+            .map(drop)
+    }
+
+    /// The whole message of the last commit of the current branch: the subject, the blank
+    /// line and the body, without the line ends after it. `None` on a branch with no commit.
+    pub fn last_commit_message(&self) -> io::Result<Option<String>> {
+        if self.status()?.head.is_none() {
+            return Ok(None);
+        }
+        let message = self.run(["log", "-1", "--format=%B"])?;
+        Ok(Some(message.trim_end_matches(['\r', '\n']).to_owned()))
+    }
+
     /// Whether the commit belongs to the user of the repository.
     pub fn is_own_commit(&self, commit: &str) -> io::Result<bool> {
         let email = self.run(["show", "-s", "--format=%ae", commit])?;
@@ -532,6 +587,19 @@ impl Repository {
     pub fn is_pushed(&self, commit: &str) -> io::Result<bool> {
         let branches = self.run(["branch", "-r", "--contains", commit])?;
         Ok(!branches.trim().is_empty())
+    }
+
+    /// Whether HEAD is the upstream of the current branch or one of its ancestors: the commit
+    /// is on the remote branch Push sends it to. Nothing is fetched, and a branch with no
+    /// upstream has nothing on a remote through it.
+    pub fn head_on_upstream(&self) -> io::Result<bool> {
+        Ok(self
+            .git
+            .run(
+                &self.root,
+                ["merge-base", "--is-ancestor", "HEAD", "@{upstream}"],
+            )
+            .is_ok())
     }
 
     /// Gives the commit another message, as F2 of the log does. The author and the tree
@@ -680,6 +748,13 @@ impl Repository {
         self.git
             .run(&self.root, ["push", "--set-upstream", remote, "HEAD"])?;
         Ok(())
+    }
+
+    /// Sends the current branch to its upstream with a lease: the remote branch is replaced
+    /// only if it is still where this repository last saw it. Amend uses it for a commit the
+    /// upstream already has, after the user agreed to the force push.
+    pub fn push_with_lease(&self) -> io::Result<()> {
+        self.run(["push", "--force-with-lease"]).map(drop)
     }
 
     /// The names of the remotes of the repository.
@@ -1355,10 +1430,17 @@ impl Repository {
         Ok(commits_of(&output))
     }
 
-    /// The whole message of a commit and the branches whose history contains it, for the
-    /// details pane of the log.
+    /// The whole message of a commit, the person who committed it and the branches whose
+    /// history contains it, for the details pane of the log. The message, which may hold
+    /// any text, comes after the fields of the committer, so the fields are one record of
+    /// their own.
     pub fn commit_details(&self, commit: &str) -> io::Result<CommitDetails> {
-        let message = self.run(["show", "-s", "--format=%B", commit])?;
+        let output = self.run(["show", "-s", "--format=%cn%x1f%ce%x1f%ct%x1e%B", commit])?;
+        let (fields, message) = output.split_once(RECORD).unwrap_or(("", output.as_str()));
+        let mut fields = fields.split(FIELD);
+        let committer = fields.next().unwrap_or_default().to_owned();
+        let committer_email = fields.next().unwrap_or_default().to_owned();
+        let committer_time = fields.next().and_then(|time| time.trim().parse().ok());
         let branches = self.run([
             "branch",
             "--all",
@@ -1376,6 +1458,9 @@ impl Repository {
         branches.dedup();
         Ok(CommitDetails {
             message: message.trim_end_matches(['\r', '\n']).to_owned(),
+            committer,
+            committer_email,
+            committer_time: committer_time.unwrap_or_default(),
             branches,
         })
     }

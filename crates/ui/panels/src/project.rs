@@ -847,7 +847,7 @@ impl ProjectPanel {
                 let text = format!("{}: {error}", folder.display());
                 self.workspace
                     .update(cx, |workspace, cx| {
-                        workspace.notify_user("Cannot read folder", text, cx)
+                        workspace.notify_error("Cannot read folder", text, cx)
                     })
                     .ok();
             }
@@ -1602,7 +1602,7 @@ impl ProjectPanel {
     fn report(&mut self, title: &str, text: String, cx: &mut Context<Self>) {
         let title = title.to_string();
         self.workspace
-            .update(cx, |workspace, cx| workspace.notify_user(title, text, cx))
+            .update(cx, |workspace, cx| workspace.notify_error(title, text, cx))
             .ok();
     }
 
@@ -2777,13 +2777,7 @@ impl ProjectPanel {
             let folder = path.clone();
             let terminal_workspace = self.workspace.clone();
             entries.push(MenuEntry::new("Open in Terminal", move |window, cx| {
-                let directory = folder.clone();
-                let terminal = cx
-                    .try_global::<crate::terminal_panel::ActiveTerminal>()
-                    .map(|active| active.0.clone());
-                if let Some(terminal) = terminal {
-                    terminal.update(cx, |panel, cx| panel.open_tab_in(directory, window, cx));
-                }
+                crate::terminal_panel::open_tab_in_directory(folder.clone(), window, cx);
                 terminal_workspace
                     .update(cx, |workspace, cx| {
                         workspace.show_tool(workspace::TERMINAL_TOOL, window, cx)

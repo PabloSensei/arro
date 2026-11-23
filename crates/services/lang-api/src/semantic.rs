@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::Provider;
+use crate::{GraphVisibility, Provider};
 
 #[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
 pub struct TextPoint {
@@ -150,6 +150,37 @@ pub struct NavigationQuery {
 /// Documentation in Markdown.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HoverText(pub String);
+
+/// The first line of a hover answer split into the declaration and the place it is in,
+/// such as the method that declares a local variable. `place` is the short form the
+/// answer shows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HoverPlace {
+    pub declaration: String,
+    pub place: String,
+}
+
+/// Where the type of an expression is read from, for Ctrl+Shift+P.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExpressionTypePlace {
+    /// The type is known from the text, such as the type of a literal: no hover is asked.
+    Known(String),
+    /// The type is in the hover answer at this byte of the document.
+    Hover(usize),
+}
+
+/// The place a library address names, such as a class of a jar or of the JDK, for the
+/// header of a definition and for the links that open the class.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LibraryPlace {
+    /// The name of the class, without its extension.
+    pub name: String,
+    /// The package or the module the class is in, empty when it has neither.
+    pub container: String,
+    /// Whether the address names a library of the language rather than a file of the
+    /// project.
+    pub library: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SymbolEntry {
@@ -547,6 +578,16 @@ pub enum ExtractKind {
     Field,
 }
 
+/// What a name the editor suggests is for: the variable an extraction introduces, the
+/// constant, the field, or the parameter an Introduce Parameter adds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameRole {
+    Variable,
+    Constant,
+    Field,
+    Parameter,
+}
+
 /// The expressions under the caret that an extract may take, in the order of the
 /// server: the innermost first.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -889,6 +930,9 @@ pub struct MethodSignature {
 pub struct ChangeSignatureInfo {
     pub signature: Option<MethodSignature>,
     pub error: Option<String>,
+    /// The visibility levels the declaration at the place may take. Empty means that every
+    /// level is allowed.
+    pub allowed_visibility: Vec<GraphVisibility>,
 }
 
 /// Ctrl+F6: the method at `spot` gets `signature`, and every call is updated.

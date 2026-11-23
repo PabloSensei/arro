@@ -37,6 +37,15 @@ use crate::view::{EditorEvent, EditorView};
 use crate::{DocBlock, DocInline};
 
 pub(crate) const NO_ANSWER: &str = "The language server did not answer, try again";
+/// The note of a jump to a declaration that no place answers.
+const NO_DECLARATION: &str = "Cannot find declaration to go to";
+/// The note of a jump to the type of a name that no place answers.
+const NO_TYPE_DECLARATION: &str = "No type declaration found";
+/// The note of an implementation question that no place answers. The code lens says the
+/// same when a label has none to show.
+pub(crate) const NO_IMPLEMENTATIONS: &str = "No implementations found";
+/// The note of Ctrl+U on a method that overrides nothing.
+const NO_SUPER_METHOD: &str = "No super method found";
 /// The note of a question that needs the language server while the server imports.
 pub(crate) const WAITING_NOTE: &str =
     "Waiting for the language server to finish importing the project…";
@@ -352,6 +361,10 @@ pub(crate) struct Completion {
     /// The class of every entry, made once per answer: a member or a local comes before
     /// a type, a name the language prefers before a rare one.
     ranks: Vec<u8>,
+    /// The place of every entry relative to the type of the expression: its own members,
+    /// the members of its supertypes, the members of the root type of the language, or
+    /// an entry the details do not place.
+    groups: Vec<u8>,
     /// The typed prefix the list filters by, kept for the highlight of the rows.
     prefix: String,
     /// What the user chose before, by prefix: an entry of the same class that was taken
@@ -379,6 +392,8 @@ pub(crate) struct CompletionRow {
     pub left: String,
     pub right: Option<String>,
     pub owner: Option<String>,
+    /// A member of the type of the expression: the list draws its name bold.
+    pub bold: bool,
     /// The entry is out of use: the row strikes its name through.
     pub deprecated: bool,
 }
@@ -400,6 +415,7 @@ impl Completion {
             prefix,
             case,
             preferred,
+            None,
             Vec::new(),
             false,
         )
@@ -413,6 +429,7 @@ impl Completion {
         prefix: &str,
         case: CompletionCase,
         preferred: &'static [&'static str],
+        root: Option<&str>,
         usage: Vec<UsageEntry>,
         explicit: bool,
     ) -> Self {
@@ -422,12 +439,14 @@ impl Completion {
             .iter()
             .map(|entry| entry_class(entry, preferred))
             .collect();
+        let groups = completion_groups(&entries, &ranks, root);
         let mut completion = Self {
             start,
             entries,
             keys,
             folded,
             ranks,
+            groups,
             prefix: String::new(),
             usage,
             shown: Vec::new(),
@@ -454,6 +473,7 @@ impl Completion {
             &self.keys,
             &self.folded,
             &self.ranks,
+            &self.groups,
             prefix,
             case,
             &self.usage,
@@ -472,6 +492,7 @@ impl Completion {
             &self.keys,
             &self.folded,
             &self.ranks,
+            &self.groups,
             &self.prefix,
             CompletionCase::None,
             &self.usage,
@@ -499,7 +520,8 @@ impl Completion {
     }
 
     pub fn label(&self, row: usize) -> CompletionRow {
-        let entry = &self.entries[self.shown[row]];
+        let index = self.shown[row];
+        let entry = &self.entries[index];
         let (left, right, owner) = completion_parts_with_label_details(
             &entry.label,
             entry.detail.as_deref(),
@@ -509,6 +531,7 @@ impl Completion {
             left,
             right,
             owner,
+            bold: self.groups.get(index) == Some(&MEMBER_OF_EXPRESSION),
             deprecated: entry.deprecated,
         }
     }
@@ -829,7 +852,19 @@ pub fn completion_order_with(
         .iter()
         .map(|entry| entry_class(entry, preferred))
         .collect();
-    order_entries(entries, &keys, &folded, &ranks, prefix, case, &[], false)
+    // The list without a language has no expression to group by.
+    let groups = vec![MEMBER_UNPLACED; entries.len()];
+    order_entries(
+        entries,
+        &keys,
+        &folded,
+        &ranks,
+        &groups,
+        prefix,
+        case,
+        &[],
+        false,
+    )
 }
 
 /// The hump positions of a name: the first letter, a letter after a separator, an
@@ -1053,26 +1088,147 @@ fn entry_class(entry: &CompletionEntry, preferred: &[&str]) -> u8 {
         return 0;
     }
     if !is_type {
-        return 1;
+        return MEMBER_RANK;
     }
     let name = entry.label.split(" - ").next().unwrap_or(&entry.label);
     let name = name.split('(').next().unwrap_or(name).trim();
     if preferred.contains(&name) { 3 } else { 4 }
 }
 
+/// The class of an entry that names a member of a type, rather than a type of its own.
+const MEMBER_RANK: u8 = 1;
+
+/// Where a member stands relative to the type of the expression. An entry that is not a
+/// member, or whose detail names no class, has no place: it keeps the order of its own
+/// class and is not one of the bold rows.
+const MEMBER_OF_EXPRESSION: u8 = 0;
+const MEMBER_OF_SUPERTYPE: u8 = 1;
+const MEMBER_OF_ROOT: u8 = 2;
+const MEMBER_UNPLACED: u8 = 3;
+
+/// Whether an entry names a member of a type, a method or a field, rather than a type,
+/// a local or a template of its own.
+fn is_member_entry(entry: &CompletionEntry) -> bool {
+    matches!(
+        entry.kind,
+        CompletionKind::Method
+            | CompletionKind::Function
+            | CompletionKind::Constructor
+            | CompletionKind::Field
+            | CompletionKind::Property
+            | CompletionKind::Constant
+    )
+}
+
+/// The class that declares a member, from the detail of its entry, and `None` for an
+/// entry that names no member.
+fn completion_owner(entry: &CompletionEntry) -> Option<String> {
+    completion_parts_with_label_details(
+        &entry.label,
+        entry.detail.as_deref(),
+        entry.label_details.as_ref(),
+    )
+    .2
+}
+
+/// The name of a class without its package: `com.example.Owner` gives `Owner`.
+fn owner_name(owner: &str) -> &str {
+    owner.rsplit('.').next().unwrap_or(owner)
+}
+
+/// The type of the expression before the caret: the class that declares the most members
+/// of the list, unless the list has only the members of the root type. An answer that
+/// names the type itself does not reach the editor today, so the members tell it.
+fn expression_type(
+    entries: &[CompletionEntry],
+    ranks: &[u8],
+    root: Option<&str>,
+) -> Option<String> {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if ranks[index] != MEMBER_RANK || !is_member_entry(entry) {
+            continue;
+        }
+        let Some(owner) = completion_owner(entry) else {
+            continue;
+        };
+        let name = owner_name(&owner);
+        if root.is_some_and(|root| name.eq_ignore_ascii_case(root)) {
+            continue;
+        }
+        match counts
+            .iter_mut()
+            .find(|(seen, _)| seen.eq_ignore_ascii_case(name))
+        {
+            Some((_, count)) => *count += 1,
+            None => counts.push((name.to_owned(), 1)),
+        }
+    }
+    // The first class wins a tie, so the order of the server still decides.
+    let mut best: Option<(String, usize)> = None;
+    for (name, count) in counts {
+        if best.as_ref().is_none_or(|(_, best)| count > *best) {
+            best = Some((name, count));
+        }
+    }
+    best.map(|(name, _)| name)
+}
+
+/// The place of every entry relative to the type of the expression. The list shows the
+/// members of that type first, then the members of its supertypes and interfaces, then
+/// the members of the root type of the language: the ones every value has.
+fn completion_groups(entries: &[CompletionEntry], ranks: &[u8], root: Option<&str>) -> Vec<u8> {
+    let expression = expression_type(entries, ranks, root);
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            if ranks[index] != MEMBER_RANK || !is_member_entry(entry) {
+                return MEMBER_UNPLACED;
+            }
+            let Some(owner) = completion_owner(entry) else {
+                return MEMBER_UNPLACED;
+            };
+            let name = owner_name(&owner);
+            if root.is_some_and(|root| name.eq_ignore_ascii_case(root)) {
+                MEMBER_OF_ROOT
+            } else if expression
+                .as_deref()
+                .is_some_and(|expression| name.eq_ignore_ascii_case(expression))
+            {
+                MEMBER_OF_EXPRESSION
+            } else {
+                MEMBER_OF_SUPERTYPE
+            }
+        })
+        .collect()
+}
+
+/// The group an entry sorts by. An entry without a place keeps the order of its class, so
+/// it stays among the members of the expression rather than after the root type.
+fn sort_group(group: u8) -> u8 {
+    if group == MEMBER_UNPLACED {
+        MEMBER_OF_EXPRESSION
+    } else {
+        group
+    }
+}
+
 /// The indices of `entries` in the order the list shows them for `prefix`. An entry that
 /// starts with the prefix and has the same case comes before one that only starts with
 /// it, then one whose humps the prefix spells, then one that contains it, then a name
-/// that is one typo away; within a group a template, a member or a local comes before a
-/// type, then the entry the user chose more often and later, and the order of the
-/// server's `sortText` decides the rest. An equal `sortText` puts the shorter name first,
-/// so `Alpha` comes before `Alphabet`.
+/// that is one typo away; within a group the members of the expression come before the
+/// members of its supertypes and the members of the root type of the language, then a
+/// template, a member or a local comes before a type, then the entry the user chose more
+/// often and later, and the order of the server's `sortText` decides the rest. An equal
+/// `sortText` puts the shorter name first, so `Alpha` comes before `Alphabet`.
 #[allow(clippy::too_many_arguments)]
 fn order_entries(
     entries: &[CompletionEntry],
     keys: &[String],
     folded: &[String],
     ranks: &[u8],
+    groups: &[u8],
     prefix: &str,
     case: CompletionCase,
     usage: &[UsageEntry],
@@ -1127,7 +1283,7 @@ fn order_entries(
             .find(|entry| entry.prefix == prefix && entry.label == keys[index])
             .map_or((0, 0), |entry| (entry.count, entry.last))
     };
-    let mut shown: Vec<(u8, u8, usize)> = Vec::new();
+    let mut shown: Vec<(u8, u8, u8, usize)> = Vec::new();
     for index in 0..entries.len() {
         let starts = keys[index].starts_with(prefix);
         let bucket = if all { Some(2) } else { bucket(index) };
@@ -1137,25 +1293,30 @@ fn order_entries(
         if !all && !matches_case(index, starts) {
             continue;
         }
-        shown.push((bucket, ranks[index], index));
+        shown.push((bucket, sort_group(groups[index]), ranks[index], index));
     }
-    shown.sort_by(|(bucket_a, class_a, a), (bucket_b, class_b, b)| {
-        bucket_a
-            .cmp(bucket_b)
-            .then(class_a.cmp(class_b))
-            .then_with(|| chosen(*b).cmp(&chosen(*a)))
-            .then_with(|| match (&entries[*a].sort_text, &entries[*b].sort_text) {
-                // Entries without a sort text are the local templates: their own order
-                // stays.
-                (Some(one), Some(other)) if one != other => one.cmp(other),
-                (Some(_), Some(_)) => folded[*a].chars().count().cmp(&folded[*b].chars().count()),
-                (None, Some(_)) => std::cmp::Ordering::Less,
-                (Some(_), None) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
-            })
-            .then_with(|| a.cmp(b))
-    });
-    shown.into_iter().map(|(_, _, index)| index).collect()
+    shown.sort_by(
+        |(bucket_a, group_a, class_a, a), (bucket_b, group_b, class_b, b)| {
+            bucket_a
+                .cmp(bucket_b)
+                .then(group_a.cmp(group_b))
+                .then(class_a.cmp(class_b))
+                .then_with(|| chosen(*b).cmp(&chosen(*a)))
+                .then_with(|| match (&entries[*a].sort_text, &entries[*b].sort_text) {
+                    // Entries without a sort text are the local templates: their own
+                    // order stays.
+                    (Some(one), Some(other)) if one != other => one.cmp(other),
+                    (Some(_), Some(_)) => {
+                        folded[*a].chars().count().cmp(&folded[*b].chars().count())
+                    }
+                    (None, Some(_)) => std::cmp::Ordering::Less,
+                    (Some(_), None) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                })
+                .then_with(|| a.cmp(b))
+        },
+    );
+    shown.into_iter().map(|(_, _, _, index)| index).collect()
 }
 
 /// A completion label in the three parts of the list: the name and parameters, the type
@@ -1587,6 +1748,9 @@ impl DocRun {
 
 fn push_doc_block(block: DocBlock, code: bool, rows: &mut Vec<CompletionDocRow>) {
     match block {
+        DocBlock::Place(text) => {
+            push_doc_block(DocBlock::Paragraph(vec![DocInline::Text(text)]), code, rows)
+        }
         DocBlock::Paragraph(inlines) => {
             for line in doc_run_lines(doc_runs(&inlines, code)) {
                 rows.push(CompletionDocRow {
@@ -1783,13 +1947,15 @@ pub(crate) fn completion_doc_line_count(doc: &CompletionDoc) -> usize {
 /// Ctrl+B with more than one target: the places to pick from.
 pub(crate) struct NavigationList {
     pub at: usize,
+    /// The question the places answer, for the note when none of them opens.
+    pub kind: NavigationKind,
     /// The places the server named, without repeats.
     pub targets: Vec<SourceSpan>,
     pub selected: usize,
 }
 
 impl NavigationList {
-    fn new(at: usize, mut targets: Vec<SourceSpan>) -> Self {
+    fn new(at: usize, kind: NavigationKind, mut targets: Vec<SourceSpan>) -> Self {
         // A server sometimes names one place twice; the list keeps the first row.
         let mut seen = HashSet::new();
         targets.retain(|target| {
@@ -1801,6 +1967,7 @@ impl NavigationList {
         });
         Self {
             at,
+            kind,
             targets,
             selected: 0,
         }
@@ -1823,6 +1990,17 @@ pub(crate) fn location_label(target: &SourceSpan) -> String {
             uri.rsplit(['/', '\\']).next().unwrap_or(uri).to_owned()
         });
     format!("{file}:{}", target.span.start.line + 1)
+}
+
+/// Whether two places of answers are the same text: the same file, and ranges that
+/// overlap. One answer names the name of a declaration and another its whole line.
+fn same_place(a: &SourceSpan, b: &SourceSpan) -> bool {
+    let same_file = match (uri_path(&a.uri), uri_path(&b.uri)) {
+        (Some(left), Some(right)) => platform::path_key(&left) == platform::path_key(&right),
+        _ => a.uri == b.uri,
+    };
+    let at = |point: TextPoint| (point.line, point.character);
+    same_file && at(a.span.start) <= at(b.span.end) && at(b.span.start) <= at(a.span.end)
 }
 
 pub(crate) struct Lsp {
@@ -2150,6 +2328,16 @@ fn visible_rows(view: &EditorView, state: &EditorState) -> (usize, usize, usize,
 pub(crate) async fn first<T>(mut replies: Replies<T>) -> Option<(T, Confidence)> {
     let answer = replies.next().await?;
     Some((answer.value, answer.confidence))
+}
+
+/// What a navigation of `kind` says when it found no place.
+fn missing_navigation(kind: NavigationKind) -> &'static str {
+    match kind {
+        NavigationKind::Definition => NO_DECLARATION,
+        NavigationKind::TypeDefinition => NO_TYPE_DECLARATION,
+        NavigationKind::Implementation => NO_IMPLEMENTATIONS,
+        NavigationKind::SuperMethod => NO_SUPER_METHOD,
+    }
 }
 
 /// Keeps the active parameter inside the overload the user picked: the caret says which
@@ -3060,6 +3248,7 @@ impl EditorView {
                 &state.store().slice(start..caret),
                 case,
                 support.preferred_completion_names(),
+                support.root_completion_type(),
                 usage.clone(),
                 explicit,
             );
@@ -3140,6 +3329,7 @@ impl EditorView {
                     &state.store().slice(start..caret),
                     case,
                     support.preferred_completion_names(),
+                    support.root_completion_type(),
                     usage,
                     explicit,
                 );
@@ -3709,7 +3899,7 @@ impl EditorView {
             .and_then(|lsp| lsp.navigation_cache.get(&key))
             .cloned()
         {
-            self.show_navigation_targets(spans, caret, cx);
+            self.show_navigation_targets(spans, caret, kind, cx);
             return;
         }
         let Some(provider) = support.navigation() else {
@@ -3717,7 +3907,7 @@ impl EditorView {
                 if let Some(target) = lookup(&word) {
                     self.go_to_location(&target, cx);
                 } else {
-                    self.show_transient_note(caret, "Cannot find declaration to go to", cx);
+                    self.show_transient_note(caret, missing_navigation(kind), cx);
                 }
             }
             return;
@@ -3729,15 +3919,48 @@ impl EditorView {
             }
             None => return,
         };
+        // A server answers with the declaration itself when nothing implements the name, so
+        // the implementations are compared with the declaration asked at the same place.
+        let declarations = (kind == NavigationKind::Implementation).then(|| {
+            ask(
+                provider,
+                NavigationQuery {
+                    kind: NavigationKind::Definition,
+                    spot: spot.clone(),
+                },
+            )
+        });
         let replies = ask(provider, NavigationQuery { kind, spot });
         self.importing_note(caret, cx);
         cx.spawn(async move |this, cx| {
             let answer = first(replies).await;
+            let declared = match declarations {
+                Some(declarations) => first(declarations).await,
+                None => None,
+            };
             this.update(cx, |this, cx| {
                 if let Some(lsp) = &mut this.lsp
                     && lsp.nav_asked == asked
                 {
                     lsp.nav_answered = asked;
+                }
+                if kind == NavigationKind::Implementation {
+                    let Some((spans, confidence)) = answer else {
+                        return;
+                    };
+                    let declared = declared.map_or_else(Vec::new, |(spans, _)| spans);
+                    let places = this.implementation_places(&spans, &declared, caret);
+                    if !places.is_empty() {
+                        if let Some(lsp) = &mut this.lsp {
+                            lsp.navigation_cache.insert(key, places.clone());
+                        }
+                        this.show_navigation_targets(places, caret, kind, cx);
+                    } else if spans.is_empty() && confidence == Confidence::Unknown {
+                        this.show_unanswered(caret, true, cx);
+                    } else {
+                        this.show_transient_note(caret, missing_navigation(kind), cx);
+                    }
+                    return;
                 }
                 match answer {
                     Some((spans, _)) if !spans.is_empty() => {
@@ -3754,7 +3977,7 @@ impl EditorView {
                             // asking the server to read the class again.
                             lsp.navigation_cache.insert(key, spans.clone());
                         }
-                        this.show_navigation_targets(spans, caret, cx);
+                        this.show_navigation_targets(spans, caret, kind, cx);
                     }
                     Some((_, confidence))
                         if confidence != Confidence::Unknown
@@ -3780,12 +4003,10 @@ impl EditorView {
                         if let Some(target) = lookup(&word) {
                             this.go_to_location(&target, cx);
                         } else {
-                            this.show_transient_note(caret, "Cannot find declaration to go to", cx);
+                            this.show_transient_note(caret, missing_navigation(kind), cx);
                         }
                     }
-                    Some(_) => {
-                        this.show_transient_note(caret, "Cannot find declaration to go to", cx)
-                    }
+                    Some(_) => this.show_transient_note(caret, missing_navigation(kind), cx),
                     None if fallback.is_some() => {
                         let (lookup, word) = fallback.unwrap();
                         if let Some(target) = lookup(&word) {
@@ -3806,6 +4027,11 @@ impl EditorView {
         let [target] = spans else {
             return false;
         };
+        self.names_caret(target, caret)
+    }
+
+    /// Whether a place of an answer is the text the caret stands on, in this file.
+    fn names_caret(&self, target: &SourceSpan, caret: usize) -> bool {
         let Some(state) = &self.state else {
             return false;
         };
@@ -3819,12 +4045,31 @@ impl EditorView {
         from <= caret && caret <= to
     }
 
+    /// The places of an implementation answer that are implementations. The declaration of
+    /// the name is no implementation, and neither is the name under the caret.
+    fn implementation_places(
+        &self,
+        spans: &[SourceSpan],
+        declared: &[SourceSpan],
+        caret: usize,
+    ) -> Vec<SourceSpan> {
+        spans
+            .iter()
+            .filter(|&target| {
+                !self.names_caret(target, caret)
+                    && !declared.iter().any(|place| same_place(place, target))
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Opens one place of a navigation answer at once, or shows the list of several,
     /// with the one the user picks opened by the same path as one target.
     fn show_navigation_targets(
         &mut self,
         spans: Vec<SourceSpan>,
         caret: usize,
+        kind: NavigationKind,
         cx: &mut Context<Self>,
     ) {
         if spans.len() == 1 {
@@ -3833,7 +4078,7 @@ impl EditorView {
         }
         self.before_navigation_popup(cx);
         if let Some(lsp) = &mut self.lsp {
-            lsp.navigation_list = Some(NavigationList::new(caret, spans));
+            lsp.navigation_list = Some(NavigationList::new(caret, kind, spans));
             cx.notify();
         }
     }
@@ -3863,10 +4108,11 @@ impl EditorView {
                 let target = list.target();
                 let target = target.cloned();
                 let at = list.at;
+                let kind = list.kind;
                 lsp.navigation_list = None;
                 match target {
                     Some(target) => self.go_to_location(&target, cx),
-                    None => self.show_transient_note(at, "Cannot find declaration to go to", cx),
+                    None => self.show_transient_note(at, missing_navigation(kind), cx),
                 }
                 true
             }
@@ -3877,6 +4123,20 @@ impl EditorView {
             }
             _ => false,
         }
+    }
+
+    /// The place a library address names. The language of this file answers first; a file
+    /// without one, or whose language does not know the address, such as a configuration
+    /// file, asks the language of the application, which shows the text of a class of a
+    /// library.
+    pub(crate) fn library_place(&self, uri: &str, cx: &App) -> Option<lang_api::LibraryPlace> {
+        self.lsp
+            .as_ref()
+            .and_then(|lsp| lsp.support.describe_library_uri(uri))
+            .or_else(|| {
+                cx.try_global::<Semantic>()
+                    .and_then(|semantic| semantic.0.describe_library_uri(uri))
+            })
     }
 
     pub(crate) fn go_to_location(&mut self, target: &SourceSpan, cx: &mut Context<Self>) {
@@ -3963,7 +4223,10 @@ impl EditorView {
             let answer = first(replies).await;
             this.update(cx, |this, cx| match answer {
                 Some((text, _)) if !text.0.trim().is_empty() => {
-                    let blocks = crate::quick_doc::parse(&text.0);
+                    let blocks = this.lsp.as_ref().map_or_else(
+                        || crate::quick_doc::parse(&text.0),
+                        |lsp| crate::quick_doc::parse_hover(&text.0, lsp.support.as_ref()),
+                    );
                     let diagnostic = this.diagnostic_at(caret);
                     this.show_quick_doc(caret, blocks, diagnostic, None, cx);
                 }
@@ -4566,6 +4829,7 @@ mod tests {
             &keys,
             &folded,
             &[3, 3],
+            &[3, 3],
             "A",
             CompletionCase::None,
             &usage,
@@ -4595,6 +4859,7 @@ mod tests {
             &entries,
             &keys,
             &folded,
+            &[3, 3],
             &[3, 3],
             "A",
             CompletionCase::None,
@@ -4728,6 +4993,125 @@ mod tests {
         ];
         let order = completion_order(&entries, "Str", &["String"]);
         assert_eq!(order, [1, 0], "the type the language prefers comes first");
+    }
+
+    /// A member as the server sends it: the detail names the class that declares it.
+    fn member_entry(label: &str, detail: &str, sort: &str) -> CompletionEntry {
+        CompletionEntry {
+            label: label.to_owned(),
+            detail: Some(detail.to_owned()),
+            sort_text: Some(sort.to_owned()),
+            kind: lang_api::CompletionKind::Method,
+            ..CompletionEntry::default()
+        }
+    }
+
+    /// `owner.` with the methods of the expression, of its superclass and of the root
+    /// type, in the order the server sent them. The sort texts of `Owner` are the
+    /// largest, so only the groups can put its members first.
+    fn members_of_an_expression(prefix: &str) -> Completion {
+        let entries = vec![
+            member_entry("getCity() : String", "Owner.getCity() : String", "0009"),
+            member_entry("wait() : void", "Object.wait() : void", "0002"),
+            member_entry("getId() : long", "BaseEntity.getId() : long", "0001"),
+            member_entry("getPets() : Pet[]", "Owner.getPets() : Pet[]", "0010"),
+            member_entry("notify() : void", "Object.notify() : void", "0003"),
+        ];
+        Completion::with_usage(
+            0,
+            entries,
+            true,
+            prefix,
+            CompletionCase::None,
+            &[],
+            Some("Object"),
+            Vec::new(),
+            false,
+        )
+    }
+
+    #[test]
+    fn the_members_of_the_expression_come_before_its_supertypes_and_the_root_type() {
+        let completion = members_of_an_expression("");
+        assert_eq!(
+            completion.labels(),
+            [
+                "getCity() : String",
+                "getPets() : Pet[]",
+                "getId() : long",
+                "wait() : void",
+                "notify() : void",
+            ],
+            "Owner comes first even though the server ranked it last"
+        );
+
+        // The quality of the match still comes before the groups: only the names with
+        // `get` stay, and the root type has none.
+        let completion = members_of_an_expression("get");
+        assert_eq!(
+            completion.labels(),
+            ["getCity() : String", "getPets() : Pet[]", "getId() : long",]
+        );
+    }
+
+    #[test]
+    fn a_frequent_choice_does_not_pass_the_group_of_its_member() {
+        use crate::completion_usage::UsageEntry;
+
+        let entries = vec![
+            member_entry("getCity() : String", "Owner.getCity() : String", "0001"),
+            member_entry("wait() : void", "Object.wait() : void", "0002"),
+            member_entry("notify() : void", "Object.notify() : void", "0003"),
+        ];
+        let usage = [UsageEntry {
+            prefix: String::new(),
+            label: "notify".to_owned(),
+            count: 50,
+            last: 100,
+        }];
+        let completion = Completion::with_usage(
+            0,
+            entries,
+            true,
+            "",
+            CompletionCase::None,
+            &[],
+            Some("Object"),
+            usage.to_vec(),
+            false,
+        );
+        assert_eq!(
+            completion.labels(),
+            ["getCity() : String", "notify() : void", "wait() : void",],
+            "the choice moves notify above wait inside the root group only"
+        );
+        assert_eq!(
+            completion.label(0).left,
+            "getCity()",
+            "a frequent root method does not pass a member of the expression"
+        );
+    }
+
+    #[test]
+    fn only_the_members_of_the_expression_type_are_bold() {
+        let completion = members_of_an_expression("");
+        let rows: Vec<(String, bool)> = (0..completion.shown.len())
+            .map(|row| {
+                let label = completion.label(row);
+                (label.left, label.bold)
+            })
+            .collect();
+        let bold = |name: &str| {
+            rows.iter()
+                .find(|(left, _)| left == name)
+                .map(|(_, bold)| *bold)
+                .unwrap_or_else(|| panic!("no row {name}: {rows:?}"))
+        };
+        assert!(bold("getCity()"), "a member of Owner is bold");
+        assert!(bold("getPets()"), "a member of Owner is bold");
+        assert!(!bold("getId()"), "a member of a superclass is not bold");
+        assert!(!bold("wait()"), "a member of Object is not bold");
+        assert!(!bold("notify()"), "a member of Object is not bold");
     }
 
     #[test]

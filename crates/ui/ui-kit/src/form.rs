@@ -62,7 +62,7 @@ fn label_text_width(window: &Window, text: &str) -> f32 {
 
 /// A label in a label column of `width` in `color`: on the height of a field, cut at the edge of
 /// the column.
-fn label_in(width: f32, text: &str, color: Hsla) -> Div {
+fn label_in(width: f32, text: impl IntoElement, color: Hsla) -> Div {
     div()
         .w(px(width))
         .flex_none()
@@ -74,13 +74,13 @@ fn label_in(width: f32, text: &str, color: Hsla) -> Div {
         .font_family(UI_FONT)
         .text_size(px(UI_SIZE))
         .text_color(color)
-        .child(text.to_owned())
+        .child(text)
 }
 
 /// A label in a label column of `width`: muted, on the height of a field, cut at the edge of the
 /// column.
 pub fn form_label(width: f32, text: &str, theme: &Theme) -> Div {
-    label_in(width, text, theme.text_muted)
+    label_in(width, text.to_owned(), theme.text_muted)
 }
 
 /// A label and a field on one row. The label stands in the column of `width`, and the field
@@ -91,6 +91,16 @@ pub fn form_row(width: f32, label: &str, field: impl IntoElement, theme: &Theme)
 
 /// [`form_row`] with the label in `color`, for the pages whose labels read as their text.
 pub fn form_row_colored(width: f32, label: &str, color: Hsla, field: impl IntoElement) -> Div {
+    form_row_labelled(width, label.to_owned(), color, field)
+}
+
+/// [`form_row_colored`] with a label of its own, such as one that marks the words of a search.
+pub fn form_row_labelled(
+    width: f32,
+    label: impl IntoElement,
+    color: Hsla,
+    field: impl IntoElement,
+) -> Div {
     div()
         .flex()
         .items_center()

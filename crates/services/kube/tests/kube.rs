@@ -141,6 +141,54 @@ fn the_contexts_namespaces_and_resources_of_the_fake_are_read() {
 }
 
 #[test]
+fn a_context_switch_writes_the_kubeconfig_and_the_next_read_sees_it() {
+    let _guard = ENV.lock().unwrap_or_else(|poison| poison.into_inner());
+    let file = state_file("kube-context-switch", false);
+    let cli = cli(&file);
+
+    let snapshot = take(&cli, None);
+    assert_eq!(snapshot.current_context, "kind-dev");
+    assert!(
+        snapshot
+            .contexts
+            .iter()
+            .any(|context| context.name == "prod" && !context.current)
+    );
+
+    cli.use_context("prod").unwrap();
+
+    let calls = calls(&file);
+    assert!(
+        calls.lines().any(|line| line == "config use-context prod"),
+        "{calls}"
+    );
+    assert!(
+        calls
+            .lines()
+            .any(|line| line == "config get-contexts -o name"),
+        "{calls}"
+    );
+    assert!(
+        calls.lines().any(|line| line == "config current-context"),
+        "{calls}"
+    );
+    let snapshot = take(&cli, None);
+    assert_eq!(snapshot.current_context, "prod");
+    assert!(
+        snapshot
+            .contexts
+            .iter()
+            .any(|context| context.name == "prod" && context.current)
+    );
+    assert!(
+        snapshot
+            .contexts
+            .iter()
+            .any(|context| context.name == "kind-dev" && !context.current)
+    );
+}
+
+#[test]
 fn a_missing_cli_is_a_state_too() {
     let cli = Kubectl::new("C:/nowhere/kubectl.exe");
 

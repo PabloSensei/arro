@@ -782,8 +782,10 @@ impl DatabaseDataView {
                     cx.notify();
                 }
                 _ => {
-                    if editing.field.key_with_clipboard(event, false, cx) {
+                    if editing.field.key_tool_field(event, false, cx) {
                         cx.notify();
+                    } else {
+                        return;
                     }
                 }
             }
@@ -805,8 +807,10 @@ impl DatabaseDataView {
                     }
                 }
                 _ => {
-                    if self.filter.key_with_clipboard(event, false, cx) {
+                    if self.filter.key_tool_field(event, false, cx) {
                         cx.notify();
+                    } else {
+                        return;
                     }
                 }
             }

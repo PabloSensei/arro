@@ -32,6 +32,10 @@ const EXCEPTIONS: &[(&str, &str)] = &[
         "the documentation popup: an anchored hint next to the caret, closed by Escape",
     ),
     (
+        "crates/ui/editor-view/src/hierarchy.rs",
+        "Quick Definition: an anchored popup next to the caret, and the catcher of its corner drag",
+    ),
+    (
         "crates/ui/editor-view/src/view.rs",
         "completion, Parameter Info and the inline menus: anchored popups, not windows",
     ),
@@ -66,6 +70,10 @@ const EXCEPTIONS: &[(&str, &str)] = &[
     (
         "crates/ui/panels/src/plugins.rs",
         "the Plugins picker: a list of plugins without fields or buttons",
+    ),
+    (
+        "crates/ui/panels/src/select_in.rs",
+        "the Select In picker of Alt+F1: a numbered list of places without fields or buttons",
     ),
     (
         "crates/ui/panels/src/window_popups.rs",

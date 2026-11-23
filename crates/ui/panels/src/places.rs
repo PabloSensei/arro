@@ -9,6 +9,10 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 use workspace::Workspace;
 
+pub use workspace::Location;
+#[cfg(test)]
+pub use workspace::LocationLog;
+
 use crate::navigation;
 use crate::outline::OpenEditors;
 
@@ -17,41 +21,11 @@ const HEIGHT: f32 = 420.;
 /// The smallest size the window resizes to.
 const MIN_WIDTH: f32 = 360.;
 const MIN_HEIGHT: f32 = 200.;
-/// Places the log keeps.
-const LOG_MAX: usize = 50;
 /// Characters of the line shown for a place.
 const SNIPPET: usize = 90;
 
-/// A line of a file the user was at, with the text it had then.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Location {
-    pub path: PathBuf,
-    pub line: usize,
-    pub text: String,
-}
-
-/// The places of edits and of jumps, the latest first.
-#[derive(Default)]
-pub struct LocationLog(Vec<Location>);
-
-impl Global for LocationLog {}
-
-impl LocationLog {
-    /// A place on a line that is already in the log moves to the front.
-    pub fn push(&mut self, place: Location) {
-        self.0
-            .retain(|known| !(known.path == place.path && known.line == place.line));
-        self.0.insert(0, place);
-        self.0.truncate(LOG_MAX);
-    }
-
-    pub fn places(&self) -> &[Location] {
-        &self.0
-    }
-}
-
 /// Remembers where the caret of the editor is.
-pub fn remember(view: &Entity<EditorView>, cx: &mut App) {
+pub fn remember(view: &Entity<EditorView>, workspace: &mut Workspace, cx: &mut Context<Workspace>) {
     let place = {
         let view = view.read(cx);
         let line = view.caret().0;
@@ -62,7 +36,27 @@ pub fn remember(view: &Entity<EditorView>, cx: &mut App) {
         })
     };
     if let Some(place) = place {
-        cx.default_global::<LocationLog>().push(place);
+        workspace.remember_place(place);
+    }
+}
+
+/// The place of the caret of the editor of `path`, when that editor is open.
+fn caret_place(workspace: &Workspace, path: &Path, cx: &App) -> Option<Location> {
+    let view = workspace.view_of(path)?;
+    let editor = view.downcast::<EditorView>().ok()?;
+    let view = editor.read(cx);
+    let line = view.caret().0;
+    view.line_text(line).map(|text| Location {
+        path: view.path().to_path_buf(),
+        line,
+        text,
+    })
+}
+
+/// Remembers where the caret of the editor of `path` is, when that editor is open.
+pub fn remember_path(workspace: &mut Workspace, path: &Path, cx: &mut Context<Workspace>) {
+    if let Some(place) = caret_place(workspace, path, cx) {
+        workspace.remember_place(place);
     }
 }
 
@@ -90,9 +84,15 @@ pub struct PlacesPopup {
     scroll: ScrollHandle,
 }
 
-fn line_of(path: &Path, line: usize, cx: &App) -> String {
-    OpenEditors::get(cx, path)
-        .and_then(|editor| editor.read(cx).line_text(line))
+fn line_now(path: &Path, line: usize, cx: &App) -> String {
+    if let Some(editor) = OpenEditors::get(cx, path)
+        && let Some(text) = editor.read(cx).line_text(line)
+    {
+        return text;
+    }
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.lines().nth(line).map(str::to_owned))
         .unwrap_or_default()
 }
 
@@ -102,15 +102,32 @@ fn file_name(path: &Path) -> String {
 }
 
 pub fn show_recent(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-    let rows = cx
-        .default_global::<LocationLog>()
-        .places()
+    // The caret of the open file is a place of its own, so the list of a window with a
+    // file open is never empty. A place that is already in the list keeps its position.
+    if let Some(path) = workspace.active_path() {
+        let known = caret_place(workspace, &path, cx).is_some_and(|place| {
+            workspace
+                .recent_places()
+                .iter()
+                .any(|known| known.path == place.path && known.line == place.line)
+        });
+        if !known {
+            remember_path(workspace, &path, cx);
+        }
+    }
+    // Places of files that are gone cannot be opened, and the next save drops them.
+    if workspace.prune_recent_places() {
+        workspace.tab_layout_changed(cx);
+    }
+    let rows = workspace
+        .recent_places()
         .iter()
         .map(|place| Row {
             badge: String::new(),
             path: place.path.clone(),
             line: place.line,
-            text: place.text.clone(),
+            // The file may have changed since the place was remembered.
+            text: line_now(&place.path, place.line, cx),
         })
         .collect();
     show(Kind::Recent, rows, workspace, window, cx);
@@ -123,7 +140,7 @@ pub fn show_bookmarks(workspace: &mut Workspace, window: &mut Window, cx: &mut C
             let line = entry.line as usize;
             Row {
                 badge: entry.mnemonic.map(String::from).unwrap_or_default(),
-                text: line_of(&entry.path, line, cx),
+                text: line_now(&entry.path, line, cx),
                 path: entry.path,
                 line,
             }
@@ -139,12 +156,8 @@ fn show(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    // Recent Locations has no popup that could show an empty list, so it keeps its
-    // notification. Bookmarks have a popup of their own, and its empty state is part of it.
-    if rows.is_empty() && kind == Kind::Recent {
-        workspace.notify_user("Recent Locations", "No places yet", cx);
-        return;
-    }
+    // Recent Locations and Bookmarks both have a popup of their own, with an empty state
+    // of their own: no notification takes the place of an empty list.
     let weak = cx.weak_entity();
     let view = cx.new(|cx| PlacesPopup {
         workspace: weak,
@@ -253,6 +266,7 @@ impl Render for PlacesPopup {
                 };
                 div()
                     .id(("places-row", index))
+                    .debug_selector(move || format!("places-row-{index}"))
                     .flex()
                     .items_center()
                     .flex_none()
@@ -312,8 +326,8 @@ impl Render for PlacesPopup {
             .on_mouse_down_out(cx.listener(|this, _, window, cx| this.dismiss(window, cx)))
             .child(header)
             .child(if rows.is_empty() {
-                // The bookmarks have a popup of their own even with nothing in it: the
-                // list says so in place of its rows, without a notification.
+                // Both lists have a popup of their own even with nothing in it: the list
+                // says so in place of its rows, without a notification.
                 div()
                     .id("places-empty")
                     .debug_selector(|| "places-empty".to_owned())
@@ -324,7 +338,7 @@ impl Render for PlacesPopup {
                     .py(px(SPACE_M))
                     .text_color(theme.text_secondary)
                     .child(match self.kind {
-                        Kind::Recent => "No places yet",
+                        Kind::Recent => "No recent locations",
                         Kind::Bookmarks => "No bookmarks yet",
                     })
                     .into_any_element()

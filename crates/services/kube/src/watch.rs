@@ -143,11 +143,8 @@ pub fn take(cli: &Kubectl, namespace: Option<&str>) -> KubeSnapshot {
         .filter(|namespace| !namespace.is_empty())
         .map(str::to_owned)
         .or_else(|| {
-            snapshot
-                .contexts
-                .iter()
-                .find(|context| context.current)
-                .map(|context| context.namespace.clone())
+            cli.current_namespace()
+                .ok()
                 .filter(|namespace| !namespace.is_empty())
         })
         .unwrap_or_else(|| "default".to_owned());

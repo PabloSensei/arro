@@ -717,10 +717,15 @@ fn main() -> ExitCode {
                 project.tool.clone(),
                 project.cache_root.clone(),
             )));
+            let scratch = panels::ScratchFileTypes(vec![panels::ScratchFileType {
+                extension: "java",
+                label: language_for(Path::new("scratch.java")).map_or("Java", |config| config.name),
+            }]);
             panels::run_with_setup(
                 launch,
                 requests,
                 languages,
+                scratch,
                 search,
                 project,
                 Some(server),
@@ -871,6 +876,22 @@ mod tests {
         assert_eq!(icons.icon_for(Path::new("App.java")), "nodes/class");
         assert_eq!(icons.icon_for(Path::new("notes.md")), "fileTypes/markdown");
         assert_eq!(icons.icon_for(Path::new("notes.log")), "fileTypes/text");
+    }
+
+    #[test]
+    fn file_types_of_a_project_carry_their_own_icons() {
+        let icons = file_icons();
+        for (path, icon) in [
+            ("application.properties", "fileTypes/properties"),
+            ("gradle-wrapper.jar", "fileTypes/archive"),
+            ("logo.svg", "fileTypes/image"),
+            ("build.gradle.kts", "fileTypes/gradle"),
+            (".editorconfig", "fileTypes/editorConfig"),
+            ("App.class", "fileTypes/javaClass"),
+            ("notes.unknown", "fileTypes/text"),
+        ] {
+            assert_eq!(icons.icon_for(Path::new(path)), icon, "{path}");
+        }
     }
 
     #[test]

@@ -140,7 +140,8 @@ impl EditorView {
 
     /// Alt+Insert: the list of what applies here. The server says which parts exist; where
     /// it does not know, the symbols of the class say. A row is left out only on positive
-    /// evidence, so a language that answers nothing keeps the full list.
+    /// evidence, so a language that answers nothing keeps the full list. The source actions
+    /// of the server that the rows do not give follow the rows.
     pub(crate) fn generate_menu(&mut self, cx: &mut Context<Self>) {
         let Some((spot, caret)) = self.spot() else {
             return;
@@ -161,6 +162,13 @@ impl EditorView {
         // not asked then: the rows come from the symbols of the class, as when it does not know.
         let ready = support.server_ready();
         let version = spot.version;
+        // The source actions of the server join the fixed rows, asked for the same place.
+        let source = self.selection_span().map(|span| lang_api::ActionQuery {
+            uri: spot.uri.clone(),
+            version,
+            span,
+            only: Some(lang_api::ActionKind::Source),
+        });
         cx.spawn(async move |this, cx| {
             // The symbols block, so they are read off the UI thread.
             let place = {
@@ -192,17 +200,31 @@ impl EditorView {
             } else {
                 Vec::new()
             };
+            // The source actions are asked together with the parts, and only while the server
+            // answers: the rows from the symbols need no server.
+            let source = match (ready, source, support.actions()) {
+                (true, Some(query), Some(actions)) => Some(ask(actions, query)),
+                _ => None,
+            };
             let mut answers = Vec::with_capacity(asked.len());
             for (kind, replies) in asked {
                 answers.push((kind, known(first(replies).await)));
             }
-            let rows: Vec<Pick> = crate::delete::generate_rows()
+            let mut rows: Vec<Pick> = crate::delete::generate_rows()
                 .into_iter()
                 .filter(|pick| match pick {
                     Pick::Generate { kind, .. } => shows(*kind, &place, &answers),
                     _ => true,
                 })
                 .collect();
+            // The source actions the fixed rows do not give come after them.
+            if let Some(replies) = source {
+                let answer = first(replies).await;
+                rows.extend(crate::actions::source_rows(
+                    crate::actions::answered_entries(answer),
+                    true,
+                ));
+            }
             this.update(cx, |this, cx| {
                 // The answers are for the caret and the text they were asked about.
                 let current = this.state.as_ref().is_some_and(|state| {
@@ -225,14 +247,7 @@ impl EditorView {
         };
         let only = Some(lang_api::ActionKind::Source);
         self.ask_actions(span, only, cx, |this, _, caret, entries, cx| {
-            let rows = entries
-                .into_iter()
-                .filter(|entry| {
-                    let code = entry.code.as_deref().unwrap_or_default();
-                    code.starts_with("source.generate") || entry.title.starts_with("Generate")
-                })
-                .map(crate::actions::Pick::Action)
-                .collect();
+            let rows = crate::actions::source_rows(entries, false);
             this.show_generate_picks(caret, rows, "Nothing to generate here", cx);
         });
     }

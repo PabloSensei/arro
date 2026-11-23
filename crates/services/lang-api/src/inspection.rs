@@ -364,6 +364,6 @@ mod tests {
     fn a_comment_with_all_suppresses_every_check_of_the_line() {
         let suppressions = Suppressions::from_text("//noinspection all\nlet x = 1;\n");
         assert!(suppressions.covers("a.one", 1));
-        assert!(suppressions.covers("org.eclipse.jdt.core.compiler.problem.unusedImport", 1));
+        assert!(suppressions.covers("a.three", 1));
     }
 }

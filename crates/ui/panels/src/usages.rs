@@ -683,7 +683,7 @@ impl UsagesHub {
         if let Err(error) = outcome {
             self.workspace
                 .update(cx, |workspace, cx| {
-                    workspace.notify_user("Find in Files", error.to_string(), cx)
+                    workspace.notify_error("Find in Files", error.to_string(), cx)
                 })
                 .ok();
         }
@@ -1307,11 +1307,17 @@ impl UsagesHub {
                         || display_path(&item.path),
                         |name| name.to_string_lossy().into_owned(),
                     );
+                    // The path follows the name in grey, and the count ends it, as IDEA
+                    // shows the file of a usage.
+                    let hint = match self.package_of(&item.path, cx) {
+                        Some(path) => format!("{path} ({count})"),
+                        None => format!("({count})"),
+                    };
                     panel_rows.push(PanelRow::Group {
-                        label: format!("{name}  ({count})"),
+                        label: name,
                         depth: keys.len(),
                         icon: icons.icon_for(&item.path),
-                        hint: self.package_of(&item.path, cx),
+                        hint: Some(hint),
                     });
                     previous_file = Some(item.path.clone());
                 }
@@ -2832,7 +2838,7 @@ impl ShowUsagesPopup {
             "enter" => self.open(self.selected, window, cx),
             "escape" => self.dismiss(window, cx),
             _ => {
-                if !self.query.key_with_clipboard(event, false, cx) {
+                if !self.query.key_tool_field(event, false, cx) {
                     return;
                 }
                 self.selected = 0;
@@ -3064,9 +3070,11 @@ impl Render for ShowUsagesPopup {
             .map(|(at, row_at)| {
                 let row = &self.rows[row_at];
                 let selected = at == self.selected;
-                let before = row.text[..row.highlight.start].to_owned();
-                let found = row.text[row.highlight.clone()].to_owned();
-                let after = row.text[row.highlight.end..].to_owned();
+                let style = HighlightStyle {
+                    color: Some(theme.match_text),
+                    background_color: Some(theme.match_bg),
+                    ..HighlightStyle::default()
+                };
                 div()
                     .id(("usages-row", at))
                     .debug_selector(move || format!("usages-row-{at}"))
@@ -3106,15 +3114,11 @@ impl Render for ShowUsagesPopup {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .child(before)
-                            .child(
-                                div()
-                                    .bg(theme.match_bg)
-                                    .text_color(theme.match_text)
-                                    .rounded(px(2.))
-                                    .child(found),
-                            )
-                            .child(after),
+                            .child(highlighted_text(
+                                row.text.clone(),
+                                [row.highlight.clone()],
+                                style,
+                            )),
                     )
             })
             .collect();

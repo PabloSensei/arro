@@ -13,6 +13,7 @@ const FORBIDDEN_WORDS: &[&str] = &[
     "java",
     "maven",
     "gradle",
+    "jdt",
     "jdtls",
     "jdwp",
     "classpath",
@@ -29,6 +30,11 @@ const WORD_EXCEPTIONS: &[(&str, &str)] = &[
     // not the build tool.
     ("file-syntax", "gradle"),
     ("panels", "gradle"),
+    // Library addresses of the Java server: the debugger's frames and their window tests, and
+    // the AI tool text and read path that name them. Listed in the report of T-0446 as open
+    // debt; move them into the language hook and drop these pairs.
+    ("panels", "jdt"),
+    ("tool-gateway", "jdt"),
 ];
 
 /// The only crates outside `crates/java` that may know a language. The application
@@ -468,5 +474,12 @@ mod tests {
             directory_literals(r#"join("rebuild", "build.rs")"#),
             [] as [&str; 0]
         );
+    }
+
+    #[test]
+    fn finds_the_scheme_of_library_addresses_but_not_the_language_server_name() {
+        assert_eq!(forbidden_words("jdt://contents/a.jar/X.class"), ["jdt"]);
+        assert_eq!(forbidden_words("org.eclipse.jdt.core"), ["jdt"]);
+        assert_eq!(forbidden_words("jdtls"), ["jdtls"]);
     }
 }

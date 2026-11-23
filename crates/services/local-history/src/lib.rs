@@ -81,18 +81,18 @@ impl Cause {
         match self {
             Cause::Saved => "Saved",
             Cause::Auto => "Auto",
-            Cause::BeforeReload => "Before an external change",
-            Cause::BeforeRename => "Before rename",
-            Cause::BeforeReplace => "Before Replace All",
+            Cause::BeforeReload => "External change",
+            Cause::BeforeRename => "Rename",
+            Cause::BeforeReplace => "Replace All",
             Cause::BeforeRefactoring => "Refactoring",
             Cause::BeforeReformat => "Reformat",
             Cause::BeforeOptimizeImports => "Optimize Imports",
-            Cause::BeforeGitRevert => "Before Git rollback",
+            Cause::BeforeGitRevert => "Git: rollback",
             Cause::BeforeGitCheckout => "Git: checkout",
             Cause::BeforeGitPull => "Git: pull",
-            Cause::BeforeDelete => "Before delete",
-            Cause::BeforeRevert => "Before revert from history",
-            Cause::BeforeRestore => "Before restore from history",
+            Cause::BeforeDelete => "Delete",
+            Cause::BeforeRevert => "Revert from history",
+            Cause::BeforeRestore => "Restore from history",
             Cause::Label => "Label",
         }
     }
@@ -216,9 +216,10 @@ impl LocalHistory {
         self.limits.max_file_bytes.min(self.limits.max_bytes / 2)
     }
 
-    /// Takes `bytes` as the version of `path`; `None` means the file is not there. Nothing
-    /// is added when the last version of the file is the same, or when the file is too big
-    /// for the limits.
+    /// Takes `bytes` as the version of `path`; `None` means the file is not there. A save
+    /// or an automatic snapshot of the bytes already at the top of the history adds
+    /// nothing, and neither does a file too big for the limits. An event such as a rename
+    /// is a version of its own even when the bytes did not change.
     pub fn record(
         &self,
         path: &Path,
@@ -254,8 +255,10 @@ impl LocalHistory {
                 .find(|entry| key_of(&entry.path) == key)
                 .map(|entry| entry.content.clone())
         };
-        // A file never seen and not there has no history to start.
-        if last == Some(content.clone()) || (last.is_none() && content.is_none()) {
+        // A save of the text the history already holds adds nothing; the same bytes in
+        // front of another cause still say what happened to the file.
+        let repeats = matches!(cause, Cause::Saved | Cause::Auto);
+        if repeats && (last == Some(content.clone()) || (last.is_none() && content.is_none())) {
             return Ok(None);
         }
         let revision = self.add(path, cause, content, None, at)?;

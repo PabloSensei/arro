@@ -933,7 +933,7 @@ pub(crate) fn apply(
             view.update(cx, |workspace, cx| match written {
                 Ok(()) => workspace.reload_keymap(cx),
                 Err(error) => {
-                    workspace.notify_user("Cannot write the keymap", error.to_string(), cx)
+                    workspace.notify_error("Cannot write the keymap", error.to_string(), cx)
                 }
             })
             .ok();
@@ -954,7 +954,7 @@ pub(crate) fn apply(
             view.update(cx, |workspace, cx| match written {
                 Ok(()) => crate::settings_templates::load(workspace, cx),
                 Err(error) => {
-                    workspace.notify_user("Cannot write the templates", error.to_string(), cx)
+                    workspace.notify_error("Cannot write the templates", error.to_string(), cx)
                 }
             })
             .ok();

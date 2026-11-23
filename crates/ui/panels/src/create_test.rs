@@ -415,7 +415,7 @@ impl CreateTestDialog {
                 .update(cx, |workspace, window, cx| {
                     workspace.dismiss(window, cx);
                     if !written {
-                        workspace.notify_user(
+                        workspace.notify_error(
                             "Create Test",
                             "The test file could not be written",
                             cx,

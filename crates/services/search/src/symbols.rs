@@ -115,6 +115,7 @@ impl SymbolIndex {
                 symbol: ranked.item.1.clone(),
             },
             score: ranked.score,
+            kind: ranked.kind,
         })
         .collect()
     }

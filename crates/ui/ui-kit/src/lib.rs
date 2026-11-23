@@ -14,6 +14,7 @@ mod dialog_buttons;
 mod embedded;
 mod floating;
 mod form;
+mod highlights;
 pub mod icon_sets;
 mod motions;
 mod palette;
@@ -34,8 +35,9 @@ pub use embedded::{Assets, app, init};
 pub use floating::{DialogPlace, DialogPlaces, PopupSpec, popup_drag_header, popup_window};
 pub use form::{
     FORM_LABEL_MAX, FORM_LABEL_MIN, form_aligned, form_hint, form_label, form_label_width,
-    form_row, form_row_colored, label_column_width,
+    form_row, form_row_colored, form_row_labelled, label_column_width,
 };
+pub use highlights::{highlight_ranges, highlighted_text};
 pub use icon_sets::{ARRO, INTELLIJ, IconCatalog, IconSet, icon_file};
 pub use motions::{Slide, smoothstep};
 pub use palette::{

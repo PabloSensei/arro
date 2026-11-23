@@ -1416,7 +1416,8 @@ pub trait ToolBackend: Send + Sync {
         Ok(self.editor_context(scope)?.open_files)
     }
 
-    /// The text of a class or a source the language service can show, such as a `jdt://` one.
+    /// The text of a class or a source the language service can show, such as a class of a
+    /// library.
     fn source_text(&self, _scope: &SessionScope, _uri: &str) -> Result<String, ToolError> {
         Err(ToolError::Failed(
             "no decompiler is connected for this file".to_string(),

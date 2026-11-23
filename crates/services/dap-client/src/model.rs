@@ -662,8 +662,8 @@ mod tests {
             Some(PathBuf::from("C:\\work\\Main.txt"))
         );
         assert_eq!(
-            source_path(Some(&json!({"path": "jdt://contents/a.jar/X.class"}))),
-            Some(PathBuf::from("jdt://contents/a.jar/X.class"))
+            source_path(Some(&json!({"path": "lib://contents/a.jar/X.class"}))),
+            Some(PathBuf::from("lib://contents/a.jar/X.class"))
         );
     }
 

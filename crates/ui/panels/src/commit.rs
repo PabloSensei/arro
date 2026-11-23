@@ -16,7 +16,7 @@ use workspace::{COMMIT_TOOL, FileIcons, Settings, Workspace};
 use crate::change_tree::{self, FOLDER_ICON, MODULE_ICON, NodeKind, TreeNode};
 use crate::changelists::{Changelists, Grouping};
 use crate::diff_view::DiffView;
-use crate::git::{GitState, Kind, relative_of, short_commit};
+use crate::git::{CommitOutcome, GitState, Kind, relative_of, short_commit};
 use crate::inspect::ActiveInspect;
 use crate::project_state::project_key;
 use crate::prompt::{Prompt, TextField};
@@ -176,6 +176,9 @@ struct OpenFile {
 enum CommitProblem {
     NoMessage,
     NoFiles,
+    /// Amend without a ticked file and with the message the last commit has: nothing would
+    /// change.
+    NothingToAmend,
     Save(String),
 }
 
@@ -184,9 +187,30 @@ impl CommitProblem {
         match self {
             Self::NoMessage => "Write a commit message first",
             Self::NoFiles => "Tick at least one file",
+            Self::NothingToAmend => "Change the message or tick a file",
             Self::Save(message) => message,
         }
     }
+}
+
+/// Whether Amend changes the last commit: its message must be known and differ from the
+/// message in the field. Without ticked files that is the only change an Amend makes.
+fn amend_changes(message: &str, last_message: Option<&str>) -> bool {
+    last_message.is_some_and(|last| last.trim() != message.trim())
+}
+
+/// The question before an Amend rewrites a commit the upstream already has. A protected
+/// branch gets a warning: its history is shared, so a force push rewrites what others have.
+pub(crate) fn force_push_question(branch: Option<&str>) -> String {
+    let mut question =
+        String::from("The amended commit was already pushed. Force push with lease?");
+    if let Some(branch @ ("main" | "master")) = branch {
+        question.push_str(&format!(
+            " Warning: {branch} is a protected branch, and a force push \
+             rewrites the history others may have."
+        ));
+    }
+    question
 }
 
 /// Builds the request for git from the message and the ticked files, writing the open
@@ -199,15 +223,18 @@ fn prepare_commit(
     open: Vec<OpenFile>,
     save: impl FnMut(&Path) -> Result<(), String>,
 ) -> Result<CommitRequest, CommitProblem> {
-    prepare_commit_with(message, paths, open, false, save)
+    prepare_commit_with(message, paths, open, false, None, save)
 }
 
-/// Like [`prepare_commit`], with `amend` saying whether the last commit is rewritten.
+/// Like [`prepare_commit`], with `amend` saying whether the last commit is rewritten and
+/// `last_message` the message it has. An Amend without ticked files only rewrites the
+/// message, so it needs one that differs from `last_message`.
 fn prepare_commit_with(
     message: &str,
     paths: &[String],
     open: Vec<OpenFile>,
     amend: bool,
+    last_message: Option<&str>,
     mut save: impl FnMut(&Path) -> Result<(), String>,
 ) -> Result<CommitRequest, CommitProblem> {
     let message = message.trim();
@@ -215,7 +242,12 @@ fn prepare_commit_with(
         return Err(CommitProblem::NoMessage);
     }
     if paths.is_empty() {
-        return Err(CommitProblem::NoFiles);
+        if !amend {
+            return Err(CommitProblem::NoFiles);
+        }
+        if !amend_changes(message, last_message) {
+            return Err(CommitProblem::NothingToAmend);
+        }
     }
     for file in open {
         if !file.dirty || !paths.contains(&file.relative) {
@@ -401,10 +433,18 @@ struct PendingCommit {
 /// made in one of them is what the other shows, and the lists are saved from here alone.
 pub struct CommitDraft {
     message: TextField,
-    /// Files the user took the tick off. A new file starts ticked.
+    /// Files the user took the tick off. A tracked file starts ticked.
     unchecked: HashSet<String>,
+    /// Files Git does not track yet that the user ticked. An untracked file starts
+    /// without a tick, and joining the index makes it an ordinary change.
+    checked_untracked: HashSet<String>,
     /// Alt+M: the next commit rewrites the last one.
     amend: bool,
+    /// The whole message of the last commit, which Amend rewrites. Known once Amend is on.
+    last_message: Option<String>,
+    /// The text of the field when Amend was ticked. Amend puts the message of the last
+    /// commit in its place, and an untick brings this text back unless the user changed it.
+    message_before_amend: Option<String>,
     /// The switches of the commit options popup.
     sign_off: bool,
     author: Option<String>,
@@ -435,7 +475,10 @@ impl CommitDraft {
         cx.new(|_| Self {
             message: TextField::default(),
             unchecked: HashSet::new(),
+            checked_untracked: HashSet::new(),
             amend: false,
+            last_message: None,
+            message_before_amend: None,
             sign_off: false,
             author: None,
             analysis,
@@ -486,6 +529,16 @@ impl CommitDraft {
     }
 }
 
+/// The paths of the files Git does not track yet. They start without a tick.
+fn untracked_paths(status: &vcs::Status) -> HashSet<String> {
+    status
+        .files
+        .iter()
+        .filter(|file| Kind::of(file) == Kind::Untracked)
+        .map(|file| file.path.clone())
+        .collect()
+}
+
 pub struct CommitPanel {
     git: Entity<GitState>,
     workspace: WeakEntity<Workspace>,
@@ -494,8 +547,12 @@ pub struct CommitPanel {
     /// change so that drawing reads them without a borrow of the draft.
     draft: Entity<CommitDraft>,
     message: TextField,
-    /// Files the user took the tick off. A new file starts ticked.
+    /// Files the user took the tick off. A tracked file starts ticked.
     unchecked: HashSet<String>,
+    /// The paths Git does not track yet, copied with the status. They start without a tick.
+    untracked: HashSet<String>,
+    /// Untracked files the user ticked, copied from the draft.
+    checked_untracked: HashSet<String>,
     /// The hunks taken off, by path, so that a file shows a partial tick.
     partial: HashMap<String, Vec<Hunk>>,
     selected: Option<usize>,
@@ -511,6 +568,8 @@ pub struct CommitPanel {
     files_focused: bool,
     /// Alt+M: the next commit rewrites the last one.
     amend: bool,
+    /// The whole message of the last commit, copied from the draft.
+    last_message: Option<String>,
     /// The switches of the commit options popup.
     sign_off: bool,
     author: Option<String>,
@@ -568,12 +627,15 @@ impl CommitPanel {
             let shared = draft.read(cx);
             let message = shared.message.clone();
             let unchecked = shared.unchecked.clone();
+            let checked_untracked = shared.checked_untracked.clone();
             let partial = shared.excluded_hunks.clone();
             let amend = shared.amend;
+            let last_message = shared.last_message.clone();
             let sign_off = shared.sign_off;
             let author = shared.author.clone();
             let analysis = shared.analysis;
             let lists = shared.lists.clone();
+            let untracked = untracked_paths(git.read(cx).status());
             Self {
                 git,
                 workspace,
@@ -581,6 +643,8 @@ impl CommitPanel {
                 draft,
                 message,
                 unchecked,
+                untracked,
+                checked_untracked,
                 partial,
                 selected: None,
                 selected_node: None,
@@ -591,6 +655,7 @@ impl CommitPanel {
                 scroll_shelf_diff: ScrollHandle::new(),
                 files_focused: false,
                 amend,
+                last_message,
                 sign_off,
                 author,
                 analysis,
@@ -638,8 +703,10 @@ impl CommitPanel {
         let draft = self.draft.read(cx);
         self.message = draft.message.clone();
         self.unchecked = draft.unchecked.clone();
+        self.checked_untracked = draft.checked_untracked.clone();
         self.partial = draft.excluded_hunks.clone();
         self.amend = draft.amend;
+        self.last_message = draft.last_message.clone();
         self.sign_off = draft.sign_off;
         self.author = draft.author.clone();
         self.analysis = draft.analysis;
@@ -665,10 +732,14 @@ impl CommitPanel {
         &self.message.text
     }
 
-    /// Whether the file carries a tick, for tests.
-    #[cfg(test)]
+    /// Whether the file carries a tick. An untracked file starts without one and gets it
+    /// only from the user; joining the index makes it an ordinary change.
     pub fn is_checked(&self, path: &str) -> bool {
-        !self.unchecked.contains(path)
+        if self.untracked.contains(path) {
+            self.checked_untracked.contains(path) && !self.unchecked.contains(path)
+        } else {
+            !self.unchecked.contains(path)
+        }
     }
 
     /// Whether the next commit rewrites the last one, for scripts and tests.
@@ -752,8 +823,17 @@ impl CommitPanel {
 
     pub fn set_checked(&mut self, path: &str, checked: bool, cx: &mut Context<Self>) {
         let path = path.to_string();
+        let untracked = self.untracked.contains(&path);
         self.change(cx, |draft| {
-            if checked {
+            if untracked {
+                if checked {
+                    draft.checked_untracked.insert(path.clone());
+                    draft.unchecked.remove(&path);
+                    draft.excluded_hunks.remove(&path);
+                } else {
+                    draft.checked_untracked.remove(&path);
+                }
+            } else if checked {
                 draft.unchecked.remove(&path);
                 draft.excluded_hunks.remove(&path);
             } else {
@@ -763,37 +843,44 @@ impl CommitPanel {
         cx.notify();
     }
 
-    /// Alt+M: the last commit is rewritten with the message of the field, which starts as
-    /// the message of that commit.
+    /// Alt+M: the last commit is rewritten with its whole message, which the field takes when
+    /// Amend is ticked. An untick brings back the text the field had, unless the user has
+    /// changed the text Amend put there: that text is theirs.
     fn toggle_amend(&mut self, cx: &mut Context<Self>) {
-        let amend = !self.amend;
-        self.change(cx, |draft| {
-            draft.amend = amend;
-            if !amend {
-                draft.message.text.clear();
-            }
-        });
-        if !amend {
+        if self.amend {
+            self.change(cx, |draft| {
+                draft.amend = false;
+                let filled = draft.last_message.as_deref() == Some(draft.message.text.as_str());
+                let before = draft.message_before_amend.take();
+                if let Some(before) = before.filter(|_| filled) {
+                    draft.message = TextField::from_text(before);
+                }
+                draft.last_message = None;
+            });
             cx.notify();
             return;
         }
+        self.change(cx, |draft| {
+            draft.amend = true;
+            draft.message_before_amend = Some(draft.message.text.clone());
+        });
         let Some(repo) = self.git.read(cx).repo() else {
             cx.notify();
             return;
         };
-        let job = cx.background_executor().spawn(async move {
-            repo.log(1, 0)
-                .ok()
-                .and_then(|mut commits| commits.pop())
-                .map(|commit| commit.subject)
-        });
+        let job = cx
+            .background_executor()
+            .spawn(async move { repo.last_commit_message().ok().flatten() });
         cx.spawn(async move |this, cx| {
             let message = job.await;
             this.update(cx, |this, cx| {
                 if this.amend
                     && let Some(message) = message
                 {
-                    this.change(cx, |draft| draft.message.text = message);
+                    this.change(cx, |draft| {
+                        draft.last_message = Some(message.clone());
+                        draft.message = TextField::from_text(message);
+                    });
                 }
                 cx.notify();
             })
@@ -895,9 +982,43 @@ impl CommitPanel {
         self.visible_files(cx)
             .into_iter()
             .filter_map(|index| files.get(index))
-            .filter(|file| !self.unchecked.contains(&file.path))
+            .filter(|file| self.is_checked(&file.path))
             .map(|file| file.path.clone())
             .collect()
+    }
+
+    /// Whether Commit and Commit and Push run: a file is ticked, or Amend changes the
+    /// message of the last commit.
+    fn can_commit(&self, checked: &[String]) -> bool {
+        !checked.is_empty()
+            || (self.amend && amend_changes(&self.message.text, self.last_message.as_deref()))
+    }
+
+    /// The text beside the buttons: how many ticked files the commit takes and the branch,
+    /// or what git is doing.
+    fn summary(&self, cx: &App) -> String {
+        let count = self.checked_paths(cx).len();
+        let git = self.git.read(cx);
+        let busy = git.busy();
+        let branch = git.status().branch.clone();
+        let summary = match (busy, branch) {
+            (Some(what), _) => format!("{what}..."),
+            // An Amend without files only changes the message.
+            (None, _) if self.amend && count == 0 => "message only".to_string(),
+            (None, Some(branch)) => format!("{count} changed on {branch}"),
+            (None, None) => format!("{count} changed"),
+        };
+        if self.amend {
+            format!("Amend · {summary}")
+        } else {
+            summary
+        }
+    }
+
+    /// The text beside the buttons, for tests.
+    #[cfg(test)]
+    pub fn summary_text(&self, cx: &App) -> String {
+        self.summary(cx)
     }
 
     /// The indices of the status the active change list shows, in the order of the status.
@@ -930,8 +1051,13 @@ impl CommitPanel {
 
     fn status_changed(&mut self, status: &vcs::Status, cx: &mut Context<Self>) {
         let paths: HashSet<String> = status.files.iter().map(|file| file.path.clone()).collect();
+        let untracked = untracked_paths(status);
+        self.untracked = untracked.clone();
         self.change(cx, |draft| {
             draft.excluded_hunks.retain(|path, _| paths.contains(path));
+            draft
+                .checked_untracked
+                .retain(|path| untracked.contains(path));
             if draft.lists.retain_paths(&paths) {
                 draft.save_lists();
             }
@@ -1634,20 +1760,26 @@ impl CommitPanel {
         let paths = self.checked_paths(cx);
         self.warn_crlf(&paths, cx);
         let open = self.open_files(cx);
-        let request =
-            match prepare_commit_with(&self.message.text, &paths, open, self.amend, |path| {
+        let request = match prepare_commit_with(
+            &self.message.text,
+            &paths,
+            open,
+            self.amend,
+            self.last_message.as_deref(),
+            |path| {
                 self.workspace
                     .update(cx, |workspace, cx| workspace.save_editor_now(path, cx))
                     .unwrap_or_else(|_| Err("the window is gone".to_string()))
-            }) {
-                Ok(request) => request,
-                Err(problem) => {
-                    let text = problem.text().to_string();
-                    self.git
-                        .update(cx, |git, cx| git.report("Commit", text, cx));
-                    return;
-                }
-            };
+            },
+        ) {
+            Ok(request) => request,
+            Err(problem) => {
+                let text = problem.text().to_string();
+                self.git
+                    .update(cx, |git, cx| git.report("Commit", text, cx));
+                return;
+            }
+        };
         let options = CommitOptions {
             sign_off: self.sign_off,
             author: self.author.clone(),
@@ -1656,7 +1788,7 @@ impl CommitPanel {
         if self.analysis && self.start_analysis(&request, push, partial.clone(), cx) {
             return;
         }
-        self.commit_now(request, push, options, partial, cx);
+        self.commit_now(request, push, options, partial, false, cx);
     }
 
     /// The ticked files whose hunks the user picked one by one. A deleted file has no
@@ -1708,36 +1840,57 @@ impl CommitPanel {
         };
         self.workspace
             .update(cx, |workspace, cx| {
-                workspace.notify_user("Commit", text, cx)
+                workspace.notify_warning("Commit", text, cx)
             })
             .ok();
     }
 
     /// Sends the request to git. The message field stays as the user left it when git
-    /// fails.
+    /// fails. `force` is the answer to the force push question of an Amend: with it the
+    /// commit goes with a lease.
     fn commit_now(
         &mut self,
         request: CommitRequest,
         push: bool,
         options: CommitOptions,
         partial: Vec<PartialFile>,
+        force: bool,
         cx: &mut Context<Self>,
     ) {
-        let root = self
-            .workspace
-            .read_with(cx, |workspace, _| workspace.root().to_path_buf());
-        if let Ok(root) = root {
-            crate::history::put_label(&root, "Before commit".to_string(), cx);
+        // The answer to the force push question retries the commit on the same state, so the
+        // label of the first try stands for both.
+        if !force {
+            let root = self
+                .workspace
+                .read_with(cx, |workspace, _| workspace.root().to_path_buf());
+            if let Ok(root) = root {
+                crate::history::put_label(&root, "Before commit".to_string(), cx);
+            }
         }
         let me = cx.weak_entity();
         let amend = request.amend;
+        let retry = (request.clone(), options.clone(), partial.clone());
         self.git.update(cx, |git, cx| {
             git.commit_roots(
                 request,
                 options,
                 push,
+                force,
                 partial,
-                move |git: &mut GitState, _ids, cx| {
+                move |git: &mut GitState, outcome, cx| {
+                    if matches!(outcome, CommitOutcome::ForcePushNeeded) {
+                        // Nothing was written. The question opens once this update of the Git
+                        // state is over: the panel reads the Git state, and this update holds it.
+                        let branch = git.status().branch.clone();
+                        let (request, options, partial) = retry;
+                        cx.defer(move |cx| {
+                            me.update(cx, |this, cx| {
+                                this.ask_force_push(branch, request, options, partial, cx)
+                            })
+                            .ok();
+                        });
+                        return;
+                    }
                     let text = if amend && push {
                         "Amended the commit and pushed".to_string()
                     } else if amend {
@@ -1752,7 +1905,11 @@ impl CommitPanel {
                         this.change(cx, |draft| {
                             draft.message.text.clear();
                             draft.amend = false;
+                            draft.last_message = None;
+                            draft.message_before_amend = None;
                             draft.excluded_hunks.clear();
+                            draft.unchecked.clear();
+                            draft.checked_untracked.clear();
                         });
                         cx.notify();
                     })
@@ -1761,6 +1918,38 @@ impl CommitPanel {
                 cx,
             )
         });
+    }
+
+    /// The question before an Amend rewrites a commit the upstream already has. Force Push
+    /// sends the commit with a lease; Cancel leaves the commit, the remote and the field as
+    /// they were.
+    fn ask_force_push(
+        &mut self,
+        branch: Option<String>,
+        request: CommitRequest,
+        options: CommitOptions,
+        partial: Vec<PartialFile>,
+        cx: &mut Context<Self>,
+    ) {
+        let question = force_push_question(branch.as_deref());
+        let me = cx.weak_entity();
+        let submit = move |cx: &mut App| {
+            let (request, options, partial) = (request.clone(), options.clone(), partial.clone());
+            me.update(cx, |this, cx| {
+                this.commit_now(request, true, options, partial, true, cx)
+            })
+            .ok();
+        };
+        let workspace = self.workspace.clone();
+        self.window
+            .update(cx, |_, window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        Prompt::ask("Force Push", &question, submit, workspace, window, cx);
+                    })
+                    .ok();
+            })
+            .ok();
     }
 
     /// Runs Inspect Code over the files of the commit. `false` means the inspection
@@ -1816,6 +2005,7 @@ impl CommitPanel {
                 pending.push,
                 pending.options,
                 pending.partial,
+                false,
                 cx,
             );
             return;
@@ -1832,6 +2022,7 @@ impl CommitPanel {
                 pending.push,
                 pending.options,
                 pending.partial,
+                false,
                 cx,
             );
             return;
@@ -1868,6 +2059,7 @@ impl CommitPanel {
                     pending.push,
                     pending.options,
                     pending.partial,
+                    false,
                     cx,
                 );
             });
@@ -2055,7 +2247,7 @@ impl CommitPanel {
         else {
             return;
         };
-        let checked = !self.unchecked.contains(&path);
+        let checked = self.is_checked(&path);
         self.set_checked(&path, !checked, cx);
     }
 
@@ -2289,7 +2481,7 @@ impl CommitPanel {
                 let path = node.path.clone();
                 tick_element.on_click(cx.listener(move |this, _, _, cx| {
                     this.files_focused = true;
-                    let now = this.unchecked.contains(&path);
+                    let now = !this.is_checked(&path);
                     this.set_checked(&path, now, cx);
                 }))
             }
@@ -2540,9 +2732,9 @@ impl CommitPanel {
     }
 
     /// The tick of one file: off when the user left it out, partial when some of its hunks
-    /// are left out, on otherwise.
+    /// are left out, on otherwise. An untracked file is on only when the user ticked it.
     fn file_tick(&self, path: &str) -> Tick {
-        if self.unchecked.contains(path) {
+        if !self.is_checked(path) {
             Tick::Off
         } else if self
             .partial
@@ -2609,9 +2801,16 @@ impl CommitPanel {
     /// Ticks or unticks several files at once, as one change of the draft both views share.
     fn set_checked_paths(&mut self, paths: &[String], checked: bool, cx: &mut Context<Self>) {
         let paths = paths.to_vec();
+        let untracked = self.untracked.clone();
         self.change(cx, |draft| {
             for path in paths {
-                if checked {
+                if untracked.contains(&path) {
+                    if checked {
+                        draft.checked_untracked.insert(path);
+                    } else {
+                        draft.checked_untracked.remove(&path);
+                    }
+                } else if checked {
                     draft.unchecked.remove(&path);
                     draft.excluded_hunks.remove(&path);
                 } else {
@@ -3150,9 +3349,14 @@ impl Render for CommitPanel {
         #[cfg(test)]
         workspace::note_view_render(cx, "commit");
         let theme = *cx.global::<Theme>();
-        let count = self.visible_files(cx).len();
-        let busy = self.git.read(cx).busy();
-        let branch = self.git.read(cx).status().branch.clone();
+        let visible = self.visible_files(cx).len();
+        let checked = self.checked_paths(cx);
+        let can_commit = self.can_commit(&checked);
+        let idle_hint = if self.amend {
+            "Change the message or tick a file"
+        } else {
+            "Tick at least one file"
+        };
         let workspace = self.workspace.clone();
         let options =
             crate::tool_menu::options_menu(workspace.clone(), workspace::COMMIT_TOOL, |_| {
@@ -3172,32 +3376,29 @@ impl Render for CommitPanel {
         let rows = self.tree_elements(&icons, &theme, cx);
         let message_empty = self.message.text.is_empty();
         let message_shown = !self.files_focused;
-        let summary = match (busy, branch) {
-            (Some(what), _) => format!("{what}..."),
-            (None, Some(branch)) => format!("{count} changed on {branch}"),
-            (None, None) => format!("{count} changed"),
-        };
-        let summary = if self.amend {
-            format!("Amend · {summary}")
+        let summary = self.summary(cx);
+        let head = self.tab_row(&theme, cx);
+        let commit_button = self.button("commit-go", "Commit", true, &theme);
+        let commit_button = if can_commit {
+            commit_button.on_click(cx.listener(|this, _, _, cx| this.commit(false, cx)))
         } else {
-            summary
+            commit_button
+                .opacity(0.4)
+                .tooltip(move |_, cx| tooltip(idle_hint, None, cx))
+                .child(
+                    div()
+                        .debug_selector(|| "commit-go-disabled".to_owned())
+                        .size(px(1.)),
+                )
         };
-        let title = match self.tab {
-            Tab::Commit => "Commit",
-            Tab::Shelf => "Shelf",
+        let push_button = self.button("commit-push", "Commit and Push", false, &theme);
+        let push_button = if can_commit {
+            push_button.on_click(cx.listener(|this, _, _, cx| this.commit(true, cx)))
+        } else {
+            push_button
+                .opacity(0.4)
+                .tooltip(move |_, cx| tooltip(idle_hint, None, cx))
         };
-        let head = div()
-            .flex()
-            .items_center()
-            .gap(px(SPACE_S))
-            .min_w_0()
-            .child(
-                div()
-                    .font_weight(FontWeight::MEDIUM)
-                    .debug_selector(|| "commit-title".to_owned())
-                    .child(title),
-            )
-            .child(self.tab_row(&theme, cx));
         let body = if self.tab == Tab::Shelf {
             self.shelf_body(&theme, window, cx)
         } else {
@@ -3220,7 +3421,7 @@ impl Render for CommitPanel {
                             .overflow_y_scroll()
                             .track_scroll(&self.scroll_files)
                             .children(rows)
-                            .when(count == 0, |this| {
+                            .when(visible == 0, |this| {
                                 this.items_center()
                                     .justify_center()
                                     .text_color(theme.text_secondary)
@@ -3284,23 +3485,8 @@ impl Render for CommitPanel {
                                     div()
                                         .flex()
                                         .gap(px(8.))
-                                        .child(
-                                            self.button("commit-go", "Commit", true, &theme)
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.commit(false, cx)
-                                                })),
-                                        )
-                                        .child(
-                                            self.button(
-                                                "commit-push",
-                                                "Commit and Push",
-                                                false,
-                                                &theme,
-                                            )
-                                            .on_click(
-                                                cx.listener(|this, _, _, cx| this.commit(true, cx)),
-                                            ),
-                                        )
+                                        .child(commit_button)
+                                        .child(push_button)
                                         .child(
                                             self.button(
                                                 "commit-shelve",
@@ -3525,7 +3711,7 @@ impl Render for PointerView {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{CommitProblem, OpenFile, prepare_commit};
+    use super::{CommitProblem, OpenFile, prepare_commit, prepare_commit_with};
 
     fn open(path: &str, relative: &str, dirty: bool) -> OpenFile {
         OpenFile {
@@ -3597,5 +3783,33 @@ mod tests {
             "Write a commit message first"
         );
         assert_eq!(CommitProblem::NoFiles.text(), "Tick at least one file");
+    }
+
+    #[test]
+    fn amend_without_files_needs_a_message_that_differs() {
+        let mut no_save = |_: &Path| -> Result<(), String> { panic!("nothing may be saved") };
+
+        assert_eq!(
+            prepare_commit_with("base", &[], Vec::new(), true, Some("base"), &mut no_save),
+            Err(CommitProblem::NothingToAmend)
+        );
+        assert_eq!(
+            prepare_commit_with("base", &[], Vec::new(), true, None, &mut no_save),
+            Err(CommitProblem::NothingToAmend),
+            "a message of the last commit that is not known changes nothing"
+        );
+        let request =
+            prepare_commit_with(" new ", &[], Vec::new(), true, Some("base"), &mut no_save)
+                .unwrap();
+        assert_eq!(request.message, "new");
+        assert!(request.amend && request.paths.is_empty());
+        assert_eq!(
+            prepare_commit_with("new", &[], Vec::new(), false, Some("base"), &mut no_save),
+            Err(CommitProblem::NoFiles)
+        );
+        assert_eq!(
+            CommitProblem::NothingToAmend.text(),
+            "Change the message or tick a file"
+        );
     }
 }

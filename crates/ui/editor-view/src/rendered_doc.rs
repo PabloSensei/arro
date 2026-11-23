@@ -150,7 +150,7 @@ impl EditorView {
         if target.starts_with("http://")
             || target.starts_with("https://")
             || target.starts_with("file:")
-            || target.starts_with("jdt:")
+            || self.library_place(&target, cx).is_some()
         {
             self.open_quick_doc_link(target, cx);
             return;

@@ -25,8 +25,8 @@ use crate::window_tests_run::{open_with, run_panel, setup, wait_for};
 const ARGS: &str = "args";
 
 /// A provider whose program prints its arguments, so a test sees what a run got.
-struct FixtureRun {
-    planned: Arc<Mutex<Vec<RunConfig>>>,
+pub(crate) struct FixtureRun {
+    pub(crate) planned: Arc<Mutex<Vec<RunConfig>>>,
 }
 
 impl RunConfigProvider for FixtureRun {

@@ -5,11 +5,11 @@ use lang_api::{
     ActionProvider, AddOverridableMethodsProvider, CallHierarchyProvider,
     ChangeSignatureInfoProvider, ChangeSignatureProvider, CompletionProvider,
     CompletionResolveProvider, DefinitionPreviewProvider, Deletion, DeletionKind,
-    DiagnosticsProvider, ExecuteCommandProvider, FileSymbolsProvider, FormatProvider,
-    GenerateApplyProvider, GenerateProvider, HierarchyProvider, HighlightProvider, HoverProvider,
-    InlayHintProvider, InlayHintSettings, LanguageId, LanguageSupport, MethodHierarchyProvider,
-    MoveDestinationProvider, MoveMembersFormProvider, MovePlace, MoveProvider,
-    MoveTargetsFormProvider, NavigationProvider, OverridableMethodsProvider,
+    DiagnosticsProvider, ExecuteCommandProvider, ExpressionTypePlace, FileSymbolsProvider,
+    FormatProvider, GenerateApplyProvider, GenerateProvider, HierarchyProvider, HighlightProvider,
+    HoverPlace, HoverProvider, InlayHintProvider, InlayHintSettings, LanguageId, LanguageSupport,
+    MethodHierarchyProvider, MoveDestinationProvider, MoveMembersFormProvider, MovePlace,
+    MoveProvider, MoveTargetsFormProvider, NavigationProvider, OverridableMethodsProvider,
     PrepareDiagnosticsProvider, ProjectProblemsProvider, Queries, RangeFormatProvider,
     ReferenceStringProvider, ReferencesProvider, RenameProvider, SemanticServer,
     SemanticTokensProvider, SignatureProvider, SourceTextProvider, StructuralEdit, StructuralMatch,
@@ -49,6 +49,9 @@ const PREFERRED_COMPLETION_NAMES: &[&str] = &[
     "Comparable",
     "CharSequence",
 ];
+
+/// The type every Java type inherits. The completion list puts its members last.
+const ROOT_COMPLETION_TYPE: &str = "Object";
 
 /// The keywords and the literals of the language, none of which names a declaration.
 const JAVA_KEYWORDS: &[&str] = &[
@@ -240,6 +243,10 @@ impl LanguageSupport for JavaProject {
         PREFERRED_COMPLETION_NAMES
     }
 
+    fn root_completion_type(&self) -> Option<&'static str> {
+        Some(ROOT_COMPLETION_TYPE)
+    }
+
     fn embedded_languages(&self) -> Vec<Arc<dyn LanguageSupport>> {
         vec![
             self.spring.clone(),
@@ -343,6 +350,27 @@ impl LanguageSupport for JavaProject {
 
     fn hover(&self) -> Option<&HoverProvider> {
         Some(&self.java_messages)
+    }
+
+    fn hover_place(&self, line: &str) -> Option<HoverPlace> {
+        crate::hover_place::split(line)
+    }
+
+    fn expression_type_place(
+        &self,
+        text: &str,
+        expression: std::ops::Range<usize>,
+    ) -> Option<ExpressionTypePlace> {
+        crate::expression_type::place(text, expression)
+    }
+
+    fn expression_type_from_hover(
+        &self,
+        text: &str,
+        offset: usize,
+        answer: &str,
+    ) -> Option<String> {
+        crate::expression_type::from_hover(text, offset, answer)
     }
 
     fn workspace_symbols(&self) -> Option<&WorkspaceSymbolProvider> {
@@ -477,6 +505,10 @@ impl LanguageSupport for JavaProject {
         Some(&self.library_sources)
     }
 
+    fn describe_library_uri(&self, uri: &str) -> Option<lang_api::LibraryPlace> {
+        crate::library_place::describe(uri)
+    }
+
     fn format(&self) -> Option<&FormatProvider> {
         Some(self.providers.as_ref())
     }
@@ -487,6 +519,20 @@ impl LanguageSupport for JavaProject {
 
     fn refactor_selections(&self) -> Option<&lang_api::RefactorSelectionsProvider> {
         Some(self.providers.as_ref())
+    }
+
+    fn expressions_at(&self, text: &str, offset: usize) -> Vec<std::ops::Range<usize>> {
+        java_syntax::expressions_at(text, offset)
+    }
+
+    fn suggest_name(
+        &self,
+        text: &str,
+        expression: std::ops::Range<usize>,
+        role: lang_api::NameRole,
+        hint: Option<&str>,
+    ) -> Option<String> {
+        suggested_name(text, expression, role, hint)
     }
 
     fn debug_processes(&self) -> Option<&lang_api::DebugProcessProvider> {
@@ -570,7 +616,7 @@ impl LanguageSupport for JavaProject {
     }
 
     fn change_signature_info(&self) -> Option<&ChangeSignatureInfoProvider> {
-        Some(self.providers.as_ref())
+        Some(&self.change_signature)
     }
 
     fn change_signature(&self) -> Option<&ChangeSignatureProvider> {
@@ -760,6 +806,166 @@ impl StructuralSearchProvider for JavaStructuralSearch {
 
     fn replace(&self, text: &str, query: &StructuralQuery) -> Result<Vec<StructuralEdit>, String> {
         java_syntax::structural_replace(query, text)
+    }
+}
+
+/// The name an extraction suggests, read from the syntax of the file. A keyword of the grammar
+/// is no name, so the editor keeps the name the server chose.
+fn suggested_name(
+    text: &str,
+    expression: std::ops::Range<usize>,
+    role: lang_api::NameRole,
+    hint: Option<&str>,
+) -> Option<String> {
+    java_syntax::suggest_name(text, expression, role, hint)
+        .filter(|name| !JAVA_KEYWORDS.contains(&name.as_str()))
+}
+
+#[cfg(test)]
+mod name_tests {
+    use std::ops::Range;
+
+    use lang_api::NameRole;
+
+    use super::suggested_name;
+
+    /// The byte range of the first `needle` of `text`: the expression a test names.
+    fn at(text: &str, needle: &str) -> Range<usize> {
+        let start = text.find(needle).expect("the needle is in the text");
+        start..start + needle.len()
+    }
+
+    #[test]
+    fn an_initializer_keeps_its_own_name_taken_so_the_name_gets_a_number() {
+        let text = "class A {\n    void f() {\n        int pageSize = 5;\n    }\n}\n";
+        let five = at(text, "5");
+        assert_eq!(
+            suggested_name(text, five.clone(), NameRole::Parameter, None).as_deref(),
+            Some("pageSize1")
+        );
+        assert_eq!(
+            suggested_name(text, five.clone(), NameRole::Variable, None).as_deref(),
+            Some("pageSize1")
+        );
+        assert_eq!(
+            suggested_name(text, five, NameRole::Field, None).as_deref(),
+            Some("pageSize1")
+        );
+    }
+
+    #[test]
+    fn a_constant_takes_the_upper_case_of_the_initialized_name() {
+        let text = "class A {\n    void f() {\n        int pageSize = 5;\n    }\n}\n";
+        assert_eq!(
+            suggested_name(text, at(text, "5"), NameRole::Constant, None).as_deref(),
+            Some("PAGE_SIZE")
+        );
+    }
+
+    #[test]
+    fn an_argument_gives_the_name_of_its_parameter_when_the_hint_knows_it() {
+        let text = "class A {\n    void f() {\n        show(5);\n    }\n}\n";
+        let five = at(text, "5");
+        assert_eq!(
+            suggested_name(
+                text,
+                five.clone(),
+                NameRole::Constant,
+                Some("attributeName")
+            )
+            .as_deref(),
+            Some("ATTRIBUTE_NAME")
+        );
+        assert_eq!(
+            suggested_name(
+                text,
+                five.clone(),
+                NameRole::Variable,
+                Some("attributeName")
+            )
+            .as_deref(),
+            Some("attributeName")
+        );
+        assert_eq!(
+            suggested_name(text, five, NameRole::Variable, None),
+            None,
+            "an argument whose parameter is unknown has no name"
+        );
+    }
+
+    #[test]
+    fn a_string_literal_that_reads_as_a_name_gives_its_text() {
+        let text = "class A {\n    void f(Model model) {\n        model.addAttribute(\"totalItems\", 3);\n    }\n}\n";
+        let literal = at(text, "\"totalItems\"");
+        assert_eq!(
+            suggested_name(text, literal.clone(), NameRole::Constant, None).as_deref(),
+            Some("TOTAL_ITEMS")
+        );
+        assert_eq!(
+            suggested_name(text, literal.clone(), NameRole::Variable, None).as_deref(),
+            Some("totalItems")
+        );
+        assert_eq!(
+            suggested_name(text, literal, NameRole::Constant, Some("attributeName")).as_deref(),
+            Some("TOTAL_ITEMS"),
+            "the text of the literal comes before the parameter it fills"
+        );
+    }
+
+    #[test]
+    fn a_name_the_scope_already_has_gets_a_number() {
+        let field = "class A {\n    static final int PAGE_SIZE = 3;\n    void f() {\n        int pageSize = 5;\n    }\n}\n";
+        assert_eq!(
+            suggested_name(field, at(field, "5"), NameRole::Constant, None).as_deref(),
+            Some("PAGE_SIZE1")
+        );
+        let local =
+            "class A {\n    void f() {\n        int limit = 3;\n        show(5);\n    }\n}\n";
+        assert_eq!(
+            suggested_name(local, at(local, "5"), NameRole::Parameter, Some("limit")).as_deref(),
+            Some("limit1")
+        );
+        let parameter = "class A {\n    void f(int limit) {\n        show(5);\n    }\n}\n";
+        assert_eq!(
+            suggested_name(
+                parameter,
+                at(parameter, "5"),
+                NameRole::Parameter,
+                Some("limit")
+            )
+            .as_deref(),
+            Some("limit1"),
+            "a parameter of the method is in the scope too"
+        );
+    }
+
+    #[test]
+    fn an_expression_without_a_context_has_no_name() {
+        let text =
+            "class A {\n    void f(boolean flag) {\n        if (flag) {\n        }\n    }\n}\n";
+        let start = text.find("(flag)").expect("the condition is in the text") + 1;
+        assert_eq!(
+            suggested_name(text, start..start + "flag".len(), NameRole::Variable, None),
+            None
+        );
+    }
+
+    #[test]
+    fn a_range_that_is_not_one_expression_has_no_name() {
+        let text = "class A {\n    void f() {\n        int pageSize = 5;\n    }\n}\n";
+        assert_eq!(
+            suggested_name(text, at(text, "pageSize = 5"), NameRole::Variable, None),
+            None
+        );
+    }
+
+    #[test]
+    fn a_keyword_is_no_name() {
+        let text = "class A {\n    void f() {\n        show(\"class\");\n    }\n}\n";
+        assert_eq!(
+            suggested_name(text, at(text, "\"class\""), NameRole::Variable, None),
+            None
+        );
     }
 }
 

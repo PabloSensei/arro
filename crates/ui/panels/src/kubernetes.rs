@@ -84,8 +84,6 @@ pub(crate) struct KubeSection {
     open: bool,
     collapsed: HashSet<String>,
     selected: Option<Node>,
-    /// The context the user picked; `None` follows the kubeconfig.
-    context: Option<String>,
     /// The namespace the user picked; `None` follows the context.
     namespace: Option<String>,
     forwards: Vec<PortForward>,
@@ -125,7 +123,6 @@ impl KubeSection {
             open: true,
             collapsed: HashSet::new(),
             selected: None,
-            context: None,
             namespace: None,
             forwards: Vec::new(),
             busy: Vec::new(),
@@ -186,9 +183,7 @@ impl KubeSection {
         if self.watch.is_none()
             && let Some(cli) = self.cli.clone()
         {
-            let cli = cli
-                .with_context(self.context.clone())
-                .with_namespace(self.namespace.clone());
+            let cli = cli.with_namespace(self.namespace.clone());
             self.watch = Some(KubeWatch::start(cli, self.namespace.clone(), EVERY));
         }
         if !self.polling {
@@ -334,10 +329,11 @@ impl KubeSection {
         self.stop_logs(cx);
         self.lines.clear();
         self.output = OutputBuffers::default();
-        let Some(cli) = self.cli.clone().map(|cli| {
-            cli.with_context(self.context.clone())
-                .with_namespace(self.namespace.clone())
-        }) else {
+        let Some(cli) = self
+            .cli
+            .clone()
+            .map(|cli| cli.with_namespace(self.namespace.clone()))
+        else {
             cx.notify();
             return;
         };
@@ -364,10 +360,9 @@ impl KubeSection {
     }
 
     fn cli(&self) -> Option<Kubectl> {
-        self.cli.clone().map(|cli| {
-            cli.with_context(self.context.clone())
-                .with_namespace(self.namespace.clone())
-        })
+        self.cli
+            .clone()
+            .map(|cli| cli.with_namespace(self.namespace.clone()))
     }
 
     fn resource(&self, kind: ResourceKind, name: &str) -> Option<Resource> {
@@ -384,6 +379,16 @@ impl KubeSection {
             .iter()
             .filter(|resource| resource.kind == kind)
             .collect()
+    }
+
+    /// The reason a cluster does not answer, in full: the tooltip of its node, and the right
+    /// side of the node once it is chosen.
+    pub(crate) fn problem(&self) -> Option<String> {
+        match &self.snapshot.cluster {
+            ClusterState::NoCli => Some(NO_CLI.to_owned()),
+            ClusterState::Unreachable { reason } => Some(reason.clone()),
+            ClusterState::Up { .. } => None,
+        }
     }
 
     pub(crate) fn report(&self) -> Vec<String> {
@@ -440,8 +445,13 @@ impl KubeSection {
     pub(crate) fn tree(&self, theme: &Theme, cx: &mut Context<DockerPanel>) -> Vec<AnyElement> {
         let mut rows = Vec::new();
         let root_open = !self.collapsed.contains(ROOT);
+        // Contexts are entries of the kubeconfig, not of the cluster: the tree shows them
+        // while the cluster does not answer too. A single context needs no list.
+        let answers = matches!(self.snapshot.cluster, ClusterState::Up { .. });
+        let shows_contexts = self.snapshot.contexts.len() > 1;
         let root_label = match &self.snapshot.cluster {
             ClusterState::NoCli => "Kubernetes is not installed: no kubectl CLI found".to_string(),
+            ClusterState::Unreachable { .. } if shows_contexts => "Kubernetes".to_string(),
             ClusterState::Unreachable { .. } => {
                 "Kubernetes: the cluster is unreachable".to_string()
             }
@@ -453,44 +463,67 @@ impl KubeSection {
                 }
             }
         };
+        // The reason of an unreachable cluster is in the tooltip, not beside the label.
         let hint = match &self.snapshot.cluster {
-            ClusterState::Unreachable { reason } => Some(reason.clone().into()),
+            ClusterState::Unreachable { .. } => None,
             _ => self.snapshot.problem.clone().map(Into::into),
         };
-        rows.push(
-            kube_row(
-                TreeRow {
-                    id: ROOT.into(),
-                    depth: 0,
-                    label: root_label.into(),
-                    hint,
-                    icon: "toolwindows/services",
-                    expandable: true,
-                    open: root_open,
-                    selected: self.selected == Some(Node::Root),
-                },
-                theme,
-            )
-            .debug_selector(|| ROOT.to_owned())
-            .on_click(cx.listener(|this, _, _, cx| this.kube.toggle_root(cx)))
-            .into_any_element(),
-        );
-        if !root_open {
+        let expandable = answers || shows_contexts;
+        let root = kube_row(
+            TreeRow {
+                id: ROOT.into(),
+                depth: 0,
+                label: root_label.into(),
+                hint,
+                icon: "toolwindows/services",
+                expandable,
+                open: expandable && root_open,
+                selected: self.selected == Some(Node::Root),
+            },
+            theme,
+        )
+        .debug_selector(|| ROOT.to_owned())
+        // A node with nothing to fold shows its reason on the right side instead.
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if expandable {
+                this.kube.toggle_root(cx)
+            } else {
+                this.kube_select(Node::Root, cx)
+            }
+        }));
+        // Without a list of contexts the node itself names the reason of the dead cluster.
+        let root = match &self.snapshot.cluster {
+            ClusterState::Unreachable { reason } if !shows_contexts => {
+                let reason = reason.clone();
+                root.tooltip(move |_, cx| tooltip(reason.clone(), None, cx))
+                    .tooltip_show_delay(TOOLTIP_CREATE_DELAY)
+            }
+            _ => root,
+        };
+        rows.push(root.into_any_element());
+        if !expandable || !root_open {
             return rows;
         }
-        let contexts_open = !self.collapsed.contains(CONTEXTS);
-        rows.push(self.section_row(
-            CONTEXTS,
-            format!("Contexts ({})", self.snapshot.contexts.len()),
-            1,
-            contexts_open,
-            theme,
-            cx,
-        ));
-        if contexts_open {
-            for context in &self.snapshot.contexts {
-                rows.push(self.context_row(context, theme, cx));
+        if shows_contexts {
+            let contexts_open = !self.collapsed.contains(CONTEXTS);
+            rows.push(self.section_row(
+                CONTEXTS,
+                format!("Contexts ({})", self.snapshot.contexts.len()),
+                1,
+                contexts_open,
+                theme,
+                cx,
+            ));
+            if contexts_open {
+                for context in &self.snapshot.contexts {
+                    rows.push(self.context_row(context, theme, cx));
+                }
             }
+        }
+        // Namespaces and resources belong to a cluster that answers; the contexts above do
+        // not.
+        if !answers {
+            return rows;
         }
         let namespaces_open = !self.collapsed.contains(NAMESPACES);
         rows.push(self.section_row(
@@ -602,14 +635,11 @@ impl KubeSection {
         let name = context.name.clone();
         let selector = format!("kube-context-{}", context.name);
         let clicked = name.clone();
-        let selected = self.selected == Some(Node::Context(name.clone()))
-            || (self.selected.is_none() && context.current);
-        let hint = if context.current {
-            Some("current".into())
-        } else {
-            None
-        };
-        kube_row(
+        let menu_name = name.clone();
+        let current = context.current;
+        let selected = self.selected == Some(Node::Context(name.clone()));
+        let hint = current.then(|| "current".into());
+        let row = kube_row(
             TreeRow {
                 id: selector.clone().into(),
                 depth: 2,
@@ -622,9 +652,46 @@ impl KubeSection {
             },
             theme,
         )
-        .debug_selector(move || selector.clone())
-        .on_click(cx.listener(move |this, _, _, cx| this.kube.switch_context(clicked.clone(), cx)))
-        .into_any_element()
+        .debug_selector({
+            let selector = selector.clone();
+            move || selector.clone()
+        });
+        // The current context carries a mark of its own after its name.
+        let row = if current {
+            let mark = format!("{selector}-current");
+            row.child(
+                div()
+                    .ml(px(SPACE_S))
+                    .flex_none()
+                    .debug_selector(move || mark.clone())
+                    .child(icon("general/check", theme)),
+            )
+        } else {
+            row
+        };
+        let row = row.on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            this.kube_select(Node::Context(clicked.clone()), cx);
+            if !current && event.click_count() >= 2 {
+                this.kube.switch_context(clicked.clone(), cx);
+            }
+        }));
+        let row = row.on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                this.kube_select(Node::Context(menu_name.clone()), cx);
+                this.kube
+                    .show_context_menu(menu_name.clone(), event.position, cx);
+            }),
+        );
+        // A dead cluster names the reason at its current context, the way the node does
+        // when the kubeconfig holds one context only.
+        let row = match (current, self.problem()) {
+            (true, Some(problem)) => row
+                .tooltip(move |_, cx| tooltip(problem.clone(), None, cx))
+                .tooltip_show_delay(TOOLTIP_CREATE_DELAY),
+            _ => row,
+        };
+        row.into_any_element()
     }
 
     fn namespace_row(
@@ -829,21 +896,53 @@ impl KubeSection {
         cx.notify();
     }
 
+    /// Writes the context into the kubeconfig in the background, then asks the tree again.
+    /// The write never reaches the cluster, so a dead cluster does not keep the user on it.
     fn switch_context(&mut self, name: String, cx: &mut Context<DockerPanel>) {
-        if self.context.as_deref() == Some(name.as_str())
-            || (self.context.is_none()
-                && self
-                    .snapshot
-                    .contexts
-                    .iter()
-                    .any(|context| context.current && context.name == name))
-        {
+        if self.snapshot.current_context == name {
             return;
         }
-        self.context = Some(name);
-        self.namespace = None;
-        self.stop(cx);
-        self.restart(cx);
+        let Some(cli) = self.cli.clone() else {
+            self.missing_cli(cx);
+            return;
+        };
+        let label = format!("use-context {name}");
+        self.busy.push(label.clone());
+        let task_name = name.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { cli.use_context(&task_name) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.kube.finish_context(label, name, result, cx);
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn finish_context(
+        &mut self,
+        label: String,
+        name: String,
+        result: Result<(), String>,
+        cx: &mut Context<DockerPanel>,
+    ) {
+        if let Some(index) = self.busy.iter().position(|busy| *busy == label) {
+            self.busy.remove(index);
+        }
+        match result {
+            Ok(()) => {
+                // The new context may carry another namespace: the tree starts from it.
+                self.namespace = None;
+                self.selected = Some(Node::Context(name));
+                self.stop(cx);
+                self.restart(cx);
+            }
+            Err(error) => self.tell("Use Context".to_owned(), error, cx),
+        }
         cx.notify();
     }
 
@@ -869,7 +968,14 @@ impl KubeSection {
                 };
                 (label.to_owned(), hint)
             }
-            Some(Node::Context(name)) => (format!("Context {name}"), String::new()),
+            Some(Node::Context(name)) => {
+                let hint = if self.snapshot.current_context == *name && self.problem().is_some() {
+                    "unreachable".to_owned()
+                } else {
+                    String::new()
+                };
+                (format!("Context {name}"), hint)
+            }
             Some(Node::Namespace(name)) => (format!("Namespace {name}"), String::new()),
             Some(Node::Kind(kind)) => (
                 kind.title().to_owned(),
@@ -899,8 +1005,21 @@ impl KubeSection {
             return vec![("refresh", "run/restart", "Refresh", true)];
         };
         match node {
-            Node::Root => vec![("refresh", "run/restart", "Refresh", true)],
-            Node::Context(_) | Node::Namespace(_) | Node::Kind(_) => Vec::new(),
+            Node::Root => {
+                let label = match &self.snapshot.cluster {
+                    ClusterState::Unreachable { .. } => "Retry",
+                    _ => "Refresh",
+                };
+                vec![("refresh", "run/restart", label, true)]
+            }
+            Node::Context(name) => {
+                if self.snapshot.current_context == *name && self.problem().is_some() {
+                    vec![("refresh", "run/restart", "Retry", true)]
+                } else {
+                    Vec::new()
+                }
+            }
+            Node::Namespace(_) | Node::Kind(_) => Vec::new(),
             Node::Key { .. } => vec![
                 ("show-value", "general/show", "Show Value", true),
                 ("copy-value", "general/copy", "Copy Value", true),
@@ -1055,6 +1174,14 @@ impl KubeSection {
             return revealed_view(name, value, &self.scroll_value, theme, window, cx);
         }
         if self.lines.is_empty() {
+            let explains_cluster = match &self.selected {
+                Some(Node::Root) => true,
+                Some(Node::Context(name)) => self.snapshot.current_context == *name,
+                _ => false,
+            };
+            if explains_cluster && let Some(problem) = self.problem() {
+                return crate::docker::problem_view(problem, theme);
+            }
             let text = match &self.selected {
                 Some(Node::Resource { kind, name }) => match self.resource(*kind, name) {
                     Some(resource) if resource.kind == ResourceKind::Secret => {
@@ -1064,6 +1191,10 @@ impl KubeSection {
                     _ => "Select a Pod for its log",
                 },
                 Some(Node::Key { .. }) => "The value stays hidden until Show Value",
+                Some(Node::Context(name)) if self.snapshot.current_context == *name => {
+                    "This context is in use"
+                }
+                Some(Node::Context(_)) => "Double-click a context to use it",
                 _ => "Select a Pod for its log",
             };
             return crate::docker::empty_state(text, theme);
@@ -1191,6 +1322,9 @@ impl KubeSection {
                     .detach();
                 self.selected = None;
                 cx.notify();
+            }
+            ("use-context", Some(Node::Context(name))) => {
+                self.switch_context(name, cx);
             }
             _ => {}
         }
@@ -1554,7 +1688,7 @@ impl KubeSection {
                 .update(cx, |_, window, cx| {
                     workspace.update(cx, |workspace, cx| match sent {
                         Ok(()) => workspace.show_tool(TERMINAL_TOOL, window, cx),
-                        Err(error) => workspace.notify_user("Terminal", error, cx),
+                        Err(error) => workspace.notify_error("Terminal", error, cx),
                     })
                 })
                 .ok();
@@ -1618,9 +1752,33 @@ impl KubeSection {
         let workspace = self.workspace.clone();
         cx.defer(move |cx| {
             workspace
-                .update(cx, |workspace, cx| workspace.notify_user(title, text, cx))
+                .update(cx, |workspace, cx| workspace.notify_error(title, text, cx))
                 .ok();
         });
+    }
+
+    /// The menu of a context that is not the current one: writing it into the kubeconfig.
+    fn show_context_menu(
+        &mut self,
+        name: String,
+        position: Point<Pixels>,
+        cx: &mut Context<DockerPanel>,
+    ) {
+        if self.snapshot.current_context == name {
+            return;
+        }
+        let panel = cx.weak_entity();
+        let entry = MenuEntry::new("Use Context", move |_, cx| {
+            panel
+                .update(cx, |this, cx| this.kube.switch_context(name.clone(), cx))
+                .ok();
+        })
+        .icon("general/check");
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_menu(position, vec![entry], cx)
+            })
+            .ok();
     }
 
     fn show_resource_menu(
@@ -2133,6 +2291,7 @@ fn apply_document(
     if document.name.is_empty() {
         notify(
             &workspace,
+            NotificationLevel::Warning,
             "Kubernetes",
             "The document has no metadata.name",
             cx,
@@ -2140,7 +2299,13 @@ fn apply_document(
         return;
     }
     let Some(cli) = cli_of(cx) else {
-        notify(&workspace, "Kubernetes", NO_CLI, cx);
+        notify(
+            &workspace,
+            NotificationLevel::Warning,
+            "Kubernetes",
+            NO_CLI,
+            cx,
+        );
         return;
     };
     let task = cx
@@ -2152,9 +2317,21 @@ fn apply_document(
             cx.update(|_, cx| match result {
                 Ok(output) => {
                     let text = first_line(&output).unwrap_or_else(|| "applied".to_owned());
-                    notify(&workspace, "Apply to Cluster", &text, cx);
+                    notify(
+                        &workspace,
+                        NotificationLevel::Info,
+                        "Apply to Cluster",
+                        &text,
+                        cx,
+                    );
                 }
-                Err(error) => notify(&workspace, "Apply to Cluster", &error, cx),
+                Err(error) => notify(
+                    &workspace,
+                    NotificationLevel::Error,
+                    "Apply to Cluster",
+                    &error,
+                    cx,
+                ),
             })
             .ok();
         })
@@ -2171,6 +2348,7 @@ fn delete_document(
     if document.name.is_empty() {
         notify(
             &workspace,
+            NotificationLevel::Warning,
             "Kubernetes",
             "The document has no metadata.name",
             cx,
@@ -2178,7 +2356,13 @@ fn delete_document(
         return;
     }
     let Some(cli) = cli_of(cx) else {
-        notify(&workspace, "Kubernetes", NO_CLI, cx);
+        notify(
+            &workspace,
+            NotificationLevel::Warning,
+            "Kubernetes",
+            NO_CLI,
+            cx,
+        );
         return;
     };
     let cli =
@@ -2204,8 +2388,20 @@ fn delete_document(
                     cx.spawn(async move |cx| {
                         let result = task.await;
                         cx.update(|cx| match result {
-                            Ok(()) => notify(&weak, "Delete from Cluster", "deleted", cx),
-                            Err(error) => notify(&weak, "Delete from Cluster", &error, cx),
+                            Ok(()) => notify(
+                                &weak,
+                                NotificationLevel::Info,
+                                "Delete from Cluster",
+                                "deleted",
+                                cx,
+                            ),
+                            Err(error) => notify(
+                                &weak,
+                                NotificationLevel::Error,
+                                "Delete from Cluster",
+                                &error,
+                                cx,
+                            ),
                         });
                     })
                     .detach();
@@ -2226,12 +2422,19 @@ fn diff_document(
     cx: &mut App,
 ) {
     let Some(cli) = cli_of(cx) else {
-        notify(&workspace, "Kubernetes", NO_CLI, cx);
+        notify(
+            &workspace,
+            NotificationLevel::Warning,
+            "Kubernetes",
+            NO_CLI,
+            cx,
+        );
         return;
     };
     if document.name.is_empty() {
         notify(
             &workspace,
+            NotificationLevel::Warning,
             "Kubernetes",
             "The document has no metadata.name",
             cx,
@@ -2242,7 +2445,13 @@ fn diff_document(
         .try_global::<crate::git::ActiveGit>()
         .map(|git| git.0.clone())
     else {
-        notify(&workspace, "Diff with Cluster", "Git is not ready", cx);
+        notify(
+            &workspace,
+            NotificationLevel::Warning,
+            "Diff with Cluster",
+            "Git is not ready",
+            cx,
+        );
         return;
     };
     let kind = document.kind_word.clone();
@@ -2261,8 +2470,16 @@ fn diff_document(
     window
         .spawn(cx, async move |cx| match task.await {
             Ok(None) => {
-                cx.update(|_, cx| notify(&workspace, "Diff with Cluster", "No differences", cx))
-                    .ok();
+                cx.update(|_, cx| {
+                    notify(
+                        &workspace,
+                        NotificationLevel::Info,
+                        "Diff with Cluster",
+                        "No differences",
+                        cx,
+                    )
+                })
+                .ok();
             }
             Ok(Some(cluster)) => {
                 let weak = workspace.clone();
@@ -2283,8 +2500,16 @@ fn diff_document(
                 .ok();
             }
             Err(error) => {
-                cx.update(|_, cx| notify(&workspace, "Diff with Cluster", &error, cx))
-                    .ok();
+                cx.update(|_, cx| {
+                    notify(
+                        &workspace,
+                        NotificationLevel::Error,
+                        "Diff with Cluster",
+                        &error,
+                        cx,
+                    )
+                })
+                .ok();
             }
         })
         .detach();
@@ -2296,9 +2521,19 @@ fn cli_of(cx: &App) -> Option<Kubectl> {
     find_cli(cx)
 }
 
-fn notify(workspace: &WeakEntity<Workspace>, title: &str, text: &str, cx: &mut App) {
+fn notify(
+    workspace: &WeakEntity<Workspace>,
+    level: NotificationLevel,
+    title: &str,
+    text: &str,
+    cx: &mut App,
+) {
     workspace
-        .update(cx, |workspace, cx| workspace.notify_user(title, text, cx))
+        .update(cx, |workspace, cx| match level {
+            NotificationLevel::Info => workspace.notify_user(title, text, cx),
+            NotificationLevel::Warning => workspace.notify_warning(title, text, cx),
+            NotificationLevel::Error => workspace.notify_error(title, text, cx),
+        })
         .ok();
 }
 

@@ -265,8 +265,8 @@ fn a_group_tick_takes_its_files_and_leaves_the_other_group_as_it_was(cx: &mut Te
         "the tick of Changes takes its files off"
     );
     assert!(
-        ticked(cx, "scratch/notes.txt"),
-        "the tick of Changes leaves Unversioned Files as it was"
+        !ticked(cx, "scratch/notes.txt"),
+        "the tick of Changes leaves Unversioned Files as it was, and an untracked file starts without a tick"
     );
 
     click(cx, window, tick);

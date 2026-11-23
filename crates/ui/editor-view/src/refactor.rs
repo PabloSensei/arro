@@ -8,14 +8,16 @@ use ::platform;
 use futures_channel::mpsc::UnboundedReceiver;
 use futures_util::StreamExt;
 use lang_api::{
-    ActionEntry, ActionKind, Confidence, DocumentEdit, DocumentSpot, ExtractKind, MoveDestination,
-    MoveKind, MovePlace, MoveQuery, MoveRequest, PrepareRename, RenamePosition, RenameQuery,
-    SelectionQuery, SourceSpan, TextSpan, WorkspaceChange, apply_to_text, ask,
+    ActionEntry, ActionKind, Confidence, DocumentEdit, DocumentSpot, ExpressionTypePlace,
+    ExtractKind, MoveDestination, MoveKind, MovePlace, MoveQuery, MoveRequest, NameRole,
+    PrepareRename, RenamePosition, RenameQuery, SelectionQuery, SourceSpan, TextPoint, TextSpan,
+    WorkspaceChange, apply_to_text, ask,
 };
 use text_core::{EditKind, TextStore};
 use ui_kit::*;
 
 use crate::actions::{Own, Pick};
+use crate::declaration::Declaration;
 use crate::rename::{
     NOT_READY, PrepareOutcome, REFUSED, RenameInPlace, WAITING_FOR_LANGUAGE, can_rename_in_place,
     prepare_outcome,
@@ -104,11 +106,133 @@ fn name_at(text: &str, position: &RenamePosition) -> Option<String> {
     text.get(start..end).map(str::to_owned)
 }
 
+/// The one line a list shows for an expression: its text with the runs of spaces and
+/// the line breaks of a multi-line expression folded into single spaces.
+fn expression_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The places an extract action replaces. The declaration it inserts is a place with
+/// no text, not an occurrence it replaces.
+fn replaced_places(entry: &ActionEntry) -> usize {
+    entry
+        .edits
+        .iter()
+        .flat_map(|source| &source.edits)
+        .filter(|edit| edit.span.start != edit.span.end)
+        .count()
+}
+
 /// The text of the file after the edits of the entry, or `None` when the entry has no
 /// edits for it.
 fn text_after(entry: &ActionEntry, uri: &str, text: &str) -> Option<String> {
     let source = entry.edits.iter().find(|source| source.uri == uri)?;
     Some(apply_to_text(text, &source.edits))
+}
+
+/// The role of the name an action introduces, by the kind of the action. An Introduce
+/// Parameter of an object has no name the editor suggests.
+fn name_role(entry: &ActionEntry) -> Option<NameRole> {
+    let code = entry.code.as_deref()?;
+    if code.starts_with("refactor.introduce.parameter.object") {
+        None
+    } else if code.starts_with("refactor.introduce.parameter") {
+        Some(NameRole::Parameter)
+    } else if code.starts_with("refactor.extract.variable") {
+        Some(NameRole::Variable)
+    } else if code.starts_with("refactor.extract.constant") {
+        Some(NameRole::Constant)
+    } else if code.starts_with("refactor.extract.field") {
+        Some(NameRole::Field)
+    } else {
+        None
+    }
+}
+
+/// The expression an action replaces in a file, and the text it puts in its place.
+struct Replaced {
+    /// The expression, as a byte range of the text before the change.
+    range: Range<usize>,
+    text: String,
+    /// How far the edits before the expression move the text, in bytes.
+    shift: isize,
+}
+
+/// The expression an action replaces in the file `uri`: the only replacement of the action,
+/// or the one the caret is in when there are several. `offset` converts the places of the
+/// edits to bytes.
+fn replaced_expression(
+    entry: &ActionEntry,
+    uri: &str,
+    offset: impl Fn(TextPoint) -> usize,
+    caret: usize,
+) -> Option<Replaced> {
+    let source = entry.edits.iter().find(|source| source.uri == uri)?;
+    // The order `apply_to_text` applies the edits in, so the shift is the one it makes.
+    let mut edits: Vec<(Range<usize>, &str)> = source
+        .edits
+        .iter()
+        .map(|edit| {
+            let start = offset(edit.span.start);
+            let end = offset(edit.span.end).max(start);
+            (start..end, edit.text.as_str())
+        })
+        .collect();
+    edits.sort_by_key(|(range, _)| (range.start, range.end));
+    let replacing: Vec<usize> = (0..edits.len())
+        .filter(|&index| !edits[index].0.is_empty())
+        .collect();
+    let index = match replacing.as_slice() {
+        [only] => *only,
+        _ => replacing.iter().copied().find(|&index| {
+            let range = &edits[index].0;
+            range.start <= caret && caret <= range.end
+        })?,
+    };
+    let shift: isize = edits[..index]
+        .iter()
+        .map(|(range, text)| text.len() as isize - range.len() as isize)
+        .sum();
+    let (range, text) = edits[index].clone();
+    Some(Replaced {
+        range,
+        text: text.to_owned(),
+        shift,
+    })
+}
+
+/// The place of the name an Introduce Parameter gave the parameter, in the text after the
+/// change: the expression it replaced now holds that name. `None` unless the text there is
+/// the name the replacement put, so that a place is never guessed.
+fn introduced_name_place(
+    entry: &ActionEntry,
+    uri: &str,
+    text: &str,
+    replaced: &Replaced,
+) -> Option<RenamePosition> {
+    let after = text_after(entry, uri, text)?;
+    let at = usize::try_from(replaced.range.start as isize + replaced.shift).ok()?;
+    if !after.get(at..)?.starts_with(replaced.text.as_str()) {
+        return None;
+    }
+    Some(RenamePosition {
+        uri: uri.to_owned(),
+        offset: after.get(..at)?.encode_utf16().count() as u32,
+        length: replaced.text.encode_utf16().count() as u32,
+    })
+}
+
+/// The name a parameter hint shows: its label without the colon after it, when the label is
+/// a name.
+fn parameter_label(label: &str) -> Option<String> {
+    let name = label.trim().strip_suffix(':')?.trim_end();
+    let mut characters = name.chars();
+    let identifier = characters
+        .next()
+        .is_some_and(|first| first.is_alphabetic() || first == '_' || first == '$')
+        && characters
+            .all(|character| character.is_alphanumeric() || character == '_' || character == '$');
+    identifier.then(|| name.to_owned())
 }
 
 /// Shift+F6: the new name is typed here, not into the text. The first Enter asks
@@ -253,6 +377,28 @@ impl ExtractNameField {
     pub fn visibility_line(&self) -> Option<&'static str> {
         self.visibility.map(Visibility::label)
     }
+}
+
+/// How long a refactoring waits for the language before the hint under the caret says that
+/// the editor is still looking for expressions, in milliseconds.
+const LOOKING_HINT_DELAY_MS: u64 = 500;
+/// The hint under the caret of a long wait.
+const LOOKING_FOR_EXPRESSIONS: &str = "Looking for expressions…";
+
+/// A refactoring that waits for the language: the expressions under the caret, then the
+/// actions of the place they name. The wait stands until its answer decides what the window
+/// shows. Escape, another action of the editor, a move of the caret, an edit of the text or
+/// the loss of the focus takes it back, and the answers of a taken-back wait are dropped.
+pub(crate) struct RefactorWait {
+    /// The number of the wait. An answer is used only while its number still stands.
+    token: u64,
+    /// The caret and the version of the text when the wait began.
+    caret: usize,
+    version: u64,
+    /// The question on its way. Dropping it cancels the question at the language.
+    _question: Option<Task<()>>,
+    /// The hint of a long wait. Dropping it hides the hint, when no answer came in time.
+    _hint: Option<Task<()>>,
 }
 
 /// What a refactoring key asks the server for: a prefix of the kind of its action.
@@ -472,6 +618,131 @@ fn under_source_root(destinations: &[MoveDestination], folder: &Path) -> bool {
         let relative = root.get(1..).unwrap_or(&[]);
         contains(&target, relative)
     })
+}
+
+/// The groups of Refactor This, in the order IDEA shows them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum RefactorGroup {
+    /// The name of the element: Rename, Change Signature, Move, Copy, Safe Delete.
+    Names,
+    /// Extract and introduce: the extractions of values, members and types.
+    Extractions,
+    /// The members of the type hierarchy: Pull Members Up, Push Members Down.
+    Hierarchy,
+    /// Inline, and the rows of the server that name none of the groups above.
+    Other,
+}
+
+/// The group and the place in it of a row of the editor.
+fn own_place(own: Own) -> (RefactorGroup, usize) {
+    use RefactorGroup::{Extractions, Hierarchy, Names, Other};
+    match own {
+        Own::Rename => (Names, 0),
+        Own::ChangeSignature => (Names, 1),
+        Own::Move => (Names, 2),
+        Own::Copy => (Names, 3),
+        Own::SafeDelete => (Names, 4),
+        Own::ExtractMethod => (Extractions, 0),
+        Own::ExtractVariable => (Extractions, 1),
+        Own::ExtractField => (Extractions, 2),
+        Own::ExtractConstant => (Extractions, 3),
+        Own::IntroduceParameter => (Extractions, 4),
+        Own::IntroduceParameterObject => (Extractions, 5),
+        Own::ExtractSuperclass => (Extractions, 7),
+        Own::PullMembersUp => (Hierarchy, 0),
+        Own::PushMembersDown => (Hierarchy, 1),
+        Own::Inline => (Other, 0),
+    }
+}
+
+/// The place of the server's extractions in their group, by the prefix of the code of the
+/// action. A longer prefix comes first, since a shorter one is a prefix of it too.
+const EXTRACTION_PLACES: [(&str, usize); 8] = [
+    ("refactor.introduce.parameter.object", 5),
+    ("refactor.introduce.parameter", 4),
+    ("refactor.extract.function", 0),
+    ("refactor.extract.variable", 1),
+    ("refactor.extract.field", 2),
+    ("refactor.extract.constant", 3),
+    ("refactor.extract.interface", 6),
+    ("refactor.extract.superclass", 7),
+];
+
+/// The note of Ctrl+Alt+N at a declaration of a library. The word is the kind the server's
+/// inline row names; a method when no row names one.
+fn library_inline_message(entries: &[ActionEntry]) -> String {
+    let title = entries
+        .iter()
+        .find(|entry| crate::actions::is_inline_action(entry))
+        .map_or_else(String::new, |entry| entry.title.to_lowercase());
+    let kind = if title.contains("constant") {
+        "constant"
+    } else if title.contains("variable") {
+        "variable"
+    } else {
+        "method"
+    };
+    format!("Cannot inline a {kind} of a library")
+}
+
+/// The group and the place of a row of the server, by the kind of its action. A kind that
+/// no group names goes to the end of its group, or of the list.
+fn server_place(code: &str) -> (RefactorGroup, usize) {
+    if code.starts_with("refactor.change.signature") {
+        return (RefactorGroup::Names, 1);
+    }
+    if let Some((_, place)) = EXTRACTION_PLACES
+        .iter()
+        .find(|(kind, _)| code.starts_with(*kind))
+    {
+        return (RefactorGroup::Extractions, *place);
+    }
+    if code.starts_with("refactor.extract.") || code.starts_with("refactor.introduce.") {
+        return (RefactorGroup::Extractions, usize::MAX);
+    }
+    if code.starts_with("refactor.pull.up") {
+        return (RefactorGroup::Hierarchy, 0);
+    }
+    if code.starts_with("refactor.push.down") {
+        return (RefactorGroup::Hierarchy, 1);
+    }
+    (RefactorGroup::Other, usize::MAX)
+}
+
+/// The names of Refactor This as the menu spells them. The ellipsis marks a refactoring that
+/// opens a dialog, a form or a field of its own, as the menu of the editor does.
+const MENU_NAMES: [&str; 16] = [
+    "Rename...",
+    "Change Signature...",
+    "Move...",
+    "Copy...",
+    "Safe Delete...",
+    "Extract Method...",
+    "Extract Variable...",
+    "Extract Field...",
+    "Extract Constant...",
+    "Introduce Parameter...",
+    "Introduce Parameter Object...",
+    "Extract Interface...",
+    "Extract Superclass...",
+    "Pull Members Up...",
+    "Push Members Down...",
+    "Inline...",
+];
+
+/// The label of a row of Refactor This as the menu spells it. A name the menu knows takes
+/// its spelling and its ellipsis, in any case and with or without the ellipsis; any other
+/// label stays as the server gave it.
+fn menu_label(label: &str) -> String {
+    let bare = label
+        .trim()
+        .trim_end_matches("...")
+        .trim_end_matches('…')
+        .trim_end();
+    MENU_NAMES
+        .iter()
+        .find(|name| name.trim_end_matches("...").eq_ignore_ascii_case(bare))
+        .map_or_else(|| label.to_owned(), |name| (*name).to_owned())
 }
 
 impl EditorView {
@@ -1609,9 +1880,12 @@ impl EditorView {
                 .all(|source| source.uri == lsp.uri || source.edits.is_empty())
     }
 
-    /// Opens the field of the name the server introduced, with the name it chose as the
-    /// text: the user types over it, as IDEA renames the new name in place. An action
-    /// without such a place applies as it is.
+    /// Opens the field of the name the server introduced. The field shows the name the
+    /// language suggests when it has one, and the name of the server otherwise: the user
+    /// types over it, and Enter applies the refactoring with that name through the rename.
+    /// An action without such a place applies as it is. An Introduce Parameter opens the
+    /// field only with a suggestion, since its name is the text its edits put in place of
+    /// the expression.
     pub(crate) fn start_extract_name(
         &mut self,
         version: i32,
@@ -1626,11 +1900,26 @@ impl EditorView {
             };
             this.apply_change_labeled(version, change, label, cx);
         };
-        let Some(rename) = entry.rename.clone() else {
-            apply(self, cx);
+        let role = name_role(&entry);
+        let Some(lsp) = &self.lsp else {
             return;
         };
-        let Some(lsp) = &self.lsp else {
+        let Some(state) = &self.state else {
+            return;
+        };
+        let text = state.text();
+        let store = state.store();
+        let caret = state.selections().primary().head;
+        let replaced =
+            replaced_expression(&entry, &lsp.uri, |point| offset_at(&store, point), caret);
+        let placed = match role {
+            Some(NameRole::Parameter) => replaced
+                .as_ref()
+                .and_then(|replaced| introduced_name_place(&entry, &lsp.uri, &text, replaced)),
+            _ => entry.rename.clone(),
+        };
+        let Some(rename) = placed else {
+            apply(self, cx);
             return;
         };
         if rename.uri != lsp.uri
@@ -1642,10 +1931,7 @@ impl EditorView {
             apply(self, cx);
             return;
         }
-        let Some(state) = &self.state else {
-            return;
-        };
-        let Some(after) = text_after(&entry, &lsp.uri, &state.text()) else {
+        let Some(after) = text_after(&entry, &lsp.uri, &text) else {
             apply(self, cx);
             return;
         };
@@ -1657,6 +1943,23 @@ impl EditorView {
             apply(self, cx);
             return;
         }
+        let suggested = match (role, replaced.as_ref()) {
+            (Some(role), Some(replaced)) => {
+                // The parameter hint before the expression names the parameter it fills.
+                let hint = state
+                    .inlays()
+                    .iter()
+                    .find(|inlay| inlay.offset == replaced.range.start)
+                    .and_then(|inlay| parameter_label(&inlay.text));
+                lsp.support
+                    .suggest_name(&text, replaced.range.clone(), role, hint.as_deref())
+            }
+            _ => None,
+        };
+        if role == Some(NameRole::Parameter) && suggested.is_none() {
+            apply(self, cx);
+            return;
+        }
         let at = state.selections().primary().head;
         let label = label
             .unwrap_or_else(|| Refactoring::from_code(entry.code.as_deref().unwrap_or_default()));
@@ -1664,6 +1967,7 @@ impl EditorView {
             .code
             .as_deref()
             .is_some_and(|code| code.starts_with("refactor.extract.function"));
+        let shown = suggested.unwrap_or_else(|| default_name.clone());
         if let Some(lsp) = &mut self.lsp {
             lsp.completion = None;
             lsp.actions = None;
@@ -1673,7 +1977,7 @@ impl EditorView {
             lsp.name = Some(ExtractNameField {
                 at,
                 label,
-                text: default_name.clone(),
+                text: shown,
                 selected: true,
                 entry,
                 version,
@@ -1683,6 +1987,15 @@ impl EditorView {
             });
         }
         cx.notify();
+    }
+
+    /// The text of the name field of an extraction, while the field is open.
+    pub fn name_field_text(&self) -> Option<String> {
+        self.lsp
+            .as_ref()?
+            .name
+            .as_ref()
+            .map(|field| field.text.clone())
     }
 
     /// Typed text goes to an open extract name field. The first character replaces the
@@ -2191,8 +2504,9 @@ impl EditorView {
         }
     }
 
-    /// Ctrl+Alt+Shift+T: every refactoring the server offers at the selection, then the
-    /// ones of the editor that the server did not name, each with its key.
+    /// Ctrl+Alt+Shift+T: every refactoring the server offers at the selection and the ones
+    /// of the editor that the server did not name, each with its key. The rows fall into
+    /// the groups of IDEA under the heading Refactor This, and the first row is selected.
     pub(crate) fn refactor_this(&mut self, cx: &mut Context<Self>) {
         let Some(span) = self.selection_span() else {
             return;
@@ -2306,8 +2620,9 @@ impl EditorView {
             .collect();
         self.ask_actions(span, only, cx, move |this, _, caret, entries, cx| {
             let mut codes = Vec::new();
-            let mut rows: Vec<Pick> = Vec::new();
-            for entry in entries {
+            // Each row says whether it inlines a symbol: those rows wait for the declaration.
+            let mut rows: Vec<(RefactorGroup, usize, Pick, bool)> = Vec::new();
+            for mut entry in entries {
                 let code = entry.code.clone().unwrap_or_default();
                 codes.push(code.clone());
                 // A move of the server needs a destination of its own; the editor's
@@ -2315,35 +2630,165 @@ impl EditorView {
                 if code.starts_with("refactor.move") {
                     continue;
                 }
+                let inline = code.starts_with("refactor.inline");
+                let (group, place) = server_place(&code);
+                entry.title = menu_label(&entry.title);
                 if code.starts_with("refactor.change.signature") {
-                    rows.push(Pick::ChangeSignature { label: entry.title });
+                    let pick = Pick::ChangeSignature { label: entry.title };
+                    rows.push((group, place, pick, inline));
                     continue;
                 }
                 if let Some(handle) = entry.handle {
-                    rows.push(Pick::Form {
+                    let pick = Pick::Form {
                         label: entry.title,
                         handle,
-                    });
+                    };
+                    rows.push((group, place, pick, inline));
                     continue;
                 }
                 if !entry.edits.is_empty() || !entry.renames.is_empty() {
-                    rows.push(Pick::Action(entry));
+                    rows.push((group, place, Pick::Action(entry), inline));
                 }
             }
-            // The editor's own refactorings come after the contextual ones of the
-            // server, and only when the server named no action of that kind.
+            // The editor's own refactorings take their place in their group, and only when
+            // the server named no action of that kind. Its Inline waits for the declaration too.
             for ((own, label, _, _, code), hint) in own.into_iter().zip(hints) {
                 if code.is_some_and(|code| codes.iter().any(|known| known.starts_with(code))) {
                     continue;
                 }
-                rows.push(Pick::Refactor {
-                    label: label.to_owned(),
+                let (group, place) = own_place(own);
+                let pick = Pick::Refactor {
+                    label: menu_label(label),
                     hint,
                     own,
-                });
+                };
+                rows.push((group, place, pick, own == Own::Inline));
             }
-            this.show_picks(caret, rows, "No refactorings here", cx);
+            let (inline_rows, rest): (Vec<_>, Vec<_>) =
+                rows.into_iter().partition(|(_, _, _, inline)| *inline);
+            let rest: Vec<(RefactorGroup, usize, Pick)> = rest
+                .into_iter()
+                .map(|(group, place, pick, _)| (group, place, pick))
+                .collect();
+            let inline_rows: Vec<(RefactorGroup, usize, Pick)> = inline_rows
+                .into_iter()
+                .map(|(group, place, pick, _)| (group, place, pick))
+                .collect();
+            // A language with no navigation keeps its rows. Otherwise the rows of an inline
+            // refactoring wait for the declaration at the caret, and the list opens without them.
+            let (shown, waiting) = match this.known_declaration() {
+                Some(declaration) if declaration.offers_inline() => {
+                    let mut shown = rest;
+                    shown.extend(inline_rows);
+                    (shown, Vec::new())
+                }
+                Some(_) => (rest, Vec::new()),
+                None if rest.is_empty() => (Vec::new(), inline_rows),
+                None => (rest, inline_rows),
+            };
+            if shown.is_empty() && !waiting.is_empty() {
+                // Nothing else to list: the list waits for the declaration instead of saying
+                // that there is no refactoring.
+                let task = this.ask_declaration(cx, move |this, declaration, cx| {
+                    let rows = if declaration == Declaration::Project {
+                        waiting
+                    } else {
+                        Vec::new()
+                    };
+                    this.show_refactor_rows(caret, rows, cx);
+                });
+                if let Some(task) = task {
+                    task.detach();
+                }
+                return;
+            }
+            // The question goes out before the list shows; the list does not wait for it.
+            let task = if waiting.is_empty() {
+                None
+            } else {
+                let version = this
+                    .state
+                    .as_ref()
+                    .map_or(0, |state| state.version() as i32);
+                this.ask_declaration(cx, move |this, declaration, cx| {
+                    if declaration == Declaration::Project {
+                        this.join_declared_refactorings(caret, version, waiting, cx);
+                    }
+                })
+            };
+            this.show_refactor_rows(caret, shown, cx);
+            if let Some(task) = task {
+                this.keep_declaration_task(Some(task));
+            }
         });
+    }
+
+    /// Shows the rows of Refactor This in their groups, with the heading and the separators
+    /// of the list. The sort is stable: a row keeps the order the server gave it in its group.
+    fn show_refactor_rows(
+        &mut self,
+        caret: usize,
+        mut rows: Vec<(RefactorGroup, usize, Pick)>,
+        cx: &mut Context<Self>,
+    ) {
+        rows.sort_by_key(|(group, place, _)| (*group, *place));
+        let listed = !rows.is_empty();
+        let groups: Vec<usize> = rows.iter().map(|(group, _, _)| *group as usize).collect();
+        let picks: Vec<Pick> = rows.into_iter().map(|(_, _, pick)| pick).collect();
+        self.show_picks(caret, picks, "No refactorings here", cx);
+        if listed && let Some(menu) = self.lsp.as_mut().and_then(|lsp| lsp.actions.as_mut()) {
+            menu.title = Some("Refactor This");
+            menu.groups = groups;
+        }
+    }
+
+    /// Adds the inline rows that the declaration allowed to the Refactor This list that is open
+    /// at the same caret and text. A row of the server's Inline comes last: its place is the
+    /// end of its group, and the group is the last of the list. The editor's own Inline comes
+    /// first in its group, which is its place.
+    fn join_declared_refactorings(
+        &mut self,
+        caret: usize,
+        version: i32,
+        rows: Vec<(RefactorGroup, usize, Pick)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .state
+            .as_ref()
+            .is_none_or(|state| state.version() as i32 != version)
+        {
+            return;
+        }
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        let Some(menu) = &mut lsp.actions else {
+            return;
+        };
+        if menu.at != caret
+            || menu.title != Some("Refactor This")
+            || menu.rows.iter().any(Pick::is_waiting)
+        {
+            return;
+        }
+        for (group, place, pick) in rows {
+            let len = menu.groups.len();
+            let index = if place == usize::MAX {
+                len
+            } else {
+                menu.groups
+                    .iter()
+                    .position(|known| *known >= group as usize)
+                    .unwrap_or(len)
+            };
+            menu.rows.insert(index, pick);
+            menu.groups.insert(index, group as usize);
+            if index <= menu.selected {
+                menu.selected += 1;
+            }
+        }
+        cx.notify();
     }
 
     /// Ctrl+Alt+M, V, F, C, P and Ctrl+Alt+N: the action of that kind for the selection.
@@ -2373,163 +2818,318 @@ impl EditorView {
             return;
         };
         let replies = ask(provider, SelectionQuery { spot, kind });
-        cx.spawn(async move |this, cx| {
+        // One wait covers the expressions and then the actions of the refactoring: the hint
+        // under the caret tells that the editor is still looking for either of them.
+        let token = self.begin_refactor_wait(true, cx);
+        let task = cx.spawn(async move |this, cx| {
             let answer = first(replies).await;
             this.update(cx, |this, cx| {
-                let Some((entries, _)) = answer else {
-                    this.refactor_span(refactoring, span, cx);
+                // A caret moved or a text edited since the question takes the wait back, even
+                // when the move did not pass through the editor's own paths.
+                this.follow_refactor_wait(cx);
+                if !this.refactor_waits(token) {
+                    return;
+                }
+                let entries = answer.map_or_else(Vec::new, |(entries, _)| entries);
+                let Some((text, store)) = this
+                    .state
+                    .as_ref()
+                    .map(|state| (state.text(), state.store()))
+                else {
+                    this.cancel_refactor_wait(cx);
                     return;
                 };
-                let Some(state) = &this.state else {
-                    return;
-                };
-                let text = state.text();
-                let found: Vec<(String, TextSpan)> = entries
+                let mut found: Vec<(String, TextSpan, usize)> = entries
                     .into_iter()
                     .filter(|entry| entry.length > 0)
                     .filter_map(|entry| {
                         let start = byte_at_utf16(&text, entry.offset)?;
                         let end = byte_at_utf16(&text, entry.offset + entry.length)?;
+                        // The list shows the expression as the file spells it: the server
+                        // normalizes the name it sends, and that loses the spaces of the
+                        // text. The name of the server stays as a fallback.
+                        let label = text
+                            .get(start..end)
+                            .map_or_else(|| entry.name.clone(), str::to_owned);
                         Some((
-                            entry.name,
+                            label,
                             TextSpan {
-                                start: point_at(&state.store(), start),
-                                end: point_at(&state.store(), end),
+                                start: point_at(&store, start),
+                                end: point_at(&store, end),
                             },
+                            end.saturating_sub(start),
                         ))
                     })
                     .collect();
-                match found.as_slice() {
-                    [] => this.refactor_span(refactoring, span, cx),
-                    [(_, found)] => this.refactor_span(refactoring, *found, cx),
+                // A server that names fewer than two expressions leaves the others around the
+                // caret to the tree of the language, as IDEA lists them. Only Introduce Variable
+                // takes them from the tree: the other extractions keep the server's answer.
+                if found.len() < 2 && matches!(refactoring, Refactoring::ExtractVariable) {
+                    let around = this
+                        .lsp
+                        .as_ref()
+                        .map(|lsp| lsp.support.expressions_at(&text, caret))
+                        .unwrap_or_default();
+                    for range in around {
+                        let span = TextSpan {
+                            start: point_at(&store, range.start),
+                            end: point_at(&store, range.end),
+                        };
+                        if found.iter().all(|(_, known, _)| *known != span) {
+                            found.push((text[range.clone()].to_owned(), span, range.len()));
+                        }
+                    }
+                }
+                // The expressions around the caret are nested: the innermost is the
+                // shortest, and IDEA lists it first.
+                found.sort_by_key(|(_, _, length)| *length);
+                found.dedup_by(|a, b| a.1 == b.1);
+                match found.len() {
+                    0 => this.refactor_span_waiting(refactoring, span, token, cx),
+                    1 => {
+                        let (_, found, _) = found.remove(0);
+                        this.refactor_span_waiting(refactoring, found, token, cx);
+                    }
                     _ => {
+                        this.end_refactor_wait(token, cx);
                         let rows = found
                             .into_iter()
-                            .map(|(label, span)| Pick::Expression {
-                                label,
+                            .map(|(label, span, _)| Pick::Expression {
+                                label: expression_line(&label),
                                 span,
                                 refactoring,
                             })
                             .collect();
                         this.show_picks(caret, rows, refactoring.missing(), cx);
+                        if let Some(menu) = this.lsp.as_mut().and_then(|lsp| lsp.actions.as_mut()) {
+                            menu.title = Some("Expressions");
+                        }
+                        if let Some(lsp) = &mut this.lsp {
+                            lsp.highlights.clear();
+                        }
+                        this.highlight_action_row();
+                        cx.notify();
                     }
                 }
             })
             .ok();
-        })
-        .detach();
+        });
+        self.keep_refactor_question(token, Some(task), cx);
     }
 
     /// The action of the refactoring for the span, which an extract with a choice of
-    /// expressions takes from the row the user picked.
+    /// expressions takes from the row the user picked. Inline of a declaration in a library
+    /// says so at the caret instead of running. The action waits in a wait of its own.
     pub(crate) fn refactor_span(
         &mut self,
         refactoring: Refactoring,
         span: TextSpan,
         cx: &mut Context<Self>,
     ) {
+        let token = self.begin_refactor_wait(false, cx);
+        self.refactor_span_waiting(refactoring, span, token, cx);
+    }
+
+    /// [`EditorView::refactor_span`] within the wait `token`, which the action ends.
+    fn refactor_span_waiting(
+        &mut self,
+        refactoring: Refactoring,
+        span: TextSpan,
+        token: u64,
+        cx: &mut Context<Self>,
+    ) {
         let only = Some(ActionKind::Refactor);
-        self.ask_actions(span, only, cx, move |this, version, caret, entries, cx| {
-            let mut found: Vec<ActionEntry> = entries
-                .into_iter()
-                .filter(|entry| {
-                    entry
-                        .code
-                        .as_deref()
-                        .is_some_and(|code| code.starts_with(refactoring.code()))
-                })
-                .collect();
-            match found.len() {
-                0 => this.show_note(caret, refactoring.missing(), cx),
-                1 => {
-                    let entry = found.remove(0);
-                    if let Some(handle) = entry.handle {
-                        cx.emit(EditorEvent::RefactorForm(handle));
-                        return;
-                    }
-                    this.apply_entry_labeled(version, entry, Some(refactoring.label()), cx);
-                }
-                _ => {
-                    // An extract of a value has two rows of the server, this place and
-                    // every place: they say what they replace before they run.
-                    let replacing = refactoring == Refactoring::ExtractVariable
-                        && found.iter().all(|entry| {
+        let task = self.ask_actions_task(
+            Some(token),
+            span,
+            only,
+            cx,
+            move |this, version, caret, entries, cx| {
+                let choose = move |this: &mut Self,
+                                   entries: Vec<ActionEntry>,
+                                   cx: &mut Context<Self>| {
+                    let mut found: Vec<ActionEntry> = entries
+                        .into_iter()
+                        .filter(|entry| {
                             entry
                                 .code
                                 .as_deref()
-                                .is_some_and(|code| code.starts_with("refactor.extract.variable"))
-                        });
-                    let mut all = false;
-                    let rows = found
-                        .into_iter()
-                        .filter_map(|entry| {
-                            let mut entry = entry;
-                            if replacing {
-                                let every = entry.title.to_lowercase().contains("all");
-                                if every && all {
-                                    return None;
-                                }
-                                all |= every;
-                                entry.title = if every {
-                                    // The declaration the extract inserts is a place
-                                    // without text, not an occurrence it replaces.
-                                    let places: usize = entry
-                                        .edits
-                                        .iter()
-                                        .flat_map(|source| &source.edits)
-                                        .filter(|edit| edit.span.start != edit.span.end)
-                                        .count();
-                                    format!("Replace all {places} occurrences")
-                                } else {
-                                    "Replace this occurrence only".to_owned()
-                                };
-                            }
-                            match entry.handle {
-                                Some(handle) => Some(Pick::Form {
-                                    label: entry.title,
-                                    handle,
-                                }),
-                                None if !entry.edits.is_empty() || !entry.renames.is_empty() => {
-                                    Some(Pick::Action(entry))
-                                }
-                                None => None,
-                            }
+                                .is_some_and(|code| code.starts_with(refactoring.code()))
                         })
                         .collect();
-                    this.show_picks(caret, rows, refactoring.missing(), cx);
+                    match found.len() {
+                        0 => this.show_note(caret, refactoring.missing(), cx),
+                        1 => {
+                            let entry = found.remove(0);
+                            if let Some(handle) = entry.handle {
+                                cx.emit(EditorEvent::RefactorForm(handle));
+                                return;
+                            }
+                            this.apply_entry_labeled(version, entry, Some(refactoring.label()), cx);
+                        }
+                        _ => {
+                            // An extract of a value has two rows of the server, this place and
+                            // every place: they say what they replace before they run.
+                            let replacing = refactoring == Refactoring::ExtractVariable
+                                && found.iter().all(|entry| {
+                                    entry.code.as_deref().is_some_and(|code| {
+                                        code.starts_with("refactor.extract.variable")
+                                    })
+                                });
+                            if replacing {
+                                let all = found
+                                    .iter()
+                                    .position(|entry| entry.title.to_lowercase().contains("all"));
+                                let places = all.map_or(0, |row| replaced_places(&found[row]));
+                                if places == 1 {
+                                    // One occurrence has no choice to make: the row of this
+                                    // place runs and the name of the new variable is typed
+                                    // over, as IDEA goes straight to the name.
+                                    let this_row = found
+                                        .iter()
+                                        .position(|entry| {
+                                            !entry.title.to_lowercase().contains("all")
+                                        })
+                                        .or(all)
+                                        .unwrap_or(0);
+                                    let entry = found.swap_remove(this_row);
+                                    if let Some(handle) = entry.handle {
+                                        cx.emit(EditorEvent::RefactorForm(handle));
+                                        return;
+                                    }
+                                    this.apply_entry_labeled(
+                                        version,
+                                        entry,
+                                        Some(refactoring.label()),
+                                        cx,
+                                    );
+                                    return;
+                                }
+                            }
+                            let mut all = false;
+                            let rows = found
+                                .into_iter()
+                                .filter_map(|entry| {
+                                    let mut entry = entry;
+                                    if replacing {
+                                        let every = entry.title.to_lowercase().contains("all");
+                                        if every && all {
+                                            return None;
+                                        }
+                                        all |= every;
+                                        entry.title = if every {
+                                            format!(
+                                                "Replace all {} occurrences",
+                                                replaced_places(&entry)
+                                            )
+                                        } else {
+                                            "Replace this occurrence only".to_owned()
+                                        };
+                                    }
+                                    match entry.handle {
+                                        Some(handle) => Some(Pick::Form {
+                                            label: entry.title,
+                                            handle,
+                                        }),
+                                        None if !entry.edits.is_empty()
+                                            || !entry.renames.is_empty() =>
+                                        {
+                                            Some(Pick::Action(entry))
+                                        }
+                                        None => None,
+                                    }
+                                })
+                                .collect();
+                            this.show_picks(caret, rows, refactoring.missing(), cx);
+                            if replacing {
+                                if let Some(menu) =
+                                    this.lsp.as_mut().and_then(|lsp| lsp.actions.as_mut())
+                                {
+                                    menu.title = Some("Multiple occurrences found");
+                                }
+                                this.highlight_action_row();
+                                cx.notify();
+                            }
+                        }
+                    }
+                };
+                if refactoring != Refactoring::Inline {
+                    this.end_refactor_wait(token, cx);
+                    choose(this, entries, cx);
+                    return;
                 }
-            }
-        });
+                // Inline waits for the declaration too; the wait ends with that answer.
+                let message = library_inline_message(&entries);
+                let task = this.with_declaration(cx, move |this, declaration, cx| {
+                    if !this.end_refactor_wait(token, cx) {
+                        return;
+                    }
+                    if declaration == Declaration::Library {
+                        this.show_note(caret, message, cx);
+                    } else {
+                        choose(this, entries, cx);
+                    }
+                });
+                this.keep_refactor_question(token, task, cx);
+            },
+        );
+        self.keep_refactor_question(token, task, cx);
     }
 
-    /// Ctrl+Shift+P: the first line of the documentation's code, the declared type.
+    /// Ctrl+Shift+P: the type of the expression at the caret, or of the selection, as the
+    /// language gives it in one line. A literal has its type from the text; a name, a field or a
+    /// call takes it from the hover answer at the place the language names.
     pub(crate) fn expression_type(&mut self, cx: &mut Context<Self>) {
-        let Some((spot, caret)) = self.spot() else {
+        const NO_TYPE: &str = "No type here";
+        let Some((_, caret)) = self.spot() else {
             return;
         };
-        let Some(provider) = self.lsp.as_ref().and_then(|lsp| lsp.support.hover()) else {
+        let (Some(lsp), Some(state)) = (self.lsp.as_ref(), self.state.as_ref()) else {
             return;
         };
-        let replies = ask(provider, spot);
-        cx.spawn(async move |this, cx| {
-            let answer = first(replies).await;
-            this.update(cx, |this, cx| match answer {
-                Some((_, Confidence::Unknown)) => this.show_note(caret, NO_ANSWER, cx),
-                Some((text, _)) => {
-                    let line = text
-                        .0
-                        .lines()
-                        .map(str::trim)
-                        .find(|line| !line.is_empty() && !line.starts_with("```"))
-                        .map(str::to_owned);
-                    let shown = line.unwrap_or_else(|| "No type here".to_owned());
-                    this.show_note(caret, shown, cx);
-                }
-                None => {}
-            })
-            .ok();
-        })
-        .detach();
+        let support = lsp.support.clone();
+        let text = state.text();
+        let selection = state.selections().primary().range();
+        // Without a selection, the innermost expression that holds the caret.
+        let expression = if selection.is_empty() {
+            support
+                .expressions_at(&text, caret)
+                .into_iter()
+                .filter(|range| range.start <= caret && caret <= range.end)
+                .min_by_key(|range| range.len())
+        } else {
+            Some(selection)
+        };
+        let place =
+            expression.and_then(|expression| support.expression_type_place(&text, expression));
+        match place {
+            None => self.show_note(caret, NO_TYPE, cx),
+            Some(ExpressionTypePlace::Known(type_name)) => self.show_note(caret, type_name, cx),
+            Some(ExpressionTypePlace::Hover(offset)) => {
+                let Some(provider) = support.hover() else {
+                    return;
+                };
+                let Some(spot) = self.spot_at(offset) else {
+                    return;
+                };
+                let replies = ask(provider, spot);
+                cx.spawn(async move |this, cx| {
+                    let answer = first(replies).await;
+                    this.update(cx, |this, cx| match answer {
+                        Some((_, Confidence::Unknown)) => this.show_note(caret, NO_ANSWER, cx),
+                        Some((hover, _)) => {
+                            let shown = support
+                                .expression_type_from_hover(&text, offset, &hover.0)
+                                .unwrap_or_else(|| NO_TYPE.to_owned());
+                            this.show_note(caret, shown, cx);
+                        }
+                        None => {}
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
     }
 
     /// Ctrl+H: the window shows the type hierarchy of the type at the caret.
@@ -2547,6 +3147,139 @@ impl EditorView {
         }
         self.importing_note(caret, cx);
         cx.emit(EditorEvent::TypeHierarchy(spot));
+    }
+
+    /// Starts a wait of a refactoring, which takes back the wait before it. `hint` shows the
+    /// hint under the caret once the wait has lasted. Returns the number of the wait.
+    pub(crate) fn begin_refactor_wait(&mut self, hint: bool, cx: &mut Context<Self>) -> u64 {
+        self.cancel_refactor_wait(cx);
+        self.refactor_tokens += 1;
+        let token = self.refactor_tokens;
+        let (caret, version) = self.state.as_ref().map_or((0, 0), |state| {
+            (state.selections().primary().head, state.version())
+        });
+        let hint = hint.then(|| {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(LOOKING_HINT_DELAY_MS))
+                    .await;
+                this.update(cx, |this, cx| this.show_refactor_hint(token, cx))
+                    .ok();
+            })
+        });
+        self.refactor_wait = Some(RefactorWait {
+            token,
+            caret,
+            version,
+            _question: None,
+            _hint: hint,
+        });
+        token
+    }
+
+    /// Whether the wait `token` still stands. An answer of a wait that was taken back is
+    /// dropped.
+    pub(crate) fn refactor_waits(&self, token: u64) -> bool {
+        self.refactor_wait
+            .as_ref()
+            .is_some_and(|wait| wait.token == token)
+    }
+
+    /// Ends the wait `token` once its answer decides what the window shows. Returns false when
+    /// the wait was taken back, and then the answer is dropped.
+    pub(crate) fn end_refactor_wait(&mut self, token: u64, cx: &mut Context<Self>) -> bool {
+        if !self.refactor_waits(token) {
+            return false;
+        }
+        self.drop_refactor_wait(cx);
+        true
+    }
+
+    /// Takes the wait back: its question is cancelled at the language and its hint goes.
+    /// Returns whether a wait was standing.
+    pub(crate) fn cancel_refactor_wait(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.refactor_wait.is_none() {
+            return false;
+        }
+        self.drop_refactor_wait(cx);
+        true
+    }
+
+    fn drop_refactor_wait(&mut self, cx: &mut Context<Self>) {
+        // The hint is the note of the wait only while the wait stands; another message stays.
+        if let Some(lsp) = &mut self.lsp
+            && lsp
+                .note
+                .as_ref()
+                .is_some_and(|note| &*note.text == LOOKING_FOR_EXPRESSIONS)
+        {
+            lsp.note = None;
+        }
+        self.refactor_wait = None;
+        cx.notify();
+    }
+
+    /// Keeps the question of the wait `token`, so that taking the wait back cancels it. A
+    /// question that was not asked ends the wait, as no answer is coming to end it.
+    pub(crate) fn keep_refactor_question(
+        &mut self,
+        token: u64,
+        task: Option<Task<()>>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.refactor_waits(token) {
+            return;
+        }
+        match task {
+            Some(task) => {
+                if let Some(wait) = &mut self.refactor_wait {
+                    wait._question = Some(task);
+                }
+            }
+            None => {
+                self.end_refactor_wait(token, cx);
+            }
+        }
+    }
+
+    /// The editor lost the focus: a refactoring that waits for the language is taken back, and
+    /// the name of an extract that was open closes. Neither comes back with the focus.
+    pub(crate) fn leave_refactor(&mut self, cx: &mut Context<Self>) {
+        self.cancel_refactor_wait(cx);
+        if let Some(lsp) = &mut self.lsp
+            && lsp.name.take().is_some()
+        {
+            cx.notify();
+        }
+    }
+
+    /// The text or the caret moved: the wait asked about the place it stood in, so a move or
+    /// an edit takes it back. A change that keeps both leaves it standing.
+    pub(crate) fn follow_refactor_wait(&mut self, cx: &mut Context<Self>) {
+        let Some(wait) = &self.refactor_wait else {
+            return;
+        };
+        let Some(state) = &self.state else {
+            return;
+        };
+        let moved =
+            state.version() != wait.version || state.selections().primary().head != wait.caret;
+        if moved {
+            self.cancel_refactor_wait(cx);
+        }
+    }
+
+    /// The hint of a wait that has lasted. It stands under the caret until the answer or Escape.
+    fn show_refactor_hint(&mut self, token: u64, cx: &mut Context<Self>) {
+        let Some(at) = self
+            .refactor_wait
+            .as_ref()
+            .filter(|wait| wait.token == token)
+            .map(|wait| wait.caret)
+        else {
+            return;
+        };
+        self.show_note(at, LOOKING_FOR_EXPRESSIONS, cx);
     }
 }
 

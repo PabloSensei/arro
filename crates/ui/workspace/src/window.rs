@@ -31,8 +31,8 @@ use crate::editor::{
 use crate::external::{OpenRequests, OpenTarget, Request, open_target};
 use crate::launch::{AppInfo, Launch};
 use crate::layout::{
-    BookmarkLayout, DockState, Layout, PaneState, WindowPlacement, has_saved_layout, save_layout,
-    save_theme,
+    BookmarkLayout, DockState, Layout, Location, LocationLog, PaneState, WindowPlacement,
+    has_saved_layout, save_layout, save_theme,
 };
 use crate::pane::{Pane, Tab, active_after_removal, next_tab, previous_tab, remember_closed};
 use crate::run::{DebugControls, DebugRunState, RunControls, RunState};
@@ -106,7 +106,8 @@ actions!(
         PinTab,
         SaveAll,
         OpenFolder,
-        // The window only declares it, the project tree selects the file.
+        // The window only declares these: the Select In popup and the project tree answer them.
+        SelectIn,
         SelectInProject,
         ToggleProblems,
         ToggleUsages,
@@ -266,7 +267,7 @@ window_keys![
     ("ctrl-alt-shift-right", FocusNextGroup, None, None, Some("ctrl-alt-shift-right")),
     ("ctrl-alt-shift-left", FocusPreviousGroup, None, None, Some("ctrl-alt-shift-left")),
     ("ctrl-s", SaveAll, Some("Workspace"), Some("SaveAll"), None),
-    ("alt-f1", SelectInProject, None, Some("SelectIn"), None),
+    ("alt-f1", SelectIn, None, Some("SelectIn"), None),
     ("ctrl-alt-s", ShowSettings, None, Some("ShowSettings"), None),
     ("f2", NextProblem, Some("Workspace"), Some("GotoNextError"), None),
     ("shift-f2", PreviousProblem, Some("Workspace"), Some("GotoPreviousError"), None),
@@ -327,6 +328,15 @@ pub fn window_step(len: usize, current: usize, step: isize) -> Option<usize> {
     Some(((current as isize + step).rem_euclid(len)) as usize)
 }
 
+/// The end of `Dismiss` on the shell of a dialog, which answers the key before the window
+/// does. `closed` says the dialog closed a list or a menu of its own: the key stops there.
+/// Otherwise it goes on to the window, which closes the dialog.
+pub fn forward_dismiss(closed: bool, cx: &mut App) {
+    if !closed {
+        cx.propagate();
+    }
+}
+
 const SAVE_DELAY: Duration = Duration::from_millis(300);
 /// Files the edited list keeps.
 const RECENT_EDITED_LIMIT: usize = 50;
@@ -340,6 +350,9 @@ const SKIPPED_KEY: &str = "updates.skipped_version";
 const MENU_OPEN_DELAY: Duration = Duration::from_millis(220);
 /// How long a message of the status bar stays before it goes away.
 const STATUS_MESSAGE_TIME: Duration = Duration::from_secs(5);
+/// How long an informational notification stays before it goes away, as in IDEA. One
+/// that offers a button, or a warning or an error, waits for the user instead.
+pub const NOTIFICATION_TIME: Duration = Duration::from_secs(8);
 
 /// The build the distribution README names: the commit and its date.
 pub fn build_version() -> &'static str {
@@ -526,6 +539,8 @@ pub(crate) enum Overlay {
         keys: Vec<MenuShortcut>,
         /// The section of the menu bar this menu belongs to, when it was opened from it.
         bar: Option<usize>,
+        /// The heading above the rows, such as the class Go to Test looks tests for.
+        title: Option<SharedString>,
     },
     View {
         view: AnyView,
@@ -582,6 +597,8 @@ pub struct MenuRow {
 }
 
 pub(crate) struct Balloon {
+    /// How important the notification is: its icon, and whether it goes away on its own.
+    pub level: NotificationLevel,
     pub title: SharedString,
     pub text: SharedString,
     /// A button of the balloon, and the file it opens.
@@ -624,7 +641,12 @@ pub type CommandCheck = Rc<dyn Fn(&Workspace, &App) -> bool>;
 pub type ToolActivator = Rc<dyn Fn(&str, &mut App) -> bool>;
 
 /// Told which file became the active tab.
-pub type TabListener = Rc<dyn Fn(&Path, &mut Context<Workspace>)>;
+pub type TabListener = Rc<dyn Fn(&mut Workspace, &Path, &mut Context<Workspace>)>;
+/// Told which file lost its tab.
+pub type TabClosedHook = Rc<dyn Fn(&Path, &mut Context<Workspace>)>;
+
+/// The files of Recent Files that a layout saves with the tabs, the latest first.
+pub type RecentFilesSource = Rc<dyn Fn(&App) -> Vec<PathBuf>>;
 
 pub struct Workspace {
     pub(crate) root: PathBuf,
@@ -668,6 +690,8 @@ pub struct Workspace {
     pub(crate) recent: Vec<PathBuf>,
     /// Files edited in this project, the latest first, for Recent Files.
     recent_edited: Vec<PathBuf>,
+    /// The places of Recent Locations, the latest first.
+    recent_places: LocationLog,
     state_dir: PathBuf,
     settings_dir: PathBuf,
     pub(crate) overlay: Option<Overlay>,
@@ -793,8 +817,10 @@ pub struct Workspace {
     /// The commands whose menu row is grey while they do not apply.
     command_checks: HashMap<&'static str, CommandCheck>,
     tab_listener: Option<TabListener>,
+    /// Where the recent files of the layout come from; see `set_recent_files_source`.
+    recent_source: Option<RecentFilesSource>,
     /// The callbacks of the views that follow the files whose tabs close.
-    tab_closed_hooks: Vec<TabListener>,
+    tab_closed_hooks: Vec<TabClosedHook>,
     /// The buffers of files that no tab shows, by path: a view edits them through their
     /// text and Save All writes them.
     buffers: HashMap<PathBuf, EditorTab>,
@@ -1095,6 +1121,7 @@ impl Workspace {
             closed: Vec::new(),
             recent,
             recent_edited: layout.recent_edited.clone(),
+            recent_places: layout.recent_places.clone(),
             state_dir,
             settings_dir,
             overlay: None,
@@ -1169,6 +1196,7 @@ impl Workspace {
             handlers: HashMap::new(),
             command_checks: HashMap::new(),
             tab_listener: None,
+            recent_source: None,
             tab_closed_hooks: Vec::new(),
             buffers: HashMap::new(),
             placement: layout.window.or_else(|| placement_of(window, cx)),
@@ -1321,7 +1349,7 @@ impl Workspace {
         }
         let Some(current) = updater::parse_version(self.info.version) else {
             if !automatic {
-                self.notify_user(
+                self.notify_error(
                     "Update check failed",
                     format!("The build version {} is not a version", self.info.version),
                     cx,
@@ -1373,7 +1401,7 @@ impl Workspace {
             Err(error) => {
                 eprintln!("update check failed: {error}");
                 if !automatic {
-                    self.notify_user("Update check failed", error.to_string(), cx);
+                    self.notify_error("Update check failed", error.to_string(), cx);
                 }
             }
         }
@@ -1413,15 +1441,16 @@ impl Workspace {
             label: "Skip This Version".into(),
             action: BalloonAction::SkipUpdate,
         });
-        self.balloon = Some(Balloon {
-            title: format!("Arro {version} is available").into(),
-            text: line.into(),
-            action: None,
-            buttons,
-        });
-        self.balloon_visible = true;
-        self.balloon_serial += 1;
-        cx.notify();
+        self.show_balloon(
+            Balloon {
+                level: NotificationLevel::Info,
+                title: format!("Arro {version} is available").into(),
+                text: line.into(),
+                action: None,
+                buttons,
+            },
+            cx,
+        );
     }
 
     /// Keeps the offered version out of the automatic checks from now on.
@@ -1444,7 +1473,7 @@ impl Workspace {
             return;
         };
         let Ok(install) = updater::install_dir() else {
-            self.notify_user(
+            self.notify_error(
                 "The update did not install",
                 "The program folder is unknown",
                 cx,
@@ -1469,7 +1498,7 @@ impl Workspace {
                 Ok(program) => this.restart_after_update(program, cx),
                 Err(error) => {
                     this.installing_update = false;
-                    this.notify_user("The update did not install", error.to_string(), cx)
+                    this.notify_error("The update did not install", error.to_string(), cx)
                 }
             })
             .ok();
@@ -1494,7 +1523,7 @@ impl Workspace {
         }
         match crate::launch::spawn_project_after(&self.state_dir, &root, Some(std::process::id())) {
             Ok(()) => cx.quit(),
-            Err(error) => self.notify_user("Cannot restart the project", error.to_string(), cx),
+            Err(error) => self.notify_error("Cannot restart the project", error.to_string(), cx),
         }
     }
 
@@ -1517,7 +1546,7 @@ impl Workspace {
         );
         match started {
             Ok(()) => cx.quit(),
-            Err(error) => self.notify_user(
+            Err(error) => self.notify_error(
                 "The update is installed",
                 format!("Restart Arro: {error}"),
                 cx,
@@ -1616,7 +1645,7 @@ impl Workspace {
         if restored
             && let (Some(listener), Some(path)) = (self.tab_listener.clone(), self.active_path())
         {
-            listener(&path, cx);
+            listener(self, &path, cx);
         }
     }
 
@@ -2861,15 +2890,16 @@ impl Workspace {
             label: "README".into(),
             action: BalloonAction::Url(README_URL.to_owned()),
         });
-        self.balloon = Some(Balloon {
-            title,
-            text: details,
-            action: None,
-            buttons,
-        });
-        self.balloon_visible = true;
-        self.balloon_serial += 1;
-        cx.notify();
+        self.show_balloon(
+            Balloon {
+                level: NotificationLevel::Info,
+                title,
+                text: details,
+                action: None,
+                buttons,
+            },
+            cx,
+        );
     }
 
     /// What the project tree wants to be restored next time.
@@ -3401,7 +3431,7 @@ impl Workspace {
         self.focus_active(window, cx);
         self.layout_changed(cx);
         if let (Some(listener), Some(path)) = (self.tab_listener.clone(), self.active_path()) {
-            listener(&path, cx);
+            listener(self, &path, cx);
         }
         cx.notify();
     }
@@ -3512,6 +3542,23 @@ impl Workspace {
         self.recent_edited.insert(0, path.to_path_buf());
         self.recent_edited.truncate(RECENT_EDITED_LIMIT);
         self.layout_changed(cx);
+    }
+
+    /// Records a place for Recent Locations, the latest first.
+    pub fn remember_place(&mut self, place: Location) {
+        self.recent_places.push(place);
+    }
+
+    /// The places of Recent Locations, the latest first.
+    pub fn recent_places(&self) -> &[Location] {
+        self.recent_places.places()
+    }
+
+    /// Drops the places of files that are gone. Returns whether the log changed.
+    pub fn prune_recent_places(&mut self) -> bool {
+        let before = self.recent_places.places().len();
+        self.recent_places.retain(|place| place.path.is_file());
+        self.recent_places.places().len() != before
     }
 
     /// The folder with the settings file, and what plugins and keys add to it.
@@ -3743,7 +3790,7 @@ impl Workspace {
                 }
                 Err(error) => {
                     workspace.keymap_broken = true;
-                    workspace.notify_user(
+                    workspace.notify_error(
                         "Keymap",
                         format!("{KEYMAP_FILE} is not read: {error}"),
                         cx,
@@ -3821,7 +3868,7 @@ impl Workspace {
     }
 
     fn refuse_keymap_edit(&mut self, cx: &mut Context<Self>) {
-        self.notify_user(
+        self.notify_warning(
             "Keymap",
             format!("{KEYMAP_FILE} is broken and left as it is. Fix it and try again."),
             cx,
@@ -3910,7 +3957,7 @@ impl Workspace {
         self.focus_active(window, cx);
         self.layout_changed(cx);
         if let (Some(listener), Some(path)) = (self.tab_listener.clone(), self.active_path()) {
-            listener(&path, cx);
+            listener(self, &path, cx);
         }
         cx.notify();
     }
@@ -4407,7 +4454,7 @@ impl Workspace {
             if let Err(error) = start.await {
                 let text = error.to_string();
                 let report = |this: &mut Self, cx: &mut Context<Self>| {
-                    this.notify_user("Cannot open the project", text, cx)
+                    this.notify_error("Cannot open the project", text, cx)
                 };
                 this.update(cx, report).ok();
             }
@@ -4431,7 +4478,7 @@ impl Workspace {
             Request::Open(path) => path,
         };
         if !path.exists() {
-            self.notify_user(
+            self.notify_error(
                 "Cannot open",
                 format!("{} does not exist", path.display()),
                 cx,
@@ -4800,7 +4847,18 @@ impl Workspace {
         keys: Vec<MenuShortcut>,
         cx: &mut Context<Self>,
     ) {
-        self.show_menu_inner(position, entries, keys, None, cx);
+        self.show_menu_inner(position, entries, keys, None, None, cx);
+    }
+
+    /// A menu with a heading above its rows, such as the class Go to Test looks tests for.
+    pub fn show_menu_titled(
+        &mut self,
+        position: Point<Pixels>,
+        title: impl Into<SharedString>,
+        entries: Vec<MenuEntry>,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_menu_inner(position, entries, Vec::new(), None, Some(title.into()), cx);
     }
 
     /// The submenu of a section of the menu bar. The bar keeps answering the pointer
@@ -4812,7 +4870,7 @@ impl Workspace {
         entries: Vec<MenuEntry>,
         cx: &mut Context<Self>,
     ) {
-        self.show_menu_inner(position, entries, Vec::new(), bar, cx);
+        self.show_menu_inner(position, entries, Vec::new(), bar, None, cx);
     }
 
     fn show_menu_inner(
@@ -4821,6 +4879,7 @@ impl Workspace {
         mut entries: Vec<MenuEntry>,
         keys: Vec<MenuShortcut>,
         bar: Option<usize>,
+        title: Option<SharedString>,
         cx: &mut Context<Self>,
     ) {
         crate::chrome::with_menu_icons(&mut entries);
@@ -4834,6 +4893,7 @@ impl Workspace {
             geometry: MenuGeometry::default(),
             keys,
             bar,
+            title,
         });
         self.focus_menu(cx);
         cx.notify();
@@ -4879,7 +4939,9 @@ impl Workspace {
             })
     }
 
-    /// Escape: a submenu closes first, then the menu itself.
+    /// Escape: a submenu closes first, then the menu itself. A dialog closes the lists of
+    /// its own before this runs: its shell answers `Dismiss` and passes it on with
+    /// [`forward_dismiss`] only when none of them was open.
     pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(Overlay::Menu { state, .. }) = self.overlay.as_mut()
             && state.close_submenu()
@@ -4928,6 +4990,14 @@ impl Workspace {
         match self.overlay.as_ref()? {
             Overlay::Menu { entries, .. } => Some(entries),
             Overlay::View { rows, .. } => rows.as_deref(),
+        }
+    }
+
+    /// The heading of the open menu, such as the class of Go to Test.
+    pub fn menu_title(&self) -> Option<&str> {
+        match self.overlay.as_ref()? {
+            Overlay::Menu { title, .. } => title.as_deref(),
+            Overlay::View { .. } => None,
         }
     }
 
@@ -5193,14 +5263,74 @@ impl Workspace {
         text: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
-        self.balloon = Some(Balloon {
-            title: title.into(),
-            text: text.into(),
-            action: None,
-            buttons: Vec::new(),
-        });
+        self.notify_with_level(NotificationLevel::Info, title, text, cx);
+    }
+
+    /// An informational notification that stays only a few seconds, unless it offers a
+    /// button.
+    pub fn notify_warning(
+        &mut self,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.notify_with_level(NotificationLevel::Warning, title, text, cx);
+    }
+
+    /// An error notification: it stays until the user closes it.
+    pub fn notify_error(
+        &mut self,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.notify_with_level(NotificationLevel::Error, title, text, cx);
+    }
+
+    fn notify_with_level(
+        &mut self,
+        level: NotificationLevel,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_balloon(
+            Balloon {
+                level,
+                title: title.into(),
+                text: text.into(),
+                action: None,
+                buttons: Vec::new(),
+            },
+            cx,
+        );
+    }
+
+    /// Shows `balloon` and, when it is informational and asks nothing of the user, hides
+    /// it after a few seconds as IDEA hides its informational notifications. A warning and
+    /// an error stay until the user closes them. A newer notification, an opened one or a
+    /// closed one bumps the serial, so an older timer leaves it alone.
+    fn show_balloon(&mut self, balloon: Balloon, cx: &mut Context<Self>) {
+        let informational = balloon.level == NotificationLevel::Info
+            && balloon.action.is_none()
+            && balloon.buttons.is_empty();
+        self.balloon = Some(balloon);
         self.balloon_visible = true;
         self.balloon_serial += 1;
+        let serial = self.balloon_serial;
+        if informational {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(NOTIFICATION_TIME).await;
+                this.update(cx, |this, cx| {
+                    if this.balloon_serial == serial && this.balloon_visible {
+                        this.balloon_visible = false;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
         cx.notify();
     }
 
@@ -5213,7 +5343,37 @@ impl Workspace {
         command: &'static str,
         cx: &mut Context<Self>,
     ) {
-        self.notify_user_with_commands(title, text, vec![("command", button.into(), command)], cx);
+        self.notify_with_command(NotificationLevel::Info, title, text, button, command, cx);
+    }
+
+    /// An error notification with one button that runs a command of the window.
+    pub fn notify_error_with_command(
+        &mut self,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        button: impl Into<SharedString>,
+        command: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        self.notify_with_command(NotificationLevel::Error, title, text, button, command, cx);
+    }
+
+    fn notify_with_command(
+        &mut self,
+        level: NotificationLevel,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        button: impl Into<SharedString>,
+        command: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        self.notify_with_commands(
+            level,
+            title,
+            text,
+            vec![("command", button.into(), command)],
+            cx,
+        );
     }
 
     /// A notification with several buttons that run commands of the window, in order.
@@ -5224,22 +5384,68 @@ impl Workspace {
         buttons: Vec<(&'static str, SharedString, &'static str)>,
         cx: &mut Context<Self>,
     ) {
-        self.balloon = Some(Balloon {
-            title: title.into(),
-            text: text.into(),
-            action: None,
-            buttons: buttons
-                .into_iter()
-                .map(|(id, label, command)| BalloonButton {
-                    id,
-                    label,
-                    action: BalloonAction::Command(command),
-                })
-                .collect(),
-        });
-        self.balloon_visible = true;
-        self.balloon_serial += 1;
-        cx.notify();
+        self.notify_with_commands(NotificationLevel::Info, title, text, buttons, cx);
+    }
+
+    /// An error notification with several buttons that run commands of the window.
+    pub fn notify_error_with_commands(
+        &mut self,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        buttons: Vec<(&'static str, SharedString, &'static str)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.notify_with_commands(NotificationLevel::Error, title, text, buttons, cx);
+    }
+
+    /// A warning notification with several buttons that run commands of the window.
+    pub fn notify_warning_with_commands(
+        &mut self,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        buttons: Vec<(&'static str, SharedString, &'static str)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.notify_with_commands(NotificationLevel::Warning, title, text, buttons, cx);
+    }
+
+    /// A warning notification with one button that runs a command of the window.
+    pub fn notify_warning_with_command(
+        &mut self,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        button: impl Into<SharedString>,
+        command: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        self.notify_with_command(NotificationLevel::Warning, title, text, button, command, cx);
+    }
+
+    fn notify_with_commands(
+        &mut self,
+        level: NotificationLevel,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        buttons: Vec<(&'static str, SharedString, &'static str)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_balloon(
+            Balloon {
+                level,
+                title: title.into(),
+                text: text.into(),
+                action: None,
+                buttons: buttons
+                    .into_iter()
+                    .map(|(id, label, command)| BalloonButton {
+                        id,
+                        label,
+                        action: BalloonAction::Command(command),
+                    })
+                    .collect(),
+            },
+            cx,
+        );
     }
 
     /// A notification with one button that opens `action_path`.
@@ -5251,15 +5457,16 @@ impl Workspace {
         action_path: PathBuf,
         cx: &mut Context<Self>,
     ) {
-        self.balloon = Some(Balloon {
-            title: title.into(),
-            text: text.into(),
-            action: Some((action.into(), action_path)),
-            buttons: Vec::new(),
-        });
-        self.balloon_visible = true;
-        self.balloon_serial += 1;
-        cx.notify();
+        self.show_balloon(
+            Balloon {
+                level: NotificationLevel::Info,
+                title: title.into(),
+                text: text.into(),
+                action: Some((action.into(), action_path)),
+                buttons: Vec::new(),
+            },
+            cx,
+        );
     }
 
     /// A notification with buttons that run commands of the window and one button that
@@ -5274,22 +5481,68 @@ impl Workspace {
         buttons: Vec<(&'static str, SharedString, &'static str)>,
         cx: &mut Context<Self>,
     ) {
-        self.balloon = Some(Balloon {
-            title: title.into(),
-            text: text.into(),
-            action: Some((action.into(), action_path)),
-            buttons: buttons
-                .into_iter()
-                .map(|(id, label, command)| BalloonButton {
-                    id,
-                    label,
-                    action: BalloonAction::Command(command),
-                })
-                .collect(),
-        });
-        self.balloon_visible = true;
-        self.balloon_serial += 1;
-        cx.notify();
+        self.notify_with_action_and_commands(
+            NotificationLevel::Info,
+            title,
+            text,
+            action,
+            action_path,
+            buttons,
+            cx,
+        );
+    }
+
+    /// An error notification with buttons that run commands of the window and one button
+    /// that opens `action_path`. The command buttons come first, the file last.
+    #[allow(clippy::too_many_arguments)]
+    pub fn notify_error_with_action_and_commands(
+        &mut self,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        action: impl Into<SharedString>,
+        action_path: PathBuf,
+        buttons: Vec<(&'static str, SharedString, &'static str)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.notify_with_action_and_commands(
+            NotificationLevel::Error,
+            title,
+            text,
+            action,
+            action_path,
+            buttons,
+            cx,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn notify_with_action_and_commands(
+        &mut self,
+        level: NotificationLevel,
+        title: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        action: impl Into<SharedString>,
+        action_path: PathBuf,
+        buttons: Vec<(&'static str, SharedString, &'static str)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_balloon(
+            Balloon {
+                level,
+                title: title.into(),
+                text: text.into(),
+                action: Some((action.into(), action_path)),
+                buttons: buttons
+                    .into_iter()
+                    .map(|(id, label, command)| BalloonButton {
+                        id,
+                        label,
+                        action: BalloonAction::Command(command),
+                    })
+                    .collect(),
+            },
+            cx,
+        );
     }
 
     /// The last notification, for scripts and tests.
@@ -5297,6 +5550,11 @@ impl Workspace {
         self.balloon
             .as_ref()
             .map(|balloon| (balloon.title.clone(), balloon.text.clone()))
+    }
+
+    /// The importance of the last notification, for scripts and tests.
+    pub fn last_notification_level(&self) -> Option<NotificationLevel> {
+        self.balloon.as_ref().map(|balloon| balloon.level)
     }
 
     /// How many notifications the window has shown, for a test that tells a new one
@@ -5571,9 +5829,16 @@ impl Workspace {
 
     pub fn set_tab_listener(
         &mut self,
-        listener: impl Fn(&Path, &mut Context<Workspace>) + 'static,
+        listener: impl Fn(&mut Workspace, &Path, &mut Context<Workspace>) + 'static,
     ) {
         self.tab_listener = Some(Rc::new(listener));
+    }
+
+    /// The recent files that the layout saves: the panels keep the list and answer for
+    /// it each time the layout is written. Without a source the layout keeps the list it
+    /// opened with.
+    pub fn set_recent_files_source(&mut self, source: impl Fn(&App) -> Vec<PathBuf> + 'static) {
+        self.recent_source = Some(Rc::new(source));
     }
 
     /// The view of the active tab, for the commands that act on the editor.
@@ -5651,6 +5916,10 @@ impl Workspace {
         ] {
             tool_sides.extend(dock.tools.iter().map(|tool| (tool.id.to_owned(), side)));
         }
+        let recent_files = match &self.recent_source {
+            Some(source) => source(cx),
+            None => self.layout.recent_files.clone(),
+        };
         Layout {
             window: self.placement,
             left: self.left.state(),
@@ -5665,12 +5934,14 @@ impl Workspace {
             bottom_tool: self.bottom.active_tool().map(|tool| tool.id.to_string()),
             tool_sides,
             recent_edited: self.recent_edited.clone(),
+            recent_files,
             preview_modes,
             bundle_modes,
             services_collapsed: self.layout.services_collapsed.clone(),
             services_selected: self.layout.services_selected.clone(),
             services_show_all: self.layout.services_show_all,
             bookmarks: self.layout.bookmarks.clone(),
+            recent_places: self.recent_places.clone(),
         }
     }
 

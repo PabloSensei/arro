@@ -5,7 +5,7 @@ use std::ops::Range;
 
 use text_core::TextStore;
 use text_core::find::{FindOptions, find_all, find_in_range, replacements_in};
-use ui_kit::metrics::CONTROL_RADIUS;
+use ui_kit::metrics::{CONTROL_RADIUS, ICON, SPACE_M, SPACE_XS};
 use ui_kit::prelude::*;
 use ui_kit::*;
 
@@ -116,15 +116,19 @@ impl EditorView {
         self.refresh_matches(true, cx);
     }
 
-    /// Ctrl+G.
+    /// Ctrl+G. The field opens with the caret's place as the status bar writes it, and the
+    /// text is selected, so that a number typed at once replaces it.
     pub(crate) fn open_goto(&mut self, cx: &mut Context<Self>) {
         if self.state.is_none() {
             return;
         }
+        let (line, column) = self.caret();
+        let mut query = TextField::from_text(format!("{}:{}", line + 1, column + 1));
+        query.select_all();
         self.bar = Some(Bar {
             kind: BarKind::Goto,
             field: Field::Query,
-            query: TextField::default(),
+            query,
             replacement: TextField::default(),
             options: FindOptions::default(),
             matches: Vec::new(),
@@ -139,6 +143,13 @@ impl EditorView {
             active: true,
         });
         cx.notify();
+    }
+
+    /// The text of the Go to field and the range selected in it, while the field is open.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn goto_field(&self) -> Option<(String, Range<usize>)> {
+        let bar = self.bar.as_ref().filter(|bar| bar.kind == BarKind::Goto)?;
+        Some((bar.query.text.clone(), bar.query.selection()))
     }
 
     pub(crate) fn close_bar(&mut self, cx: &mut Context<Self>) {
@@ -682,68 +693,98 @@ impl EditorView {
         let history: Vec<String> = cx
             .try_global::<FindHistory>()
             .map_or_else(Vec::new, |history| history.entries().to_vec());
-        let field =
-            |id: &'static str, value: &TextField, on: bool, which: Field, hint: &'static str| {
-                let placeholder = value.text.is_empty() && !on;
-                let color = if placeholder {
-                    style.line_number
-                } else {
-                    style.code
-                };
-                div()
-                    .id(id)
-                    .flex_1()
-                    .min_w(px(120.))
-                    .h(px(24.))
-                    .px(px(8.))
-                    .flex()
-                    .items_center()
-                    .rounded(px(CONTROL_RADIUS))
-                    .bg(style.background)
-                    .border_1()
-                    .border_color(if on { style.accent } else { style.indent_guide })
-                    .text_color(color)
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .when(placeholder, |this| this.child(hint))
-                    .when(!placeholder, |this| {
-                        this.children(text_field_children_named(
-                            FieldMouse::with_edit(
-                                cx,
-                                move |editor: &mut Self| {
-                                    let bar = editor.bar.as_mut()?;
-                                    Some(if which == Field::Query {
-                                        &mut bar.query
-                                    } else {
-                                        &mut bar.replacement
-                                    })
-                                },
-                                move |editor: &mut Self, cx| {
-                                    if let Some(bar) = &mut editor.bar {
-                                        bar.error = None;
-                                    }
-                                    editor.refresh_matches(which == Field::Query, cx);
-                                },
-                            ),
-                            id,
-                            value,
-                            style.code,
-                            style.code,
-                            style.selection,
-                            style.caret,
-                            16.,
-                            on,
-                        ))
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(bar) = &mut this.bar {
-                            bar.field = which;
-                            bar.active = true;
-                            bar.history_popup = false;
-                            cx.notify();
-                        }
-                    }))
+        // The Find field and the Replace field have one width, so that their rows line up.
+        let replacing = bar.kind == BarKind::Replace;
+        let width = field_width(
+            window,
+            &bar.query.text,
+            if replacing {
+                bar.replacement.text.as_str()
+            } else {
+                ""
+            },
+        );
+        let field = |id: &'static str,
+                     value: &TextField,
+                     on: bool,
+                     which: Field,
+                     hint: &'static str,
+                     width: Option<f32>,
+                     toggles: Vec<AnyElement>| {
+            let placeholder = value.text.is_empty() && !on;
+            let color = if placeholder {
+                style.line_number
+            } else {
+                style.code
             };
+            // The text takes the room that the toggles leave at the right edge.
+            let text = div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .when(placeholder, |this| this.child(hint))
+                .when(!placeholder, |this| {
+                    this.children(text_field_children_named(
+                        FieldMouse::with_edit(
+                            cx,
+                            move |editor: &mut Self| {
+                                let bar = editor.bar.as_mut()?;
+                                Some(if which == Field::Query {
+                                    &mut bar.query
+                                } else {
+                                    &mut bar.replacement
+                                })
+                            },
+                            move |editor: &mut Self, cx| {
+                                if let Some(bar) = &mut editor.bar {
+                                    bar.error = None;
+                                }
+                                editor.refresh_matches(which == Field::Query, cx);
+                            },
+                        ),
+                        id,
+                        value,
+                        style.code,
+                        style.code,
+                        style.selection,
+                        style.caret,
+                        16.,
+                        on,
+                    ))
+                });
+            let frame = div()
+                .id(id)
+                .debug_selector(move || id.to_owned())
+                .min_w(px(120.))
+                .h(px(24.))
+                .px(px(SPACE_M))
+                .flex()
+                .items_center()
+                .gap(px(SPACE_XS))
+                .rounded(px(CONTROL_RADIUS))
+                .bg(style.background)
+                .border_1()
+                .border_color(if on { style.accent } else { style.indent_guide })
+                .text_color(color)
+                .child(text)
+                .children(toggles)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(bar) = &mut this.bar {
+                        bar.field = which;
+                        bar.active = true;
+                        bar.history_popup = false;
+                        cx.notify();
+                    }
+                }));
+            match width {
+                Some(width) => frame.w(px(width)),
+                None => frame.flex_1(),
+            }
+        };
         let chip = |id: &'static str, label: &'static str, on: bool| {
             div()
                 .id(id)
@@ -751,6 +792,7 @@ impl EditorView {
                 .min_w(px(24.))
                 .px(px(4.))
                 .flex()
+                .flex_none()
                 .items_center()
                 .justify_center()
                 .rounded(px(CONTROL_RADIUS))
@@ -777,6 +819,8 @@ impl EditorView {
                     active,
                     Field::Query,
                     "Line:Column",
+                    None,
+                    Vec::new(),
                 ))
                 .child(
                     div()
@@ -789,14 +833,42 @@ impl EditorView {
                 );
         } else {
             let query_on = active && bar.field == Field::Query;
-            let toggle = |id: &'static str,
+            let option = |id: &'static str,
                           name: &'static str,
                           label: &'static str,
                           key: &'static str,
                           on: bool| {
-                icon_button(id, name, label, Some(key.into()), &theme)
-                    .when(on, |this| this.bg(style.selection))
+                field_toggle(id, name, label, key, on, style.selection, &theme)
             };
+            let toggles = vec![
+                option(
+                    "bar-case",
+                    "general/caseSensitive",
+                    "Match Case",
+                    "Alt+C",
+                    bar.options.case_sensitive,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_option(0, cx)))
+                .into_any_element(),
+                option(
+                    "bar-word",
+                    "general/wholeWord",
+                    "Whole Words",
+                    "Alt+W",
+                    bar.options.whole_word,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_option(1, cx)))
+                .into_any_element(),
+                option(
+                    "bar-regex",
+                    "general/regex",
+                    "Regex",
+                    "Alt+X",
+                    bar.options.regex,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_option(2, cx)))
+                .into_any_element(),
+            ];
             let count: SharedString =
                 match (&bar.error, bar.query.text.is_empty(), bar.matches.len()) {
                     (Some(error), _, _) => error.clone().into(),
@@ -814,45 +886,14 @@ impl EditorView {
                     query_on,
                     Field::Query,
                     "Find",
+                    Some(width),
+                    toggles,
                 ))
                 .child(
-                    toggle(
-                        "bar-case",
-                        "general/caseSensitive",
-                        "Match Case",
-                        "Alt+C",
-                        bar.options.case_sensitive,
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_option(0, cx))),
-                )
-                .child(
-                    toggle(
-                        "bar-word",
-                        "general/wholeWord",
-                        "Whole Words",
-                        "Alt+W",
-                        bar.options.whole_word,
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_option(1, cx))),
-                )
-                .child(
-                    toggle(
-                        "bar-regex",
-                        "general/regex",
-                        "Regex",
-                        "Alt+X",
-                        bar.options.regex,
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_option(2, cx))),
-                )
-                .child(
-                    chip("bar-selection", "In Selection", bar.in_selection)
-                        .debug_selector(|| "bar-selection".to_owned())
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_in_selection(cx))),
-                )
-                .child(
                     div()
+                        .flex_none()
                         .min_w(px(70.))
+                        .debug_selector(|| "bar-count".to_owned())
                         .text_color(if bad { style.error } else { style.line_number })
                         .child(count),
                 )
@@ -864,6 +905,8 @@ impl EditorView {
                         Some("Shift+F3".into()),
                         &theme,
                     )
+                    .flex_none()
+                    .debug_selector(|| "bar-prev".to_owned())
                     .on_click(cx.listener(|this, _, _, cx| this.find_step(false, cx))),
                 )
                 .child(
@@ -874,8 +917,16 @@ impl EditorView {
                         Some("F3".into()),
                         &theme,
                     )
+                    .flex_none()
+                    .debug_selector(|| "bar-next".to_owned())
                     .on_click(cx.listener(|this, _, _, cx| this.find_step(true, cx))),
-                );
+                )
+                .child(
+                    chip("bar-selection", "In Selection", bar.in_selection)
+                        .debug_selector(|| "bar-selection".to_owned())
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_in_selection(cx))),
+                )
+                .child(div().flex_1());
         }
         row = row.child(
             icon_button(
@@ -885,6 +936,8 @@ impl EditorView {
                 Some("Esc".into()),
                 &theme,
             )
+            .flex_none()
+            .debug_selector(|| "bar-close".to_owned())
             .on_click(cx.listener(|this, _, _, cx| this.close_bar(cx))),
         );
         let mut bar_view = div()
@@ -911,6 +964,8 @@ impl EditorView {
                     on,
                     Field::Replacement,
                     "Replace",
+                    Some(width),
+                    Vec::new(),
                 ))
                 .child(
                     chip(
@@ -1014,4 +1069,70 @@ impl Bar {
             Field::Replacement => &mut self.replacement,
         }
     }
+}
+
+/// The size of the text of the bar, in points.
+const BAR_TEXT_SIZE: f32 = 13.;
+/// The narrowest and the widest field of Find and Replace, in points: a field grows with
+/// its text between the two.
+const FIELD_MIN: f32 = 320.;
+const FIELD_MAX: f32 = 600.;
+/// The side of one toggle of the Find field. The toggles sit inside the field, which is
+/// 24 points high with its border.
+const FIELD_TOGGLE: f32 = 20.;
+/// What a field takes beside its text: the padding and the border on both sides, the gap
+/// before the toggles, and the toggles with the gaps between them.
+const FIELD_CHROME: f32 = 2. * SPACE_M + 2. + SPACE_XS + 3. * FIELD_TOGGLE + 2. * SPACE_XS;
+
+/// The width of the Find field and of the Replace field under it: the wider of the two
+/// texts with the chrome of the Find field, kept within [`FIELD_MIN`] and [`FIELD_MAX`].
+fn field_width(window: &Window, query: &str, replacement: &str) -> f32 {
+    let widest = text_width(window, query).max(text_width(window, replacement));
+    (widest + FIELD_CHROME).clamp(FIELD_MIN, FIELD_MAX)
+}
+
+/// The width of one line of text in the font of the bar. The text system lays out a single
+/// line, so a line break counts as a space.
+fn text_width(window: &Window, text: &str) -> f32 {
+    if text.is_empty() {
+        return 0.;
+    }
+    let text = text.replace('\n', " ");
+    let run = window.text_style().to_run(text.len());
+    let line = window.text_system().shape_line(
+        text.into(),
+        px(BAR_TEXT_SIZE),
+        std::slice::from_ref(&run),
+        None,
+    );
+    f32::from(line.width())
+}
+
+/// One option of the Find field, drawn at its right edge: a square with the icon of the
+/// option, its name and its key. The square is smaller than a toolbar button, because the
+/// field is too low for one.
+fn field_toggle(
+    id: &'static str,
+    name: &'static str,
+    label: &'static str,
+    key: &'static str,
+    on: bool,
+    selection: Hsla,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let hover = theme.hover;
+    div()
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .flex_none()
+        .size(px(FIELD_TOGGLE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(CONTROL_RADIUS))
+        .cursor_pointer()
+        .when(on, |this| this.bg(selection))
+        .hover(move |this| this.bg(hover))
+        .tooltip(move |_, cx| tooltip(label, Some(key.into()), cx))
+        .child(icon_sized(name, ICON, theme))
 }

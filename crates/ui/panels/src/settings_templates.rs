@@ -70,7 +70,7 @@ pub(crate) fn load(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
                     apply(&mut settings, loaded.file);
                 }
                 Err(error) => {
-                    workspace.notify_user(
+                    workspace.notify_error(
                         "Templates",
                         format!("{TEMPLATES_FILE} is not read: {error}"),
                         cx,

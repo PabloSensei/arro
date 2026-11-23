@@ -27,6 +27,7 @@ use crate::index::SearchSetup;
 use crate::window_tests::{
     bounds_of, buffer_of, draw, editor_of, open_path, press, project_setup, scratch, type_text,
 };
+use crate::window_tests_refactor_this::select_refactoring;
 use crate::{AgentOptions, LanguageServer, connect, install};
 
 const SOURCE: SourceId = SourceId::new("fake-extract");
@@ -564,6 +565,7 @@ fn one_undo_takes_back_a_refactoring_of_three_files_and_redo_brings_it_back(
 
     press(cx, window, "ctrl-alt-shift-t");
     draw(cx, window);
+    select_refactoring(cx, window, &shape, "Extract Interface...");
     press(cx, window, "enter");
     draw(cx, window);
     press(cx, window, "enter");

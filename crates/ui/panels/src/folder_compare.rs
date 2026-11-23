@@ -514,7 +514,7 @@ impl FolderCompareView {
     fn report(&self, error: String, cx: &mut Context<Self>) {
         self.workspace
             .update(cx, |workspace, cx| {
-                workspace.notify_user("Compare", error, cx)
+                workspace.notify_error("Compare", error, cx)
             })
             .ok();
     }

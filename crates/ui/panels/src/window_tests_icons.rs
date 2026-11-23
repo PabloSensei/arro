@@ -28,7 +28,7 @@ fn selector(name: String) -> &'static str {
 }
 
 /// The file the icon `name` is drawn from in the theme of the window.
-fn icon_path(cx: &TestAppContext, name: &str) -> &'static str {
+pub(crate) fn icon_path(cx: &TestAppContext, name: &str) -> &'static str {
     let (set, dark) = cx.read(|cx| {
         let theme = cx.global::<Theme>();
         (theme.icon_set(), theme.dark)
@@ -39,7 +39,7 @@ fn icon_path(cx: &TestAppContext, name: &str) -> &'static str {
 /// The icon `icon` is drawn inside one of the `places` that show it. A window can draw the
 /// same icon in several controls, and the frame keeps one box per icon, so the box is
 /// checked against every place that shows the icon.
-fn icon_in(
+pub(crate) fn icon_in(
     cx: &mut TestAppContext,
     window: WindowHandle<Workspace>,
     places: &[&'static str],
@@ -66,7 +66,7 @@ fn icon_in(
 
 /// One button of a toolbar: the selector of the button, the icon it shows, the name and the
 /// key its tooltip shows, and the controls of the window that show the same icon.
-type IconButton<'a> = (
+pub(crate) type IconButton<'a> = (
     &'static str,
     &'static str,
     &'a str,
@@ -77,7 +77,7 @@ type IconButton<'a> = (
 /// The buttons of a toolbar: each one shows its icon and names itself in its tooltip. The
 /// controls of the window that show the same icon are listed after the button. The key of
 /// each button is the one its tooltip shows, or none.
-fn assert_icon_buttons(
+pub(crate) fn assert_icon_buttons(
     cx: &mut TestAppContext,
     window: WindowHandle<Workspace>,
     buttons: &[IconButton<'_>],
@@ -170,14 +170,14 @@ fn the_database_copy_buttons_are_icons_that_name_themselves(cx: &mut TestAppCont
                 "general/copy",
                 "Copy Cell",
                 Some(copy.as_str()),
-                &["database-copy-row"],
+                &[],
             ),
             (
                 "database-copy-row",
-                "general/copy",
+                "general/editorAndPreview",
                 "Copy Row",
                 None,
-                &["database-copy-cell"],
+                &[],
             ),
         ],
     );

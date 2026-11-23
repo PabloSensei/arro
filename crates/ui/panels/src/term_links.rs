@@ -327,12 +327,6 @@ mod tests {
     use super::{LinkKind, directory, links, resolve};
     use std::path::Path;
 
-    /// The extension of the source files of the language, kept out of this neutral
-    /// crate's words.
-    fn extension() -> String {
-        ["ja", "va"].concat()
-    }
-
     fn file(path: &str, line: Option<u32>, column: Option<u32>) -> LinkKind {
         LinkKind::File {
             path: path.to_string(),
@@ -367,13 +361,13 @@ mod tests {
 
     #[test]
     fn the_output_of_a_compiler_names_a_path_and_a_place() {
-        let source = format!("Main.{}", extension());
+        let source = "Main.txt";
         let found = links(&format!("{source}:[12,5] cannot find symbol"));
         assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].kind, file(&source, Some(12), Some(5)), "{found:?}");
+        assert_eq!(found[0].kind, file(source, Some(12), Some(5)), "{found:?}");
 
         let found = links(&format!("{source}:[12]"));
-        assert_eq!(found[0].kind, file(&source, Some(12), None));
+        assert_eq!(found[0].kind, file(source, Some(12), None));
 
         let found = links(&format!("src/{source}:7: error: missing return"));
         assert_eq!(found[0].kind, file(&format!("src/{source}"), Some(7), None));
@@ -381,14 +375,14 @@ mod tests {
 
     #[test]
     fn a_frame_of_a_stack_trace_is_a_link_for_the_language() {
-        let source = format!("Main.{}", extension());
+        let source = "Main.txt";
         let line = format!("    at pkg.Cls.run({source}:42)");
         let found = links(&line);
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(
             found[0].kind,
             LinkKind::Frame {
-                file: source.clone(),
+                file: source.to_owned(),
                 line: 42
             }
         );

@@ -72,10 +72,10 @@ fn uri_of(path: &Path) -> String {
     CanonPath::new(path).unwrap().to_uri()
 }
 
-struct FakeLanguage {
+pub(crate) struct FakeLanguage {
     syntax: NoSyntax,
     documents: Mutex<HashMap<String, Arc<str>>>,
-    info: Mutex<ChangeSignatureInfo>,
+    pub(crate) info: Mutex<ChangeSignatureInfo>,
     outcome_error: Mutex<Option<String>>,
     requests: Mutex<Vec<ChangeSignatureRequest>>,
     closed: Mutex<Option<PathBuf>>,
@@ -110,6 +110,7 @@ impl FakeLanguage {
             info: Mutex::new(ChangeSignatureInfo {
                 signature: Some(signature),
                 error: None,
+                ..Default::default()
             }),
             outcome_error: Mutex::new(None),
             requests: Mutex::new(Vec::new()),
@@ -126,6 +127,7 @@ impl FakeLanguage {
         *self.info.lock().unwrap() = ChangeSignatureInfo {
             signature: None,
             error: Some(text.to_owned()),
+            ..Default::default()
         };
     }
 
@@ -137,7 +139,7 @@ impl FakeLanguage {
         *self.closed.lock().unwrap() = Some(path);
     }
 
-    fn requests(&self) -> Vec<ChangeSignatureRequest> {
+    pub(crate) fn requests(&self) -> Vec<ChangeSignatureRequest> {
         self.requests.lock().unwrap().clone()
     }
 
@@ -399,13 +401,17 @@ fn open_window_with(
     })
 }
 
-fn shown(cx: &mut TestAppContext, window: WindowHandle<Workspace>, selector: &'static str) -> bool {
+pub(crate) fn shown(
+    cx: &mut TestAppContext,
+    window: WindowHandle<Workspace>,
+    selector: &'static str,
+) -> bool {
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.debug_bounds(selector).is_some()
 }
 
 /// The signature the form previews, read from the dialog itself.
-fn preview_of(cx: &mut TestAppContext, window: WindowHandle<Workspace>) -> String {
+pub(crate) fn preview_of(cx: &mut TestAppContext, window: WindowHandle<Workspace>) -> String {
     let view = window
         .read_with(cx, |workspace, _| workspace.overlay_view())
         .unwrap()
@@ -553,6 +559,7 @@ fn escape_and_server_errors_leave_the_file_alone(cx: &mut TestAppContext) {
     *language.info.lock().unwrap() = ChangeSignatureInfo {
         signature: Some(signature),
         error: None,
+        ..Default::default()
     };
     language.set_outcome_error("Refactoring failed");
     press(cx, window, "ctrl-f6");
@@ -579,6 +586,8 @@ fn escape_and_server_errors_leave_the_file_alone(cx: &mut TestAppContext) {
 
 #[ui_kit::gpui::test]
 fn refactor_this_lists_change_signature(cx: &mut TestAppContext) {
+    use crate::window_tests_refactor_this::select_refactoring;
+
     let root = project(
         "signature-refactor-this",
         &[("src/Signature.txt", SIGNATURE)],
@@ -596,6 +605,7 @@ fn refactor_this_lists_change_signature(cx: &mut TestAppContext) {
         bounds_of(cx, window, "actions-popup").size.height > px(0.),
         "Refactor This lists the refactorings"
     );
+    select_refactoring(cx, window, &open, "Change Signature...");
     press(cx, window, "enter");
     draw(cx, window);
     assert!(
@@ -607,7 +617,7 @@ fn refactor_this_lists_change_signature(cx: &mut TestAppContext) {
 /// Opens the Change Signature form on the `combine` method of a fresh project. The form is
 /// shown as the editor shows it, without a key press, and the language stays alive for the
 /// test.
-fn open_form(
+pub(crate) fn open_form(
     cx: &mut TestAppContext,
     name: &str,
 ) -> (WindowHandle<Workspace>, Arc<FakeLanguage>, PathBuf) {

@@ -394,8 +394,14 @@ impl ItemsPanel {
         let mut lines = Vec::new();
         for row in &self.rows {
             match row {
-                PanelRow::Group { label, depth, .. } => {
-                    lines.push(format!("{}{}", "  ".repeat(*depth), label));
+                PanelRow::Group {
+                    label, depth, hint, ..
+                } => {
+                    let hint = hint
+                        .as_deref()
+                        .map(|hint| format!("\t{hint}"))
+                        .unwrap_or_default();
+                    lines.push(format!("{}{label}{hint}", "  ".repeat(*depth)));
                 }
                 PanelRow::Item {
                     index,
@@ -544,12 +550,11 @@ fn code_row(
     selected: bool,
     theme: &Theme,
 ) -> Stateful<Div> {
-    let start = code.highlight.start.min(code.text.len());
-    let end = code.highlight.end.clamp(start, code.text.len());
-    let before = code.text.get(..start).unwrap_or_default().to_owned();
-    let found = code.text.get(start..end).unwrap_or_default().to_owned();
-    let after = code.text.get(end..).unwrap_or_default().to_owned();
-    let (match_bg, match_text) = (theme.match_bg, theme.match_text);
+    let style = HighlightStyle {
+        color: Some(theme.match_text),
+        background_color: Some(theme.match_bg),
+        ..HighlightStyle::default()
+    };
     let hover = theme.selection_hover;
     div()
         .id(("item", index))
@@ -588,16 +593,12 @@ fn code_row(
                 .min_w_0()
                 .overflow_hidden()
                 .whitespace_nowrap()
-                .child(before)
-                .child(
-                    div()
-                        .bg(match_bg)
-                        .text_color(match_text)
-                        .rounded(px(2.))
-                        .debug_selector(move || format!("item-code-match-{index}"))
-                        .child(found),
-                )
-                .child(after),
+                .debug_selector(move || format!("item-code-match-{index}"))
+                .child(highlighted_text(
+                    code.text.clone(),
+                    [code.highlight.clone()],
+                    style,
+                )),
         )
 }
 
@@ -629,6 +630,8 @@ impl Render for ItemsPanel {
                     selected: false,
                 };
                 div().w_full().px(px(ROW_MARGIN)).child(
+                    // A group keeps the hint right after its label: it names the detail of
+                    // the node rather than a column of the list.
                     tree_row(style, &theme).debug_selector(move || format!("item-group-{at}")),
                 )
             }
@@ -665,7 +668,7 @@ impl Render for ItemsPanel {
                             open: false,
                             selected: self.selected == Some(index),
                         };
-                        tree_row(style, &theme)
+                        tree_row_hint_at_end(style, &theme)
                     }
                 }
                 .debug_selector(move || format!("item-row-{index}"))

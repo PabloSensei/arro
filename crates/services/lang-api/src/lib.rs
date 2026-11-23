@@ -67,7 +67,7 @@ pub use hierarchy::{
     MethodHierarchyEntry, MethodHierarchyProvider, MethodHierarchyQuery, MethodRelation,
     OverridableMethod, OverridableMethods, OverridableMethodsProvider, OverridableMethodsQuery,
     ReferenceQuery, ReferenceStringProvider, TypeHierarchyItem, TypeHierarchyProvider,
-    TypeHierarchyQuery, TypeKind,
+    TypeHierarchyQuery, TypeKind, short_type_name,
 };
 pub use inlay::{
     InlayHintEntry, InlayHintKind, InlayHintProvider, InlayHintQuery, InlayHintSettings,
@@ -88,6 +88,7 @@ pub use profile::{
     ProfileSamples, ProfileSnapshot, ProfileType, ProfileTypeTree, ProfileUnit, bytes_text,
 };
 pub use run_points::{RunPoint, RunPointKind, RunPointQuery, RunPointsProvider};
+pub use semantic::LibraryPlace;
 pub use semantic::{
     ActionApplyProvider, ActionApplyRequest, ActionChoice, ActionEntry, ActionField, ActionKind,
     ActionMember, ActionOutcome, ActionParameters, ActionParametersProvider, ActionParametersQuery,
@@ -97,26 +98,26 @@ pub use semantic::{
     CompletionLabelDetails, CompletionList, CompletionProvider, CompletionResolveProvider,
     DependencyUpdatesProvider, DependencyVersion, DependencyVersionQuery, DiagnosticEntry,
     DiagnosticsProvider, DiagnosticsQuery, DocumentEdit, DocumentSpot, ExecuteCommandProvider,
-    ExtractKind, FileChange, FileRename, FormatProvider, FormatQuery, GenerateApplyProvider,
-    GenerateApplyRequest, GenerateChoice, GenerateKind, GenerateProvider, GenerateQuery,
-    GeneratedFile, Generation, HierarchyDirection, HierarchyProvider, HierarchyQuery,
-    HighlightProvider, HoverProvider, HoverText, MemberActionForm, MemberActionParametersProvider,
-    MemberActionProvider, MemberActionQuery, MemberActionRequest, MemberChoice, MemberRefactoring,
-    MemberSelection, MemberTarget, MethodSignature, MoveDestination, MoveDestinationProvider,
-    MoveKind, MoveMember, MoveMembersForm, MoveMembersFormProvider, MoveMembersQuery, MoveOutcome,
-    MovePlace, MoveProvider, MoveQuery, MoveRequest, MoveTargetsForm, MoveTargetsFormProvider,
-    MoveTargetsQuery, NavigationKind, NavigationProvider, NavigationQuery, PrepareRename,
-    PrepareRenameProvider, ProjectProblem, ProjectProblemsProvider, ProjectProblemsQuery,
-    RefactorSelectionsProvider, ReferencesProvider, RenamePosition, RenameProvider, RenameQuery,
-    SelectionEntry, SelectionQuery, SemanticServer, Severity, SignatureException,
-    SignatureParameter, SignatureProvider, SignatureQuery, SignatureText, SourceEdit, SourceSpan,
-    SourceTextProvider, SourceTextQuery, SuppressionQuery, SuppressionStyle, SuppressionTarget,
-    SymbolEntry, SymbolQuery, TextPoint, TextSpan, WorkspaceChange, WorkspaceSymbolProvider,
-    apply_to_text, offset_in,
+    ExpressionTypePlace, ExtractKind, FileChange, FileRename, FormatProvider, FormatQuery,
+    GenerateApplyProvider, GenerateApplyRequest, GenerateChoice, GenerateKind, GenerateProvider,
+    GenerateQuery, GeneratedFile, Generation, HierarchyDirection, HierarchyProvider,
+    HierarchyQuery, HighlightProvider, HoverPlace, HoverProvider, HoverText, MemberActionForm,
+    MemberActionParametersProvider, MemberActionProvider, MemberActionQuery, MemberActionRequest,
+    MemberChoice, MemberRefactoring, MemberSelection, MemberTarget, MethodSignature,
+    MoveDestination, MoveDestinationProvider, MoveKind, MoveMember, MoveMembersForm,
+    MoveMembersFormProvider, MoveMembersQuery, MoveOutcome, MovePlace, MoveProvider, MoveQuery,
+    MoveRequest, MoveTargetsForm, MoveTargetsFormProvider, MoveTargetsQuery, NavigationKind,
+    NavigationProvider, NavigationQuery, PrepareRename, PrepareRenameProvider, ProjectProblem,
+    ProjectProblemsProvider, ProjectProblemsQuery, RefactorSelectionsProvider, ReferencesProvider,
+    RenamePosition, RenameProvider, RenameQuery, SelectionEntry, SelectionQuery, SemanticServer,
+    Severity, SignatureException, SignatureParameter, SignatureProvider, SignatureQuery,
+    SignatureText, SourceEdit, SourceSpan, SourceTextProvider, SourceTextQuery, SuppressionQuery,
+    SuppressionStyle, SuppressionTarget, SymbolEntry, SymbolQuery, TextPoint, TextSpan,
+    WorkspaceChange, WorkspaceSymbolProvider, apply_to_text, offset_in,
 };
 pub use semantic::{
     CallParameter, CallSignature, CompletionKind, ExpectedType, ExpectedTypeProvider, ExternalDoc,
-    ExternalDocProvider, SemanticToken, SemanticTokenKind, SemanticTokenModifiers,
+    ExternalDocProvider, NameRole, SemanticToken, SemanticTokenKind, SemanticTokenModifiers,
     SemanticTokensProvider, SemanticTokensQuery, SignatureHelp, SignatureInfoProvider,
 };
 pub use semantic::{

@@ -18,3 +18,22 @@ The tool window icons keep the `@20x20` files of the source for the stripes.
 
 `fileTypes/gitignore` and `fileTypes/http` have no dark variant in the source; the light
 file is copied under the `_dark` name too.
+
+Files added 2026-11-22 from the same commit, light and `_dark`, below the same
+`platform/icons/src/expui/fileTypes`:
+
+- `properties`
+- `archive`
+- `image`
+- `csv`
+- `editorConfig`
+- `manifest`
+- `patch`
+- `microsoftWindows`
+- `xsd`
+- `graphql`
+- `terraform`
+- `hprof`
+- `jfr`
+- `gradle`
+- `javaClass`

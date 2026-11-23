@@ -286,6 +286,11 @@ pub fn register(
         places::show_recent,
     );
     workspace.register_command(
+        keys::RECENT_CHANGES,
+        "Recent Changes",
+        crate::recent_changes::show,
+    );
+    workspace.register_command(
         "window.show_bookmarks",
         "Bookmarks",
         crate::bookmarks::show_window,
@@ -530,6 +535,8 @@ pub fn register(
             editor_keys::CONVERT_INDENTS_TO_TABS,
             "Convert Indents to Tabs",
         ),
+        (editor_keys::SORT_MEMBERS, "Sort Members"),
+        (editor_keys::ADD_FINAL_MODIFIERS, "Add final Modifiers"),
     ] {
         workspace.register_command(id, title, move |workspace, _, cx| {
             if let Some(view) = workspace
@@ -971,7 +978,8 @@ fn goto_test(
         match spot {
             Some(spot) => {
                 let entries = vec![create_test_entry(spot)];
-                workspace.show_menu(popup_anchor(workspace, window, cx), entries, cx);
+                let title = test_menu_title(&stem, 0);
+                workspace.show_menu_titled(popup_anchor(workspace, window, cx), title, entries, cx);
                 workspace.highlight_first_menu_row(cx);
             }
             None => workspace.notify_user("Go to Test", "No test found", cx),
@@ -982,9 +990,15 @@ fn goto_test(
         workspace.open_file(found.remove(0), window, cx);
         return;
     }
+    let title = test_menu_title(&stem, found.len());
     let entries = test_menu(workspace, found, spot, cx.weak_entity());
-    workspace.show_menu(popup_anchor(workspace, window, cx), entries, cx);
+    workspace.show_menu_titled(popup_anchor(workspace, window, cx), title, entries, cx);
     workspace.highlight_first_menu_row(cx);
+}
+
+/// The heading of Go to Test: the class of the active file and how many tests it has.
+fn test_menu_title(stem: &str, found: usize) -> String {
+    format!("Choose Test for {stem} ({found} found)")
 }
 
 /// The place Create Test works from, when the language of `path` makes test classes for
@@ -1002,32 +1016,53 @@ fn create_test_spot(
     view.read(cx).spot().map(|(spot, _)| spot)
 }
 
-/// The rows of Go to Test: the tests that exist, and Create New Test last.
+/// The rows of Go to Test: the tests that exist, and Create New Test last after a
+/// separator.
 fn test_menu(
     workspace: &Workspace,
     found: Vec<PathBuf>,
     spot: Option<lang_api::DocumentSpot>,
     weak: WeakEntity<Workspace>,
 ) -> Vec<MenuEntry> {
+    let root = workspace.root().to_path_buf();
+    let icons = workspace.icons().clone();
     let mut entries: Vec<MenuEntry> = found
         .into_iter()
         .map(|path| {
-            let label = path
-                .strip_prefix(workspace.root())
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
+            let label = path.file_stem().map_or_else(
+                || path.display().to_string(),
+                |stem| stem.to_string_lossy().into_owned(),
+            );
+            let icon = icons.icon_for(&path);
+            let folder = test_folder(&root, &path);
             let weak = weak.clone();
-            MenuEntry::new(label, move |window, cx| {
+            let row = MenuEntry::new(label, move |window, cx| {
                 weak.update(cx, |this, cx| this.open_file(path.clone(), window, cx))
                     .ok();
             })
+            .icon(icon);
+            match folder {
+                Some(folder) => row.detail(folder),
+                None => row,
+            }
         })
         .collect();
     if let Some(spot) = spot {
+        if !entries.is_empty() {
+            entries.push(MenuEntry::separator());
+        }
         entries.push(create_test_entry(spot));
     }
     entries
+}
+
+/// The folder of a test from the root of the project, as the row shows it: a path with
+/// `/` on every system.
+fn test_folder(root: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let parent = relative.parent()?;
+    let folder = parent.to_string_lossy().replace('\\', "/");
+    (!folder.is_empty()).then_some(folder)
 }
 
 /// "Create New Test..." of Go to Test: the Create Test window of the language.
@@ -1321,7 +1356,7 @@ fn copy_element_now(
     let target = match crate::copy_class::copy_file(workspace, source, name, folder, cx) {
         Ok(target) => target,
         Err(error) => {
-            workspace.notify_user("Copy Element", error, cx);
+            workspace.notify_error("Copy Element", error, cx);
             return;
         }
     };
@@ -1547,7 +1582,7 @@ fn exit(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
                     }
                 }
                 if let Some(text) = failure {
-                    workspace.notify_user("Cannot save", text, cx);
+                    workspace.notify_error("Cannot save", text, cx);
                     return;
                 }
                 workspace.close_all_windows(true, window, cx);
@@ -1577,7 +1612,7 @@ fn toggle_read_only(workspace: &mut Workspace, _window: &mut Window, cx: &mut Co
         return;
     };
     let Ok(metadata) = std::fs::metadata(&path) else {
-        workspace.notify_user(
+        workspace.notify_error(
             "Read-Only",
             format!("{} is not on disk", path.display()),
             cx,
@@ -1588,7 +1623,7 @@ fn toggle_read_only(workspace: &mut Workspace, _window: &mut Window, cx: &mut Co
     let mut permissions = metadata.permissions();
     permissions.set_readonly(read_only);
     if let Err(error) = std::fs::set_permissions(&path, permissions) {
-        workspace.notify_user("Read-Only", format!("{}: {error}", path.display()), cx);
+        workspace.notify_error("Read-Only", format!("{}: {error}", path.display()), cx);
         return;
     }
     view.update(cx, |view, cx| view.set_read_only(read_only, cx));
@@ -2154,7 +2189,7 @@ fn ask_endpoint(
             Err(message) => {
                 workspace_weak
                     .update(cx, |workspace, cx| {
-                        workspace.notify_user("Attach to JVM", message, cx)
+                        workspace.notify_warning("Attach to JVM", message, cx)
                     })
                     .ok();
                 return;
@@ -2197,7 +2232,7 @@ fn begin_attach(
     let Some(service) = runs.read(cx).debug_service() else {
         workspace
             .update(cx, |workspace, cx| {
-                workspace.notify_user("Attach to JVM", "The language server is not running", cx)
+                workspace.notify_warning("Attach to JVM", "The language server is not running", cx)
             })
             .ok();
         return;
@@ -2223,7 +2258,7 @@ fn begin_attach(
         Err(error) => {
             workspace
                 .update(cx, |workspace, cx| {
-                    workspace.notify_user("Attach to JVM", error, cx)
+                    workspace.notify_error("Attach to JVM", error, cx)
                 })
                 .ok();
         }

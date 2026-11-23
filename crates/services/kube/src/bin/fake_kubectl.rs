@@ -36,6 +36,19 @@ fn main() {
     }
     match words.as_slice() {
         ["config", "view", ..] => config_view(&state),
+        ["config", "get-contexts", ..] => {
+            for context in state["contexts"].as_array().into_iter().flatten() {
+                println!("{}", context["name"].as_str().unwrap_or_default());
+            }
+        }
+        ["config", "current-context", ..] => {
+            println!("{}", state["current_context"].as_str().unwrap_or_default());
+        }
+        ["config", "use-context", name, ..] => {
+            state["current_context"] = Value::String((*name).to_owned());
+            save(&path, &state);
+            println!("Switched to context \"{name}\".");
+        }
         ["get", "namespaces", ..] => {
             let items: Vec<Value> = state["namespaces"]
                 .as_array()

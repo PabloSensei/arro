@@ -393,8 +393,8 @@ fn the_results_of_two_files_are_grouped_by_their_files(cx: &mut TestAppContext) 
     assert_eq!(
         groups,
         vec![
-            ("Main.txt  (1)".to_owned(), Some("src".to_owned()), 0),
-            ("Other.txt  (1)".to_owned(), Some("src".to_owned()), 0),
+            ("Main.txt".to_owned(), Some("src (1)".to_owned()), 0),
+            ("Other.txt".to_owned(), Some("src (1)".to_owned()), 0),
         ],
         "every file is a group with its count and the package in grey"
     );
