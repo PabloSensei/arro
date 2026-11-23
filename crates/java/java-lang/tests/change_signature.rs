@@ -152,6 +152,7 @@ fn fixture(project: &str, name: &str, extra: &[(&str, &str)]) -> Fixture {
         gradle_java_home: Some(fs::canonicalize(corpus.join("jdk").join("17")).unwrap()),
         offline: true,
         environment: HashMap::new(),
+        max_heap_mb: None,
     };
     Fixture { root, config }
 }

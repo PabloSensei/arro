@@ -276,6 +276,7 @@ fn fixture(tool: Tool) -> Fixture {
         gradle_java_home: Some(jdk21.home.clone()),
         offline: tool == Tool::Maven,
         environment: std::collections::HashMap::new(),
+        max_heap_mb: None,
     };
     let session = JavaSession::open(config, sidecar::Trust::Trusted).expect("jdtls starts");
     wait_ready(&session);

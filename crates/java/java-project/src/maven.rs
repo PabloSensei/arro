@@ -115,7 +115,10 @@ impl Maven {
             .clone();
         let (kind, configured) = match &chosen {
             Some(home) => (ToolHome::Custom, Some(home.as_path())),
-            None => (settings.home_kind, settings.home_path().map(Path::new)),
+            None => (
+                settings.chosen_home_kind(),
+                settings.home_path().map(Path::new),
+            ),
         };
         find_maven_home(
             root,
@@ -213,6 +216,8 @@ impl BuildSystem for Maven {
             ),
             download: Some("Download Maven".into()),
             choose: Some("Choose Maven home\u{2026}".into()),
+            create_wrapper: None,
+            use_downloaded: None,
             settings: Some(("Build Tools \u{2192} Maven".into(), "build_tool_first_home")),
         })
     }

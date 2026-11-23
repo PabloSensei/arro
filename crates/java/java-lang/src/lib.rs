@@ -316,6 +316,7 @@ mod tests {
             gradle_java_home: None,
             offline: true,
             environment: HashMap::new(),
+            max_heap_mb: None,
         };
         let outcome = JavaProject::open(config, Trust::Untrusted);
         assert!(matches!(outcome, Err(OpenError::NotTrusted)));

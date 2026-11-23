@@ -195,6 +195,7 @@ mod tests {
             gradle_java_home: None,
             offline: true,
             environment: HashMap::new(),
+            max_heap_mb: None,
         };
         Jdtls::new(config).unwrap()
     }

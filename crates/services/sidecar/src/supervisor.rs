@@ -112,6 +112,9 @@ pub struct Limits {
     /// Short stops for memory in a row before automatic starts turn off until
     /// the user asks for one.
     pub memory_attempts: u32,
+    /// How long memory must stay low, without a reading that clears, before a running
+    /// server stops for it. A host that adds memory on demand clears a dip in seconds.
+    pub memory_hold: Duration,
 }
 
 impl Default for Limits {
@@ -125,6 +128,7 @@ impl Default for Limits {
             memory_wait: Duration::from_secs(30),
             memory_wait_max: Duration::from_secs(300),
             memory_attempts: 3,
+            memory_hold: platform::LOW_MEMORY_HOLD,
         }
     }
 }
@@ -144,6 +148,18 @@ pub struct Status {
     /// Restarts since the last stable run.
     pub crashes: u32,
     pub last_error: Option<String>,
+}
+
+impl Status {
+    /// Whether the server stopped because memory is low, automatically or for a restart
+    /// by the user. A status line of the window puts this stop before the import.
+    pub fn stopped_for_memory(&self) -> bool {
+        self.state == State::Stopped
+            && self
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error == MEMORY_AUTOMATIC || error == MEMORY_MANUAL)
+    }
 }
 
 /// Passes server traffic to its consumer and moves the state.
@@ -389,6 +405,29 @@ async fn low_memory(memory: &mut watch::Receiver<bool>) {
     }
 }
 
+/// Waits until memory has been low for `hold` without a break. A reading that clears in
+/// between starts the count over, so a short dip of free memory stops nothing.
+async fn low_memory_for(memory: &mut watch::Receiver<bool>, hold: Duration) {
+    loop {
+        low_memory(memory).await;
+        let cleared = async {
+            loop {
+                if memory.changed().await.is_err() {
+                    // Without the watcher nothing can clear the reading.
+                    std::future::pending::<()>().await;
+                }
+                if !*memory.borrow_and_update() {
+                    return;
+                }
+            }
+        };
+        tokio::select! {
+            () = sleep(hold) => return,
+            () = cleared => {}
+        }
+    }
+}
+
 /// The user's restart either starts the server or, when the channel is gone,
 /// ends the sidecar like a stop.
 fn user_started(started: Option<()>) -> MemoryWait {
@@ -473,7 +512,7 @@ impl Supervisor {
                     let event = tokio::select! {
                         () = sleep(backoff) => Backoff::Elapsed,
                         _ = self.stops.recv() => Backoff::Stop,
-                        _ = low_memory(&mut self.memory) => Backoff::LowMemory,
+                        _ = low_memory_for(&mut self.memory, self.limits.memory_hold) => Backoff::LowMemory,
                     };
                     match event {
                         Backoff::Elapsed => {}
@@ -680,7 +719,7 @@ impl Supervisor {
                 running.handle.kill();
                 return Outcome::Reload;
             }
-            _ = low_memory(&mut self.memory) => {
+            _ = low_memory_for(&mut self.memory, self.limits.memory_hold) => {
                 self.status.send_modify(|status| {
                     status.last_error = Some(MEMORY_AUTOMATIC.to_owned());
                 });
@@ -712,7 +751,7 @@ impl Supervisor {
                 self.shut_down(running).await;
                 Outcome::Reload
             }
-            _ = low_memory(&mut self.memory) => {
+            _ = low_memory_for(&mut self.memory, self.limits.memory_hold) => {
                 self.status.send_modify(|status| {
                     status.last_error = Some(MEMORY_AUTOMATIC.to_owned());
                 });

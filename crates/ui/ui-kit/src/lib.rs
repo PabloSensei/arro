@@ -27,6 +27,7 @@ mod scrollbars;
 mod test_bounds;
 mod text_field;
 mod text_field_mouse;
+pub mod time;
 mod widgets;
 
 pub use dialog::{DialogSpec, dialog_window};

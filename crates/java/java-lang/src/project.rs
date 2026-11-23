@@ -250,33 +250,34 @@ impl lang_api::SemanticServer for JavaServer {
 /// The latest project problems of the server, as the window reads them.
 pub(crate) struct ProjectProblems {
     failures: watch::Receiver<Option<ImportFailure>>,
-    log: Option<PathBuf>,
+    spec: Arc<Jdtls>,
     runtime: Handle,
 }
 
 impl ProjectProblems {
     fn list(
         failures: &watch::Receiver<Option<ImportFailure>>,
-        log: Option<PathBuf>,
+        spec: &Jdtls,
     ) -> Vec<ProjectProblem> {
-        failures
-            .borrow()
-            .clone()
-            .map(|failure| ProjectProblem {
-                file: (!failure.file.as_os_str().is_empty()).then_some(failure.file),
-                line: failure.line,
-                severity: Severity::Error,
-                message: failure.message,
-                summary: failure.summary,
-                log,
-                tool: failure.tool.map(|tool| match tool {
-                    jdtls_adapter::BuildTool::Maven => 0,
-                    jdtls_adapter::BuildTool::Gradle => 1,
-                }),
-                retry: failure.retry,
-            })
-            .into_iter()
-            .collect()
+        let Some(failure) = failures.borrow().clone() else {
+            return Vec::new();
+        };
+        // Show Log opens the log of the messages of the server. The JVM output that is
+        // not a known warning joins it under its own heading before the window opens it.
+        spec.append_jvm_output();
+        vec![ProjectProblem {
+            file: (!failure.file.as_os_str().is_empty()).then_some(failure.file),
+            line: failure.line,
+            severity: Severity::Error,
+            message: failure.message,
+            summary: failure.summary,
+            log: Some(spec.log_file()),
+            tool: failure.tool.map(|tool| match tool {
+                jdtls_adapter::BuildTool::Maven => 0,
+                jdtls_adapter::BuildTool::Gradle => 1,
+            }),
+            retry: failure.retry,
+        }]
     }
 }
 
@@ -294,11 +295,11 @@ impl Provider<ProjectProblemsQuery, Vec<ProjectProblem>> for ProjectProblems {
         mut reply: Reply<Vec<ProjectProblem>>,
     ) {
         let mut failures = self.failures.clone();
-        let log = self.log.clone();
+        let spec = self.spec.clone();
         self.runtime.spawn(async move {
             let source = SOURCE;
             loop {
-                let list = ProjectProblems::list(&failures, log.clone());
+                let list = ProjectProblems::list(&failures, &spec);
                 let answer = Answer::new(list, Confidence::Certain, source);
                 if reply.send(answer).is_err() && reply.is_cancelled() {
                     return;
@@ -520,7 +521,7 @@ impl JavaProject {
         );
         let problems = ProjectProblems {
             failures,
-            log: Some(spec.log_file()),
+            spec: spec.clone(),
             runtime: Handle::current(),
         };
         let importing = spec.watch_importing();
@@ -746,6 +747,12 @@ impl JavaProject {
     /// Starts the server again after it stopped, for example for low memory.
     pub(crate) fn restart(&self) -> bool {
         self.sidecar.restart()
+    }
+
+    /// The most heap the server takes from its next start on. A running server keeps the
+    /// heap it started with.
+    pub(crate) fn set_max_heap_mb(&self, megabytes: Option<u32>) {
+        self.spec.set_max_heap_mb(megabytes);
     }
 
     /// Project Structure chose another SDK: the server starts again with it. The state
@@ -1695,3 +1702,7 @@ impl Provider<ReferenceQuery, String> for JavaProject {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "project_log_tests.rs"]
+mod project_log_tests;

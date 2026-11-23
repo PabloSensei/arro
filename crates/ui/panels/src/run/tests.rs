@@ -1131,7 +1131,7 @@ impl RunPanel {
                 let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(run.at);
                 let label: SharedString =
                     format!("{}: {} passed, {} failed", run.name, run.passed, run.failed).into();
-                let age: SharedString = crate::history_view::age(at).into();
+                let age: SharedString = ui_kit::time::ago_now(at).into();
                 let hover = theme.hover;
                 div()
                     .id(("test-history-row", index))

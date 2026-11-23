@@ -14,12 +14,17 @@ use database::{
     Column, ColumnKind, DriverKind, ResultSet, Source, SourceId, Table, TableKind, Value,
 };
 use ui_kit::gpui;
-use ui_kit::gpui::{TestAppContext, VisualTestContext, WindowHandle};
+use ui_kit::gpui::{
+    Modifiers, MouseButton, Pixels, Point, TestAppContext, VisualTestContext, WindowHandle, point,
+    px,
+};
 use workspace::{DATABASE_TOOL, Workspace};
 
 use crate::database_data::Question;
 use crate::database_panel::{ActiveDatabase, DatabasePanel, ScriptedCommand, ScriptedReply};
-use crate::window_tests::{draw, open_window, press, sample_project, type_text, wait_for_signal};
+use crate::window_tests::{
+    bounds_of, click, draw, open_window, press, sample_project, type_text, wait_for_signal,
+};
 
 const SOURCE: &str = "owners";
 
@@ -647,5 +652,724 @@ fn a_view_is_read_only_and_says_why(cx: &mut TestAppContext) {
         view.read_with(cx, |view, _| view.model_for_test().row_count()),
         2,
         "a view takes no new row"
+    );
+}
+
+#[ui_kit::gpui::test]
+fn a_click_on_a_cell_selects_it(cx: &mut TestAppContext) {
+    let (window, panel) = data_tab(
+        cx,
+        "database-data-click",
+        table(),
+        vec![page(owners()), count(2)],
+    );
+    let view = wait_for_rows(cx, &panel, &table(), 2);
+
+    click(cx, window, "database-data-cell-1-2");
+    draw(cx, window);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selected_for_test()),
+        Some((1, 2))
+    );
+}
+
+/// Three owners: the third has no age, so its cell is NULL.
+fn three_owners() -> Vec<Vec<Value>> {
+    vec![
+        vec![
+            Value::Integer(1),
+            Value::Text("Ann".into()),
+            Value::Integer(30),
+        ],
+        vec![
+            Value::Integer(2),
+            Value::Text("Bob".into()),
+            Value::Integer(40),
+        ],
+        vec![Value::Integer(3), Value::Text("Cid".into()), Value::Null],
+    ]
+}
+
+/// A debug selector that lives as long as the test, for the cells of the grid.
+fn selector(text: String) -> &'static str {
+    Box::leak(text.into_boxed_str())
+}
+
+/// The centre of a cell of the grid on the screen.
+fn cell_centre(
+    cx: &mut TestAppContext,
+    window: WindowHandle<Workspace>,
+    row: usize,
+    column: usize,
+) -> Point<Pixels> {
+    bounds_of(
+        cx,
+        window,
+        selector(format!("database-data-cell-{row}-{column}")),
+    )
+    .center()
+}
+
+/// The left edge of the element with a debug selector, in pixels.
+fn left_of(cx: &mut TestAppContext, window: WindowHandle<Workspace>, name: String) -> f32 {
+    f32::from(bounds_of(cx, window, selector(name)).left())
+}
+
+/// The text on the clipboard now.
+fn clipboard(cx: &mut TestAppContext) -> Option<String> {
+    cx.read(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
+}
+
+/// Puts a text on the clipboard that a copy must replace.
+fn clear_clipboard(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.write_to_clipboard(ui_kit::ClipboardItem::new_string("before".to_owned())));
+}
+
+/// Presses the left button at `from`, moves to `to` and releases it there.
+fn drag(
+    cx: &mut TestAppContext,
+    window: WindowHandle<Workspace>,
+    from: Point<Pixels>,
+    to: Point<Pixels>,
+    modifiers: Modifiers,
+) {
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_mouse_down(from, MouseButton::Left, modifiers);
+    visual.simulate_mouse_move(to, MouseButton::Left, modifiers);
+    visual.simulate_mouse_up(to, MouseButton::Left, modifiers);
+    cx.run_until_parked();
+}
+
+/// A click at `at` with the keys of `modifiers` held.
+fn click_at(
+    cx: &mut TestAppContext,
+    window: WindowHandle<Workspace>,
+    at: Point<Pixels>,
+    modifiers: Modifiers,
+) {
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_click(at, modifiers);
+    cx.run_until_parked();
+}
+
+/// Moves the pointer to `at` with no button held.
+fn hover(cx: &mut TestAppContext, window: WindowHandle<Workspace>, at: Point<Pixels>) {
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_mouse_move(at, None::<MouseButton>, Modifiers::default());
+    cx.run_until_parked();
+}
+
+/// A press and a release of the right button at `at`, which opens the menu of the place.
+fn right_click(cx: &mut TestAppContext, window: WindowHandle<Workspace>, at: Point<Pixels>) {
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_mouse_down(at, MouseButton::Right, Modifiers::default());
+    visual.simulate_mouse_up(at, MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
+}
+
+fn ctrl() -> Modifiers {
+    Modifiers {
+        control: true,
+        ..Modifiers::default()
+    }
+}
+
+fn shift() -> Modifiers {
+    Modifiers {
+        shift: true,
+        ..Modifiers::default()
+    }
+}
+
+#[ui_kit::gpui::test]
+fn a_drag_selects_a_rectangle_and_ctrl_c_copies_it(cx: &mut TestAppContext) {
+    let (window, panel) = data_tab(
+        cx,
+        "database-data-drag",
+        table(),
+        vec![page(three_owners()), count(3)],
+    );
+    let _view = wait_for_rows(cx, &panel, &table(), 3);
+    draw(cx, window);
+
+    let from = cell_centre(cx, window, 0, 0);
+    let to = cell_centre(cx, window, 2, 1);
+    drag(cx, window, from, to, Modifiers::default());
+    draw(cx, window);
+    clear_clipboard(cx);
+    press(cx, window, "ctrl-c");
+    assert_eq!(
+        clipboard(cx).as_deref(),
+        Some("1\tAnn\n2\tBob\n3\tCid"),
+        "three rows of two cells"
+    );
+}
+
+#[ui_kit::gpui::test]
+fn shift_click_draws_the_rectangle_from_the_anchor(cx: &mut TestAppContext) {
+    let (window, panel) = data_tab(
+        cx,
+        "database-data-shift",
+        table(),
+        vec![page(owners()), count(2)],
+    );
+    let _view = wait_for_rows(cx, &panel, &table(), 2);
+    click(cx, window, "database-data-cell-0-0");
+    draw(cx, window);
+    let to = cell_centre(cx, window, 1, 1);
+    click_at(cx, window, to, shift());
+    draw(cx, window);
+    clear_clipboard(cx);
+    press(cx, window, "ctrl-c");
+    assert_eq!(clipboard(cx).as_deref(), Some("1\tAnn\n2\tBob"));
+}
+
+#[ui_kit::gpui::test]
+fn ctrl_click_takes_two_cells_of_a_row_and_the_cell_between_copies_empty(cx: &mut TestAppContext) {
+    let (window, panel) = data_tab(
+        cx,
+        "database-data-ctrl",
+        table(),
+        vec![page(owners()), count(2)],
+    );
+    let _view = wait_for_rows(cx, &panel, &table(), 2);
+    click(cx, window, "database-data-cell-0-0");
+    draw(cx, window);
+    let at = cell_centre(cx, window, 0, 2);
+    click_at(cx, window, at, ctrl());
+    draw(cx, window);
+    clear_clipboard(cx);
+    press(cx, window, "ctrl-c");
+    assert_eq!(
+        clipboard(cx).as_deref(),
+        Some("1\t\t30"),
+        "the cell between the two is copied empty"
+    );
+
+    // Ctrl+click on a selected cell takes it out of the selection.
+    let first = cell_centre(cx, window, 0, 0);
+    click_at(cx, window, first, ctrl());
+    draw(cx, window);
+    clear_clipboard(cx);
+    press(cx, window, "ctrl-c");
+    assert_eq!(clipboard(cx).as_deref(), Some("30"));
+}
+
+#[ui_kit::gpui::test]
+fn ctrl_drag_adds_a_rectangle_of_its_own(cx: &mut TestAppContext) {
+    let (window, panel) = data_tab(
+        cx,
+        "database-data-ctrl-drag",
+        table(),
+        vec![page(three_owners()), count(3)],
+    );
+    let _view = wait_for_rows(cx, &panel, &table(), 3);
+    click(cx, window, "database-data-cell-0-0");
+    draw(cx, window);
+
+    let from = cell_centre(cx, window, 1, 2);
+    let to = cell_centre(cx, window, 2, 2);
+    drag(cx, window, from, to, ctrl());
+    draw(cx, window);
+    clear_clipboard(cx);
+    press(cx, window, "ctrl-c");
+    assert_eq!(
+        clipboard(cx).as_deref(),
+        Some("1\t\t\n\t\t40\n\t\tNULL"),
+        "the first cell and the dragged rectangle share one grid"
+    );
+}
+
+#[ui_kit::gpui::test]
+fn shift_click_on_headers_selects_the_columns_between(cx: &mut TestAppContext) {
+    let (window, panel) = data_tab(
+        cx,
+        "database-data-shift-head",
+        table(),
+        vec![page(owners()), count(2)],
+    );
+    let _view = wait_for_rows(cx, &panel, &table(), 2);
+    click(cx, window, "database-data-head-0");
+    draw(cx, window);
+    let last = bounds_of(cx, window, "database-data-head-2").center();
+    click_at(cx, window, last, shift());
+    draw(cx, window);
+    clear_clipboard(cx);
+    press(cx, window, "ctrl-c");
+    assert_eq!(
+        clipboard(cx).as_deref(),
+        Some("ID\tNAME\tAGE\n1\tAnn\t30\n2\tBob\t40"),
+        "whole columns carry their names"
+    );
+
+    // Ctrl+click on a header takes its column out; the columns that stay are whole and keep the
+    // names, and the removed column stays in the box as empty cells.
+    let middle = bounds_of(cx, window, "database-data-head-1").center();
+    click_at(cx, window, middle, ctrl());
+    draw(cx, window);
+    clear_clipboard(cx);
+    press(cx, window, "ctrl-c");
+    assert_eq!(
+        clipboard(cx).as_deref(),
+        Some("ID\tNAME\tAGE\n1\t\t30\n2\t\t40"),
+        "the removed column is empty, the others keep their names"
+    );
+}
+
+#[ui_kit::gpui::test]
+fn a_drag_past_the_edge_scrolls_the_rows_until_the_release(cx: &mut TestAppContext) {
+    let rows: Vec<Vec<Value>> = (0..60)
+        .map(|index| {
+            vec![
+                Value::Integer(index + 1),
+                Value::Text(format!("n{index}")),
+                Value::Integer(index),
+            ]
+        })
+        .collect();
+    let (window, panel) = data_tab(
+        cx,
+        "database-data-autoscroll",
+        table(),
+        vec![page(rows), count(60)],
+    );
+    let view = wait_for_rows(cx, &panel, &table(), 60);
+    draw(cx, window);
+
+    // The press in the first cell, and a move to a point below the rows, which the frames scroll.
+    let from = cell_centre(cx, window, 0, 0);
+    let list = bounds_of(cx, window, "database-data-rows");
+    let below = point(from.x, list.bottom() + px(40.));
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+    visual.simulate_mouse_move(below, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    for _ in 0..5 {
+        draw(cx, window);
+    }
+    let reached = view.read_with(cx, |view, _| view.selected_for_test());
+    assert!(
+        reached.is_some_and(|(row, _)| row >= 5),
+        "the rows scrolled under the pointer: {reached:?}"
+    );
+
+    // The release ends the drag, so the next frames leave the selection where it is.
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_mouse_up(below, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    draw(cx, window);
+    let released = view.read_with(cx, |view, _| view.selected_for_test());
+    draw(cx, window);
+    draw(cx, window);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selected_for_test()),
+        released,
+        "no scroll after the release"
+    );
+}
+
+#[ui_kit::gpui::test]
+fn a_click_on_a_header_selects_the_column_and_copy_gives_its_name(cx: &mut TestAppContext) {
+    let (window, panel) = data_tab(
+        cx,
+        "database-data-column",
+        table(),
+        vec![page(owners()), count(2)],
+    );
+    let _view = wait_for_rows(cx, &panel, &table(), 2);
+    click(cx, window, "database-data-head-1");
+    draw(cx, window);
+    clear_clipboard(cx);
+    press(cx, window, "ctrl-c");
+    assert_eq!(clipboard(cx).as_deref(), Some("NAME\nAnn\nBob"));
+}
+
+#[ui_kit::gpui::test]
+fn a_click_on_a_header_keeps_the_sort_and_the_icon_sorts(cx: &mut TestAppContext) {
+    let replies = vec![
+        page(owners()),
+        count(2),
+        page(owners()),
+        count(2),
+        page(owners()),
+        count(2),
+        page(owners()),
+        count(2),
+    ];
+    let (window, panel) = data_tab(cx, "database-data-sort", table(), replies);
+    let view = wait_for_rows(cx, &panel, &table(), 2);
+    let reads = panel.read_with(cx, |panel, _| panel.queries_for_test().len());
+
+    click(cx, window, "database-data-head-1");
+    draw(cx, window);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.sort_for_test()),
+        None,
+        "a click on the name sorts nothing"
+    );
+    assert_eq!(
+        panel.read_with(cx, |panel, _| panel.queries_for_test().len()),
+        reads,
+        "and reads nothing"
+    );
+
+    // The icon shows while the pointer is over the header: ascending, then descending, then none.
+    let head = bounds_of(cx, window, "database-data-head-1").center();
+    hover(cx, window, head);
+    draw(cx, window);
+    click(cx, window, "database-data-sort-1");
+    wait_for_signal(cx, "the ascending sort", |cx| {
+        view.read_with(cx, |view, _| {
+            view.sort_for_test() == Some(("NAME".to_owned(), true))
+        })
+    });
+    let queries = panel.read_with(cx, |panel, _| panel.queries_for_test());
+    assert!(
+        queries
+            .iter()
+            .any(|(sql, _)| sql.contains("ORDER BY \"NAME\" ASC")),
+        "{queries:?}"
+    );
+
+    draw(cx, window);
+    click(cx, window, "database-data-sort-1");
+    wait_for_signal(cx, "the descending sort", |cx| {
+        view.read_with(cx, |view, _| {
+            view.sort_for_test() == Some(("NAME".to_owned(), false))
+        })
+    });
+    draw(cx, window);
+    click(cx, window, "database-data-sort-1");
+    wait_for_signal(cx, "no sort", |cx| {
+        view.read_with(cx, |view, _| view.sort_for_test().is_none())
+    });
+}
+
+#[ui_kit::gpui::test]
+fn the_row_numbers_count_the_rows_and_a_click_selects_the_whole_row(cx: &mut TestAppContext) {
+    let (window, panel) = data_tab(
+        cx,
+        "database-data-numbers",
+        table(),
+        vec![page(owners()), count(2)],
+    );
+    let view = wait_for_rows(cx, &panel, &table(), 2);
+    assert_eq!(
+        view.read_with(cx, |view, _| (
+            view.number_for_test(0),
+            view.number_for_test(1)
+        )),
+        (1, 2)
+    );
+
+    draw(cx, window);
+    click(cx, window, "database-data-number-1");
+    draw(cx, window);
+    clear_clipboard(cx);
+    press(cx, window, "ctrl-c");
+    assert_eq!(
+        clipboard(cx).as_deref(),
+        Some("2\tBob\t40"),
+        "the whole row is selected"
+    );
+}
+
+#[ui_kit::gpui::test]
+fn the_rows_of_a_second_page_go_on_from_the_page_size(cx: &mut TestAppContext) {
+    let (window, panel) = data_tab(
+        cx,
+        "database-data-numbers-page",
+        table(),
+        vec![
+            page(owners()),
+            count(3),
+            page(vec![vec![
+                Value::Integer(3),
+                Value::Text("Cid".into()),
+                Value::Null,
+            ]]),
+            count(3),
+        ],
+    );
+    let view = wait_for_rows(cx, &panel, &table(), 2);
+
+    click(cx, window, "database-data-next");
+    wait_for_signal(cx, "the second page", |cx| {
+        view.read_with(cx, |view, _| {
+            view.page_for_test() == 1 && view.model_for_test().row_count() == 1
+        })
+    });
+    assert_eq!(
+        view.read_with(cx, |view, _| view.number_for_test(0)),
+        501,
+        "the first row of the second page is the 501st"
+    );
+}
+
+#[ui_kit::gpui::test]
+fn ctrl_a_and_the_corner_select_every_loaded_row(cx: &mut TestAppContext) {
+    let (window, panel) = data_tab(
+        cx,
+        "database-data-select-all",
+        table(),
+        vec![page(owners()), count(2)],
+    );
+    let _view = wait_for_rows(cx, &panel, &table(), 2);
+    click(cx, window, "database-data-cell-0-0");
+    draw(cx, window);
+    press(cx, window, "ctrl-a");
+    draw(cx, window);
+    clear_clipboard(cx);
+    press(cx, window, "ctrl-c");
+    assert_eq!(
+        clipboard(cx).as_deref(),
+        Some("1\tAnn\t30\n2\tBob\t40"),
+        "every loaded row, and no names: the rows are selected, not the columns"
+    );
+
+    press(cx, window, "down");
+    draw(cx, window);
+    clear_clipboard(cx);
+    press(cx, window, "ctrl-c");
+    assert_eq!(
+        clipboard(cx).as_deref(),
+        Some("2"),
+        "an arrow without Shift leaves one cell"
+    );
+
+    click(cx, window, "database-data-cell-0-1");
+    draw(cx, window);
+    click(cx, window, "database-data-corner");
+    draw(cx, window);
+    clear_clipboard(cx);
+    press(cx, window, "ctrl-c");
+    assert_eq!(clipboard(cx).as_deref(), Some("1\tAnn\t30\n2\tBob\t40"));
+}
+
+#[ui_kit::gpui::test]
+fn a_right_click_inside_the_selection_keeps_it_for_the_menu(cx: &mut TestAppContext) {
+    let (window, panel) = data_tab(
+        cx,
+        "database-data-menu-select",
+        table(),
+        vec![page(three_owners()), count(3)],
+    );
+    let _view = wait_for_rows(cx, &panel, &table(), 3);
+    draw(cx, window);
+    let from = cell_centre(cx, window, 0, 0);
+    let to = cell_centre(cx, window, 1, 1);
+    drag(cx, window, from, to, Modifiers::default());
+    draw(cx, window);
+
+    // A right click inside the rectangle keeps it, so Copy of the menu copies all of it.
+    let inside = cell_centre(cx, window, 1, 0);
+    right_click(cx, window, inside);
+    draw(cx, window);
+    clear_clipboard(cx);
+    click(cx, window, "menu-0");
+    assert_eq!(clipboard(cx).as_deref(), Some("1\tAnn\n2\tBob"));
+
+    // A right click outside the rectangle selects the cell under it, and Copy takes that cell.
+    let outside = cell_centre(cx, window, 1, 2);
+    right_click(cx, window, outside);
+    draw(cx, window);
+    clear_clipboard(cx);
+    click(cx, window, "menu-0");
+    assert_eq!(clipboard(cx).as_deref(), Some("40"));
+}
+
+#[ui_kit::gpui::test]
+fn the_menu_of_a_header_sorts_the_rows(cx: &mut TestAppContext) {
+    let (window, panel) = data_tab(
+        cx,
+        "database-data-header-menu",
+        table(),
+        vec![page(owners()), count(2), page(owners()), count(2)],
+    );
+    let view = wait_for_rows(cx, &panel, &table(), 2);
+    draw(cx, window);
+    let head = bounds_of(cx, window, "database-data-head-1").center();
+    right_click(cx, window, head);
+    draw(cx, window);
+    click(cx, window, "menu-0");
+    wait_for_signal(cx, "the ascending sort from the menu", |cx| {
+        view.read_with(cx, |view, _| {
+            view.sort_for_test() == Some(("NAME".to_owned(), true))
+        })
+    });
+}
+
+#[ui_kit::gpui::test]
+fn the_numbers_stay_in_place_when_the_grid_scrolls_sideways(cx: &mut TestAppContext) {
+    let wide = wide_table();
+    let (window, panel) = data_tab(
+        cx,
+        "database-data-scroll",
+        wide.clone(),
+        vec![wide_page(), count(1)],
+    );
+    let view = wait_for_rows(cx, &panel, &wide, 1);
+    draw(cx, window);
+    let number = left_of(cx, window, "database-data-number-0".to_owned());
+    let head = left_of(cx, window, "database-data-head-2".to_owned());
+    let cell = left_of(cx, window, "database-data-cell-0-2".to_owned());
+    assert!(
+        (head - cell).abs() < 0.5,
+        "the header lines up with the rows"
+    );
+
+    view.read_with(cx, |view, _| view.scroll_sideways_for_test(-120.));
+    draw(cx, window);
+    assert!(
+        view.read_with(cx, |view, _| view.scroll_x_for_test()) < 0.,
+        "the rows scrolled to the right"
+    );
+    let number_after = left_of(cx, window, "database-data-number-0".to_owned());
+    let head_after = left_of(cx, window, "database-data-head-2".to_owned());
+    let cell_after = left_of(cx, window, "database-data-cell-0-2".to_owned());
+    assert!(
+        (number_after - number).abs() < 0.5,
+        "the numbers stay where they were"
+    );
+    assert!(cell_after < cell, "the cells moved to the left");
+    assert!(
+        (head_after - cell_after).abs() < 0.5,
+        "the header follows the rows"
+    );
+}
+
+/// Twelve text columns, wider than the grid, so that the grid scrolls sideways.
+fn wide_columns() -> Vec<Column> {
+    (0..12)
+        .map(|index| Column {
+            name: format!("C{index}"),
+            type_name: "VARCHAR".into(),
+            kind: ColumnKind::Text,
+            nullable: true,
+            primary_key: index == 0,
+        })
+        .collect()
+}
+
+/// The table of the wide columns.
+fn wide_table() -> Table {
+    Table {
+        name: "WIDE".into(),
+        columns: wide_columns(),
+        ..table()
+    }
+}
+
+/// One row of the wide table, as the driver answers it.
+fn wide_page() -> ScriptedReply {
+    let row: Vec<Value> = (0..12)
+        .map(|index| Value::Text(format!("v{index}")))
+        .collect();
+    ScriptedReply {
+        result: ResultSet {
+            columns: wide_columns(),
+            rows: vec![row],
+            update_count: None,
+            truncated: false,
+        },
+        error: None,
+    }
+}
+
+#[ui_kit::gpui::test]
+fn a_drag_past_the_right_edge_scrolls_the_columns(cx: &mut TestAppContext) {
+    let wide = wide_table();
+    let (window, panel) = data_tab(
+        cx,
+        "database-data-scroll-edge",
+        wide.clone(),
+        vec![wide_page(), count(1)],
+    );
+    let view = wait_for_rows(cx, &panel, &wide, 1);
+    draw(cx, window);
+
+    // The press in the first cell, and a move to the right of the grid, which the frames scroll.
+    let from = cell_centre(cx, window, 0, 0);
+    let list = bounds_of(cx, window, "database-data-rows");
+    let beyond = point(list.right() + px(40.), from.y);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+    visual.simulate_mouse_move(beyond, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    for _ in 0..4 {
+        draw(cx, window);
+    }
+    assert!(
+        view.read_with(cx, |view, _| view.scroll_x_for_test()) < 0.,
+        "the columns scrolled to the right"
+    );
+    let reached = view.read_with(cx, |view, _| view.selected_for_test());
+    assert!(
+        reached.is_some_and(|(_, column)| column >= 3),
+        "the drag reached the columns on the right: {reached:?}"
+    );
+
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_mouse_up(beyond, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+}
+
+#[ui_kit::gpui::test]
+fn shift_arrows_extend_the_rectangle_from_the_anchor(cx: &mut TestAppContext) {
+    let (window, panel) = data_tab(
+        cx,
+        "database-data-shift-arrows",
+        table(),
+        vec![page(owners()), count(2)],
+    );
+    let _view = wait_for_rows(cx, &panel, &table(), 2);
+    click(cx, window, "database-data-cell-0-0");
+    draw(cx, window);
+    press(cx, window, "shift-down");
+    draw(cx, window);
+    clear_clipboard(cx);
+    press(cx, window, "ctrl-c");
+    assert_eq!(
+        clipboard(cx).as_deref(),
+        Some("1\n2"),
+        "the rectangle reaches the row below"
+    );
+}
+
+#[ui_kit::gpui::test]
+fn a_drag_across_row_numbers_selects_rows_and_across_headers_selects_columns(
+    cx: &mut TestAppContext,
+) {
+    let (window, panel) = data_tab(
+        cx,
+        "database-data-drag-axes",
+        table(),
+        vec![page(owners()), count(2)],
+    );
+    let _view = wait_for_rows(cx, &panel, &table(), 2);
+    draw(cx, window);
+
+    let from = bounds_of(cx, window, "database-data-number-0").center();
+    let to = bounds_of(cx, window, "database-data-number-1").center();
+    drag(cx, window, from, to, Modifiers::default());
+    draw(cx, window);
+    clear_clipboard(cx);
+    press(cx, window, "ctrl-c");
+    assert_eq!(
+        clipboard(cx).as_deref(),
+        Some("1\tAnn\t30\n2\tBob\t40"),
+        "two whole rows"
+    );
+
+    let from = bounds_of(cx, window, "database-data-head-0").center();
+    let to = bounds_of(cx, window, "database-data-head-1").center();
+    drag(cx, window, from, to, Modifiers::default());
+    draw(cx, window);
+    clear_clipboard(cx);
+    press(cx, window, "ctrl-c");
+    assert_eq!(
+        clipboard(cx).as_deref(),
+        Some("ID\tNAME\n1\tAnn\n2\tBob"),
+        "two whole columns carry their names"
     );
 }

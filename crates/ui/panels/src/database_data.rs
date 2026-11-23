@@ -11,7 +11,10 @@ use database::{
     Column, DataModel, Dialect, PageQuery, Plan, RowKind, SourceId, Table, TableKind, TableRef,
     Value, csv, insert_literal, tsv,
 };
-use ui_kit::gpui::{ListHorizontalSizingBehavior, ScrollStrategy};
+use ui_kit::gpui::{
+    DispatchPhase, ListHorizontalSizingBehavior, Modifiers, MouseMoveEvent, MouseUpEvent,
+    ScrollStrategy, canvas, point,
+};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
@@ -27,6 +30,8 @@ const CELL_WIDTH: f32 = 160.;
 const DATA_ROW_HEIGHT: f32 = 24.;
 /// The height of the field of the filter.
 const FIELD_HEIGHT: f32 = 26.;
+/// The group of a column header: its sort icon shows while the header is under the pointer.
+const HEADER_GROUP: &str = "database-data-head";
 
 /// A question that stands over the tab before it closes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +65,174 @@ struct Submit {
     failed: bool,
 }
 
+/// The part of the table that a press picks: one cell, a row from its number, or a column
+/// from its header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pick {
+    Cells,
+    Rows,
+    Columns,
+}
+
+/// A rectangle of the grid with both of its ends included, and the gesture that drew it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Span {
+    top: usize,
+    bottom: usize,
+    left: usize,
+    right: usize,
+    pick: Pick,
+}
+
+impl Span {
+    /// The rectangle between two cells, whichever corner each one is.
+    fn new(pick: Pick, from: (usize, usize), to: (usize, usize)) -> Self {
+        Self {
+            top: from.0.min(to.0),
+            bottom: from.0.max(to.0),
+            left: from.1.min(to.1),
+            right: from.1.max(to.1),
+            pick,
+        }
+    }
+
+    fn contains(&self, row: usize, column: usize) -> bool {
+        (self.top..=self.bottom).contains(&row) && (self.left..=self.right).contains(&column)
+    }
+
+    /// The rectangles that stay when one cell is taken out of this one. What stays is cells
+    /// now: a column or a row with a hole in it is no longer a whole one.
+    fn without(self, row: usize, column: usize) -> Vec<Span> {
+        if !self.contains(row, column) {
+            return vec![self];
+        }
+        let pick = Pick::Cells;
+        let mut rest = Vec::new();
+        if self.top < row {
+            rest.push(Span {
+                bottom: row - 1,
+                pick,
+                ..self
+            });
+        }
+        if row < self.bottom {
+            rest.push(Span {
+                top: row + 1,
+                pick,
+                ..self
+            });
+        }
+        if self.left < column {
+            rest.push(Span {
+                top: row,
+                bottom: row,
+                right: column - 1,
+                pick,
+                ..self
+            });
+        }
+        if column < self.right {
+            rest.push(Span {
+                top: row,
+                bottom: row,
+                left: column + 1,
+                pick,
+                ..self
+            });
+        }
+        rest
+    }
+
+    /// The rectangles that stay when a whole column is taken out of this one. Each part keeps
+    /// the gesture of this rectangle, so the columns that stay are whole.
+    fn without_column(self, column: usize) -> Vec<Span> {
+        if !(self.left..=self.right).contains(&column) {
+            return vec![self];
+        }
+        let mut rest = Vec::new();
+        if self.left < column {
+            rest.push(Span {
+                right: column - 1,
+                ..self
+            });
+        }
+        if column < self.right {
+            rest.push(Span {
+                left: column + 1,
+                ..self
+            });
+        }
+        rest
+    }
+
+    /// The rectangles that stay when a whole row is taken out of this one, as `without_column`.
+    fn without_row(self, row: usize) -> Vec<Span> {
+        if !(self.top..=self.bottom).contains(&row) {
+            return vec![self];
+        }
+        let mut rest = Vec::new();
+        if self.top < row {
+            rest.push(Span {
+                bottom: row - 1,
+                ..self
+            });
+        }
+        if row < self.bottom {
+            rest.push(Span {
+                top: row + 1,
+                ..self
+            });
+        }
+        rest
+    }
+}
+
+/// A drag that draws the rectangle `index` of the selection from `anchor` to the pointer.
+#[derive(Clone, Copy, Debug)]
+struct Drag {
+    pick: Pick,
+    anchor: (usize, usize),
+    index: usize,
+}
+
+/// What a copy takes from the grid: the cells of the bounding box of the selection, in the
+/// order of the table.
+struct Copied {
+    columns: Vec<Column>,
+    /// One row per row of the box; `None` is a cell that the selection does not take.
+    rows: Vec<Vec<Option<Value>>>,
+    /// The names of the columns go first: the selection is made of whole columns only.
+    names: bool,
+}
+
+impl Copied {
+    /// The grid as tab-separated text. A cell that the selection does not take is empty.
+    fn tsv(&self) -> String {
+        let mut lines: Vec<Vec<Value>> = Vec::new();
+        if self.names {
+            lines.push(
+                self.columns
+                    .iter()
+                    .map(|column| Value::Text(column.name.clone()))
+                    .collect(),
+            );
+        }
+        lines.extend(
+            self.rows
+                .iter()
+                .map(|row| filled(row, Value::Text(String::new()))),
+        );
+        tsv(&lines)
+    }
+}
+
+/// The values of a row of a copy, with `empty` in the cells that the selection does not take.
+fn filled(row: &[Option<Value>], empty: Value) -> Vec<Value> {
+    row.iter()
+        .map(|cell| cell.clone().unwrap_or_else(|| empty.clone()))
+        .collect()
+}
+
 pub struct DatabaseDataView {
     workspace: WeakEntity<Workspace>,
     panel: WeakEntity<DatabasePanel>,
@@ -81,8 +254,16 @@ pub struct DatabaseDataView {
     filter_active: bool,
     /// The column the rows are sorted by and whether the order is ascending.
     sort: Option<(String, bool)>,
+    /// The caret: the cell that the keys and the edits act on.
     selected: Option<(usize, usize)>,
+    /// The cell that Shift extends the selection from.
     anchor: Option<(usize, usize)>,
+    /// The rectangles of the selection. The last one is the one that Shift extends.
+    rects: Vec<Span>,
+    /// The drag that draws a rectangle of the selection, while the button is held.
+    drag: Option<Drag>,
+    /// Where the pointer was in the window during the drag, for the scroll at the edges.
+    pointer: Option<Point<Pixels>>,
     editing: Option<Editing>,
     /// The serial of the next request and the one that is in flight.
     serial: u64,
@@ -130,6 +311,9 @@ impl DatabaseDataView {
             sort: None,
             selected: None,
             anchor: None,
+            rects: Vec::new(),
+            drag: None,
+            pointer: None,
             editing: None,
             serial: 0,
             in_flight: None,
@@ -218,6 +402,33 @@ impl DatabaseDataView {
         self.selected
     }
 
+    /// The number that the row at `row` shows, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn number_for_test(&self, row: usize) -> usize {
+        self.row_number(row)
+    }
+
+    /// The column the rows are sorted by and whether they ascend, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn sort_for_test(&self) -> Option<(String, bool)> {
+        self.sort.clone()
+    }
+
+    /// The horizontal offset of the rows, for the window tests. It is negative once the
+    /// rows are scrolled to the right.
+    #[cfg(test)]
+    pub(crate) fn scroll_x_for_test(&self) -> f32 {
+        f32::from(self.scroll.0.borrow().base_handle.offset().x)
+    }
+
+    /// Sets the horizontal offset of the rows, for the window tests. The next frame clamps it
+    /// to the width that the grid can scroll.
+    #[cfg(test)]
+    pub(crate) fn scroll_sideways_for_test(&self, x: f32) {
+        let handle = self.scroll.0.borrow().base_handle.clone();
+        handle.set_offset(point(px(x), handle.offset().y));
+    }
+
     /// The table the tab writes to.
     fn table_ref(&self) -> TableRef {
         TableRef::new(self.table.schema.clone(), self.table.name.clone())
@@ -251,6 +462,8 @@ impl DatabaseDataView {
         self.editing = None;
         self.selected = None;
         self.anchor = None;
+        self.rects.clear();
+        self.drag = None;
         self.status = Some("Reading…".to_owned());
         let sql = query.sql(self.dialect);
         self.send(DataRequest::Page, sql, cx);
@@ -374,6 +587,7 @@ impl DatabaseDataView {
         let rows = self.align_rows();
         self.model.set_rows(rows);
         self.selected = None;
+        self.rects.clear();
         self.error = None;
         let query = self.page_query();
         self.send(DataRequest::Count, query.count_sql(self.dialect), cx);
@@ -580,8 +794,7 @@ impl DatabaseDataView {
             return;
         }
         let row = self.model.add_row();
-        self.selected = Some((row, 0));
-        self.anchor = self.selected;
+        self.select_cell(row, 0);
         self.scroll.scroll_to_item(row, ScrollStrategy::Bottom);
         cx.notify();
     }
@@ -602,6 +815,11 @@ impl DatabaseDataView {
         let rows = self.model.row_count();
         self.selected = (rows > 0).then(|| ((row).min(rows - 1), 0));
         self.anchor = self.selected;
+        self.rects = self
+            .selected
+            .into_iter()
+            .map(|cell| Span::new(Pick::Cells, cell, cell))
+            .collect();
         cx.notify();
     }
 
@@ -633,7 +851,7 @@ impl DatabaseDataView {
             Some(Value::Null) | None => String::new(),
             Some(value) => value.text(),
         };
-        self.selected = Some((row, column));
+        self.select_cell(row, column);
         self.editing = Some(Editing {
             row,
             column,
@@ -668,78 +886,380 @@ impl DatabaseDataView {
         cx.notify();
     }
 
-    /// The selected cells as text: the whole rectangle when the user extended it.
-    fn selected_rows(&self) -> Vec<Vec<Value>> {
-        let Some((row, column)) = self.selected else {
-            return Vec::new();
+    /// Selects one cell: it is the caret, the anchor and the only rectangle.
+    fn select_cell(&mut self, row: usize, column: usize) {
+        self.selected = Some((row, column));
+        self.anchor = Some((row, column));
+        self.rects = vec![Span::new(Pick::Cells, (row, column), (row, column))];
+        self.drag = None;
+    }
+
+    /// Selects every loaded row, as Ctrl+A and a click on the corner of the grid do. The
+    /// selection is of rows, so a copy of it has no names of the columns.
+    fn select_all(&mut self, cx: &mut Context<Self>) {
+        let rows = self.model.row_count();
+        let columns = self.model.columns().len();
+        if rows == 0 || columns == 0 {
+            return;
+        }
+        self.rects = vec![Span {
+            top: 0,
+            bottom: rows - 1,
+            left: 0,
+            right: columns - 1,
+            pick: Pick::Rows,
+        }];
+        self.anchor = Some((0, 0));
+        self.selected = Some(self.selected.unwrap_or((0, 0)));
+        self.drag = None;
+        cx.notify();
+    }
+
+    /// The cell that a press of `pick` names. A row keeps the column of the anchor, and a
+    /// column keeps its row, so that the anchor still gives Shift an end to draw from.
+    fn picked(&self, pick: Pick, row: usize, column: usize) -> (usize, usize) {
+        let (anchor_row, anchor_column) = self.anchor.unwrap_or((0, 0));
+        match pick {
+            Pick::Cells => (row, column),
+            Pick::Rows => (row, anchor_column),
+            Pick::Columns => (anchor_row, column),
+        }
+    }
+
+    /// The rectangle that `pick` draws from `from` to `to`. A row or a column reaches across
+    /// the whole table, so only its own row or column decides it.
+    fn span(&self, pick: Pick, from: (usize, usize), to: (usize, usize)) -> Span {
+        let last_row = self.model.row_count().saturating_sub(1);
+        let last_column = self.model.columns().len().saturating_sub(1);
+        match pick {
+            Pick::Cells => Span::new(pick, from, to),
+            Pick::Rows => Span {
+                top: from.0.min(to.0),
+                bottom: from.0.max(to.0),
+                left: 0,
+                right: last_column,
+                pick,
+            },
+            Pick::Columns => Span {
+                top: 0,
+                bottom: last_row,
+                left: from.1.min(to.1),
+                right: from.1.max(to.1),
+                pick,
+            },
+        }
+    }
+
+    /// Whether the part of the table that `pick` names at `cell` is selected in full.
+    fn taken(&self, pick: Pick, cell: (usize, usize)) -> bool {
+        match pick {
+            Pick::Cells => self.in_range(cell.0, cell.1),
+            Pick::Rows => {
+                (0..self.model.columns().len()).all(|column| self.in_range(cell.0, column))
+            }
+            Pick::Columns => (0..self.model.row_count()).all(|row| self.in_range(row, cell.1)),
+        }
+    }
+
+    /// The cells that the part of the table that `pick` names at `cell` covers.
+    fn cells_of(&self, pick: Pick, cell: (usize, usize)) -> Vec<(usize, usize)> {
+        match pick {
+            Pick::Cells => vec![cell],
+            Pick::Rows => (0..self.model.columns().len())
+                .map(|column| (cell.0, column))
+                .collect(),
+            Pick::Columns => (0..self.model.row_count())
+                .map(|row| (row, cell.1))
+                .collect(),
+        }
+    }
+
+    /// Takes the part of the table that `pick` names at `cell` out of the selection. A whole
+    /// column or row comes out of a rectangle of its own gesture as a whole, so the parts that
+    /// stay keep the gesture; any other rectangle loses the cells of the part one by one.
+    fn take_out(&mut self, pick: Pick, cell: (usize, usize)) {
+        let cells = self.cells_of(pick, cell);
+        let rects = std::mem::take(&mut self.rects);
+        self.rects = rects
+            .into_iter()
+            .flat_map(|span| match pick {
+                Pick::Columns if span.pick == Pick::Columns => span.without_column(cell.1),
+                Pick::Rows if span.pick == Pick::Rows => span.without_row(cell.0),
+                _ => cells.iter().fold(vec![span], |parts, &(row, column)| {
+                    parts
+                        .into_iter()
+                        .flat_map(|part| part.without(row, column))
+                        .collect()
+                }),
+            })
+            .collect();
+    }
+
+    /// A press of the left button on the part of the table that `pick` names. A plain press
+    /// selects it and starts a drag. Shift draws the rectangle from the anchor to it. Ctrl
+    /// takes the part out of the selection when it is selected in full, and adds it as a
+    /// rectangle of its own otherwise, with a drag that draws that rectangle.
+    fn press(
+        &mut self,
+        pick: Pick,
+        row: usize,
+        column: usize,
+        modifiers: &Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        if self.model.row_count() == 0 || self.model.columns().is_empty() {
+            return;
+        }
+        let at = self.picked(pick, row, column);
+        if modifiers.shift {
+            let from = self.anchor.unwrap_or(at);
+            self.rects = vec![self.span(pick, from, at)];
+            self.drag = None;
+        } else if modifiers.control || modifiers.platform {
+            if self.taken(pick, at) {
+                self.take_out(pick, at);
+                self.drag = None;
+            } else {
+                self.rects.push(self.span(pick, at, at));
+                self.drag = Some(Drag {
+                    pick,
+                    anchor: at,
+                    index: self.rects.len() - 1,
+                });
+            }
+            self.anchor = Some(at);
+        } else {
+            self.rects = vec![self.span(pick, at, at)];
+            self.drag = Some(Drag {
+                pick,
+                anchor: at,
+                index: 0,
+            });
+            self.anchor = Some(at);
+        }
+        self.selected = Some(at);
+        cx.notify();
+    }
+
+    /// The pointer is over `cell` during a drag, and the rectangle of the drag follows it.
+    /// `only` names the gesture of the element: a header extends a drag of columns only, and
+    /// a row number a drag of rows only.
+    fn drag_over(&mut self, cell: (usize, usize), only: Option<Pick>, cx: &mut Context<Self>) {
+        let Some(drag) = self.drag else {
+            return;
         };
-        let (top, bottom, left, right) = match self.anchor {
-            Some((anchor_row, anchor_column)) => (
-                row.min(anchor_row),
-                row.max(anchor_row),
-                column.min(anchor_column),
-                column.max(anchor_column),
-            ),
-            None => (row, row, column, column),
+        if only.is_some_and(|pick| pick != drag.pick) {
+            return;
+        }
+        self.extend_drag(cell);
+        cx.notify();
+    }
+
+    /// The rectangle of the drag reaches `cell`, and the caret follows it.
+    fn extend_drag(&mut self, cell: (usize, usize)) {
+        let Some(drag) = self.drag else {
+            return;
         };
-        let mut rows = Vec::new();
-        for index in top..=bottom {
-            let Some(found) = self.model.row(index) else {
+        let span = self.span(drag.pick, drag.anchor, cell);
+        if let Some(slot) = self.rects.get_mut(drag.index) {
+            *slot = span;
+        }
+        self.selected = Some(match drag.pick {
+            Pick::Cells => cell,
+            Pick::Rows => (cell.0, drag.anchor.1),
+            Pick::Columns => (drag.anchor.0, cell.1),
+        });
+    }
+
+    /// The pointer moved in the window during a drag. A drag ends once no button is held,
+    /// and otherwise the pointer is kept for the scroll at the edges of the rows.
+    fn drag_pointer(&mut self, position: Point<Pixels>, held: bool, cx: &mut Context<Self>) {
+        if self.drag.is_none() {
+            return;
+        }
+        if held {
+            self.pointer = Some(position);
+        } else {
+            self.end_drag();
+        }
+        cx.notify();
+    }
+
+    /// The drag ends with the release of the left button.
+    fn end_drag(&mut self) {
+        self.drag = None;
+        self.pointer = None;
+    }
+
+    /// While a drag holds the pointer past an edge of the rows, the rows scroll and the drag
+    /// reaches the row or the column at that edge. Each frame asks for the next one, until the
+    /// pointer is back among the rows or the rows reach their end. A cell drag scrolls both
+    /// ways, a row drag only up and down, and a column drag only sideways.
+    fn edge_scroll(&mut self, window: &mut Window, gutter: f32) {
+        let Some(drag) = self.drag else {
+            return;
+        };
+        let Some(pointer) = self.pointer else {
+            return;
+        };
+        let (rows, columns) = (self.model.row_count(), self.model.columns().len());
+        if rows == 0 || columns == 0 {
+            return;
+        }
+        let handle = self.scroll.0.borrow().base_handle.clone();
+        let bounds = handle.bounds();
+        let offset = handle.offset();
+        let max = handle.max_offset();
+        // The numbers keep the gutter, so the cells begin to its right.
+        let (top, bottom) = (f32::from(bounds.top()), f32::from(bounds.bottom()));
+        let (left, right) = (f32::from(bounds.left()) + gutter, f32::from(bounds.right()));
+        let (pointer_x, pointer_y) = (f32::from(pointer.x), f32::from(pointer.y));
+        let vertical = (drag.pick != Pick::Columns)
+            .then(|| {
+                edge_step(
+                    f32::from(offset.y),
+                    f32::from(max.y),
+                    pointer_y,
+                    top,
+                    bottom,
+                    DATA_ROW_HEIGHT,
+                )
+            })
+            .flatten();
+        let horizontal = (drag.pick != Pick::Rows)
+            .then(|| {
+                edge_step(
+                    f32::from(offset.x),
+                    f32::from(max.x),
+                    pointer_x,
+                    left,
+                    right,
+                    CELL_WIDTH,
+                )
+            })
+            .flatten();
+        if vertical.is_none() && horizontal.is_none() {
+            return;
+        }
+        let next_y = vertical.unwrap_or(f32::from(offset.y));
+        let next_x = horizontal.unwrap_or(f32::from(offset.x));
+        handle.set_offset(point(px(next_x), px(next_y)));
+        window.request_animation_frame();
+
+        // The drag reaches the first row under the top edge or the last row above the bottom,
+        // and the first or the last column beside the left or the right edge.
+        let (mut row, mut column) = self.selected.unwrap_or((0, 0));
+        if vertical.is_some() {
+            let first = (-next_y / DATA_ROW_HEIGHT).floor().max(0.) as usize;
+            let last = ((bottom - top - next_y) / DATA_ROW_HEIGHT).ceil().max(1.) as usize - 1;
+            row = if pointer_y < top { first } else { last };
+            row = row.min(rows - 1);
+        }
+        if horizontal.is_some() {
+            let first = (-next_x / CELL_WIDTH).floor().max(0.) as usize;
+            let last = ((right - left - next_x) / CELL_WIDTH).ceil().max(1.) as usize - 1;
+            column = if pointer_x < left { first } else { last };
+            column = column.min(columns - 1);
+        }
+        self.extend_drag((row, column));
+    }
+
+    /// The selected cells as text. The rectangles are taken in one box, in the order of the
+    /// table: a cell that no rectangle takes stays empty. The names of the columns come first
+    /// when the rectangles are whole columns.
+    fn copied(&self) -> Option<Copied> {
+        let count = self.model.row_count();
+        let width = self.model.columns().len();
+        if self.rects.is_empty() || count == 0 || width == 0 {
+            return None;
+        }
+        let top = self.rects.iter().map(|span| span.top).min()?;
+        let bottom = self
+            .rects
+            .iter()
+            .map(|span| span.bottom)
+            .max()?
+            .min(count - 1);
+        let left = self.rects.iter().map(|span| span.left).min()?;
+        let right = self
+            .rects
+            .iter()
+            .map(|span| span.right)
+            .max()?
+            .min(width - 1);
+        let columns = self.model.columns().get(left..=right)?.to_vec();
+        let mut rows: Vec<Vec<Option<Value>>> = Vec::new();
+        for row in top..=bottom {
+            let Some(found) = self.model.row(row) else {
                 continue;
             };
             rows.push(
                 (left..=right)
-                    .map(|column| found.cell(column).cloned().unwrap_or(Value::Null))
+                    .map(|column| {
+                        self.in_range(row, column)
+                            .then(|| found.cell(column).cloned().unwrap_or(Value::Null))
+                    })
                     .collect(),
             );
         }
-        rows
+        // A whole column is a column rectangle that reaches the first and the last row.
+        let names = self
+            .rects
+            .iter()
+            .all(|span| span.pick == Pick::Columns && span.top == 0 && span.bottom + 1 == count);
+        if rows.is_empty() {
+            return None;
+        }
+        Some(Copied {
+            columns,
+            rows,
+            names,
+        })
     }
 
     fn copy(&mut self, cx: &mut Context<Self>) {
-        let rows = self.selected_rows();
-        if rows.is_empty() {
+        let Some(copied) = self.copied() else {
             return;
-        }
-        cx.write_to_clipboard(ui_kit::ClipboardItem::new_string(tsv(&rows)));
+        };
+        cx.write_to_clipboard(ui_kit::ClipboardItem::new_string(copied.tsv()));
     }
 
     fn copy_as_insert(&mut self, cx: &mut Context<Self>) {
-        let rows = self.selected_rows();
-        if rows.is_empty() {
+        let Some(copied) = self.copied() else {
             return;
-        }
-        let names = self.selected_columns();
-        let text = rows
+        };
+        let table = self.table_ref();
+        // A cell that the selection does not take is written as NULL, which an INSERT takes
+        // in any column.
+        let text = copied
+            .rows
             .iter()
-            .map(|row| insert_literal(self.dialect, &self.table_ref(), &names, row))
+            .map(|row| {
+                insert_literal(
+                    self.dialect,
+                    &table,
+                    &copied.columns,
+                    &filled(row, Value::Null),
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
         cx.write_to_clipboard(ui_kit::ClipboardItem::new_string(text));
     }
 
     fn copy_as_csv(&mut self, cx: &mut Context<Self>) {
-        let rows = self.selected_rows();
-        if rows.is_empty() {
+        let Some(copied) = self.copied() else {
             return;
-        }
-        let names = self.selected_columns();
-        cx.write_to_clipboard(ui_kit::ClipboardItem::new_string(csv(&names, &rows)));
-    }
-
-    fn selected_columns(&self) -> Vec<Column> {
-        let Some((row, column)) = self.selected else {
-            return Vec::new();
         };
-        let columns = self.model.columns();
-        let (left, right) = match self.anchor {
-            Some((_, anchor_column)) => (column.min(anchor_column), column.max(anchor_column)),
-            None => (column, column),
-        };
-        let _ = row;
-        (left..=right)
-            .filter_map(|index| columns.get(index).cloned())
-            .collect()
+        let rows: Vec<Vec<Value>> = copied
+            .rows
+            .iter()
+            .map(|row| filled(row, Value::Text(String::new())))
+            .collect();
+        cx.write_to_clipboard(ui_kit::ClipboardItem::new_string(csv(
+            &copied.columns,
+            &rows,
+        )));
     }
 
     fn move_selection(&mut self, row_delta: isize, column_delta: isize, extend: bool) {
@@ -749,19 +1269,18 @@ impl DatabaseDataView {
             return;
         }
         let Some((row, column)) = self.selected else {
-            self.selected = Some((0, 0));
-            self.anchor = self.selected;
+            self.select_cell(0, 0);
             return;
         };
         let row = (row as isize + row_delta).clamp(0, rows as isize - 1) as usize;
         let column = (column as isize + column_delta).clamp(0, columns as isize - 1) as usize;
-        if extend && self.anchor.is_none() {
+        if !extend || self.anchor.is_none() {
             self.anchor = Some((row, column));
         }
-        if !extend {
-            self.anchor = Some((row, column));
-        }
+        let from = self.anchor.unwrap_or((row, column));
         self.selected = Some((row, column));
+        // A plain move leaves one cell; a move with Shift draws the rectangle from the anchor.
+        self.rects = vec![Span::new(Pick::Cells, from, (row, column))];
         self.scroll.scroll_to_item(row, ScrollStrategy::Nearest);
     }
 
@@ -831,6 +1350,7 @@ impl DatabaseDataView {
             ("delete", true, _) => self.delete_row(cx),
             ("n", true, true) => self.set_null(cx),
             ("c", true, _) => self.copy(cx),
+            ("a", true, false) => self.select_all(cx),
             ("enter", false, false) => {
                 if let Some((row, column)) = self.selected {
                     self.begin_edit(row, column, cx);
@@ -1139,6 +1659,49 @@ impl DatabaseDataView {
         });
     }
 
+    /// The menu of a column header: the sort in either order.
+    fn header_menu(&mut self, column: usize, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(name) = self.columns.get(column).map(|column| column.name.clone()) else {
+            return;
+        };
+        let view = cx.entity();
+        let (ascending, descending) = (view.clone(), view.clone());
+        let (up_name, down_name) = (name.clone(), name);
+        let entries = vec![
+            MenuEntry::new("Sort Ascending", move |_, cx| {
+                ascending.update(cx, |view, cx| view.sort_by(up_name.clone(), true, cx));
+            }),
+            MenuEntry::new("Sort Descending", move |_, cx| {
+                descending.update(cx, |view, cx| view.sort_by(down_name.clone(), false, cx));
+            }),
+        ];
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_menu(position, entries, cx)
+        });
+    }
+
+    /// The sort icon of a column: ascending, then descending, then no sort, and the rows
+    /// are read again in that order.
+    fn cycle_sort(&mut self, column: &str, cx: &mut Context<Self>) {
+        self.sort = match &self.sort {
+            Some((sorted, true)) if sorted.as_str() == column => Some((column.to_owned(), false)),
+            Some((sorted, false)) if sorted.as_str() == column => None,
+            _ => Some((column.to_owned(), true)),
+        };
+        self.page = 0;
+        self.load(cx);
+    }
+
+    /// Sorts the rows by `column` in the order asked for, from the menu of a header.
+    fn sort_by(&mut self, column: String, ascending: bool, cx: &mut Context<Self>) {
+        self.sort = Some((column, ascending));
+        self.page = 0;
+        self.load(cx);
+    }
+
     fn question_band(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let Some(question) = self.question else {
             return div().into_any_element();
@@ -1232,60 +1795,169 @@ impl DatabaseDataView {
         rows.into_any_element()
     }
 
-    /// The header of the grid, moved by the horizontal offset of the rows.
-    fn header(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let offset = self.scroll.0.borrow().base_handle.offset().x;
-        let mut cells = div().flex().ml(px((-offset).into()));
+    /// The header of the grid: a corner that selects every row, then the names of the columns
+    /// with their sort icons. The names move with the horizontal offset of the rows, and the
+    /// corner stays where the numbers of the rows are.
+    fn header(
+        &mut self,
+        theme: &Theme,
+        gutter: f32,
+        shift: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let hover = theme.hover;
+        let mut cells = div().relative().left(px(shift)).flex().h_full();
         for (index, column) in self.columns.iter().enumerate() {
+            let name = column.name.clone();
             let sorted = self
                 .sort
                 .as_ref()
-                .is_some_and(|(name, _)| name == &column.name);
-            let arrow = match (sorted, self.sort.as_ref().map(|(_, ascending)| *ascending)) {
-                (true, Some(true)) => " ▲",
-                (true, Some(false)) => " ▼",
-                _ => "",
+                .filter(|(sorted, _)| sorted == &name)
+                .map(|(_, ascending)| *ascending);
+            // The icon shows the current order; the tooltip names the order of the next click.
+            let (icon_name, label) = match sorted {
+                Some(true) => ("general/arrowUp", "Sort Descending"),
+                Some(false) => ("general/arrowDown", "No Sorting"),
+                None => ("general/chevronDown", "Sort Ascending"),
             };
-            let title = format!("{}{arrow}", column.name);
-            let name = column.name.clone();
+            let picked = self.taken(Pick::Columns, (0, index));
+            let sort_name = name.clone();
+            // The icon is not occluding, so the header keeps the hover that shows it.
+            let sort = div()
+                .id(("database-data-sort", index))
+                .debug_selector(move || format!("database-data-sort-{index}"))
+                .flex_none()
+                .size(px(ROW_HEIGHT))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(CONTROL_RADIUS))
+                .cursor_pointer()
+                .hover(move |style| style.bg(hover))
+                .when(sorted.is_none(), |this| {
+                    this.invisible()
+                        .group_hover(HEADER_GROUP, |style| style.visible())
+                })
+                .tooltip(move |_, cx| tooltip(label, None, cx))
+                .tooltip_show_delay(TOOLTIP_CREATE_DELAY)
+                .on_click(cx.listener(move |this, _, _, cx| this.cycle_sort(&sort_name, cx)))
+                .child(icon_sized(icon_name, ICON, theme));
+            // The name takes the presses of the header, so a press on the icon does not select
+            // the column; the cell takes the moves of a drag across the header.
+            let title = div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.text)
+                .child(name)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        window.focus(&this.focus, cx);
+                        this.press(Pick::Columns, 0, index, &event.modifiers, cx);
+                    }),
+                );
             cells = cells.child(
                 div()
                     .id(("database-data-head", index))
                     .debug_selector(move || format!("database-data-head-{index}"))
+                    .group(HEADER_GROUP)
                     .w(px(CELL_WIDTH))
                     .flex_none()
-                    .px(px(SPACE_S))
                     .h_full()
+                    .px(px(SPACE_S))
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
                     .overflow_hidden()
                     .border_r_1()
                     .border_color(theme.border)
                     .cursor_pointer()
+                    .when(picked, |this| this.bg(theme.selection))
+                    .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                        this.drag_over((0, index), Some(Pick::Columns), cx)
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            window.focus(&this.focus, cx);
+                            if !this.taken(Pick::Columns, (0, index)) {
+                                this.press(Pick::Columns, 0, index, &Modifiers::default(), cx);
+                            }
+                            this.drag = None;
+                            this.header_menu(index, event.position, cx);
+                        }),
+                    )
                     .child(title)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let ascending = !matches!(
-                            &this.sort,
-                            Some((sorted, true)) if sorted == &name
-                        );
-                        this.sort = Some((name.clone(), ascending));
-                        this.page = 0;
-                        this.load(cx);
-                    })),
+                    .child(sort),
             );
         }
+        let corner = div()
+            .id("database-data-corner")
+            .debug_selector(|| "database-data-corner".to_owned())
+            .flex_none()
+            .w(px(gutter))
+            .h_full()
+            .border_r_1()
+            .border_color(theme.border)
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    window.focus(&this.focus, cx);
+                    this.select_all(cx);
+                }),
+            );
         div()
             .flex()
             .flex_none()
             .h(px(CONTROL_HEIGHT))
             .bg(theme.tab_selected)
+            .border_b_1()
+            .border_color(theme.border)
             .overflow_hidden()
-            .child(cells)
+            .child(corner)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .overflow_hidden()
+                    .child(cells),
+            )
             .into_any_element()
     }
 
+    /// The number that the row at `row` of the page shows: the rows of the earlier pages come
+    /// first, so the first row of the second page is the one after the page size.
+    fn row_number(&self, row: usize) -> usize {
+        self.page * self.page_rows + row + 1
+    }
+
+    /// The width of the column of row numbers. The longest number that the page can show
+    /// decides it, in the font of the data.
+    fn gutter_width(&self, window: &Window) -> f32 {
+        let longest = (self.page * self.page_rows + self.model.row_count()).max(1);
+        let text = longest.to_string();
+        let style = window.text_style();
+        let size = style.font_size.to_pixels(window.rem_size());
+        let run = style.to_run(text.len());
+        let line =
+            window
+                .text_system()
+                .shape_line(text.into(), size, std::slice::from_ref(&run), None);
+        f32::from(line.width()) + 2. * SPACE_S
+    }
+
+    /// The rows of the grid in `range`. Each row starts with its number, which stays in place
+    /// when the grid scrolls sideways: the cells scroll in a clip beside the number.
     fn rows(
         &mut self,
         range: std::ops::Range<usize>,
         theme: &Theme,
+        gutter: f32,
+        shift: f32,
         cx: &mut Context<Self>,
     ) -> Vec<Stateful<Div>> {
         let columns = self.model.columns().len();
@@ -1296,13 +1968,17 @@ impl DatabaseDataView {
             };
             let kind = row.kind();
             let error = row.error().map(str::to_owned);
+            let marked = self
+                .rects
+                .iter()
+                .any(|span| (span.top..=span.bottom).contains(&index));
             let mut line = div()
                 .id(("database-data-row", index))
                 .debug_selector(move || format!("database-data-row-{index}"))
                 .relative()
                 .flex()
                 .flex_none()
-                .w(px(CELL_WIDTH * columns as f32))
+                .w(px(gutter + CELL_WIDTH * columns as f32))
                 .h(px(DATA_ROW_HEIGHT))
                 .when(index % 2 == 1, |this| this.bg(theme.hover.opacity(0.3)))
                 .when(kind == RowKind::New, |this| {
@@ -1311,6 +1987,62 @@ impl DatabaseDataView {
                 .when(kind == RowKind::Deleted, |this| {
                     this.bg(theme.stripe_error.opacity(0.12))
                 });
+            // The number is the first child: it is laid out in the gutter and moved back by the
+            // offset of the rows, so that it stays where the grid starts.
+            let number = self.row_number(index);
+            line = line.child(
+                div()
+                    .id(("database-data-number", index))
+                    .debug_selector(move || format!("database-data-number-{index}"))
+                    .flex_none()
+                    .relative()
+                    .left(px(-shift))
+                    .h_full()
+                    .w(px(gutter))
+                    .px(px(SPACE_S))
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .border_r_1()
+                    .border_color(theme.border)
+                    .bg(if marked {
+                        theme.selection
+                    } else {
+                        theme.editor_bg
+                    })
+                    .text_color(theme.text_muted)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            window.focus(&this.focus, cx);
+                            this.press(Pick::Rows, index, 0, &event.modifiers, cx);
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                        this.drag_over((index, 0), Some(Pick::Rows), cx)
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            window.focus(&this.focus, cx);
+                            if !this.taken(Pick::Rows, (index, 0)) {
+                                this.press(Pick::Rows, index, 0, &Modifiers::default(), cx);
+                            }
+                            this.drag = None;
+                            this.menu(event.position, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .child(number.to_string()),
+            );
+            // The cells scroll in a clip beside the number, so they never pass under it.
+            let mut cells_row = div()
+                .relative()
+                .left(px(shift))
+                .flex()
+                .flex_none()
+                .h_full()
+                .w(px(CELL_WIDTH * columns as f32));
             for column in 0..columns {
                 let value = row.cell(column).cloned();
                 let edited = row.is_edited(column);
@@ -1379,16 +2111,18 @@ impl DatabaseDataView {
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                             window.focus(&this.focus, cx);
-                            if event.modifiers.shift {
-                                this.selected = Some((index, column));
-                                if this.anchor.is_none() {
-                                    this.anchor = Some((index, column));
-                                }
-                            } else {
-                                this.selected = Some((index, column));
-                                this.anchor = Some((index, column));
+                            // The cell being edited takes its own press and drag in its field.
+                            if this.editing.as_ref().is_some_and(|editing| {
+                                editing.row == index && editing.column == column
+                            }) {
+                                return;
                             }
-                            cx.notify();
+                            this.press(Pick::Cells, index, column, &event.modifiers, cx);
+                        }),
+                    )
+                    .on_mouse_move(
+                        cx.listener(move |this, _, _, cx| {
+                            this.drag_over((index, column), None, cx)
                         }),
                     )
                     .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
@@ -1400,8 +2134,12 @@ impl DatabaseDataView {
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                             window.focus(&this.focus, cx);
+                            if !this.in_range(index, column) {
+                                this.press(Pick::Cells, index, column, &Modifiers::default(), cx);
+                            }
+                            // The menu acts on the cell under the pointer, and the rectangles stay.
                             this.selected = Some((index, column));
-                            this.anchor = Some((index, column));
+                            this.drag = None;
                             this.menu(event.position, cx);
                             cx.notify();
                         }),
@@ -1421,40 +2159,44 @@ impl DatabaseDataView {
                             .child(error.clone().unwrap_or_default()),
                     );
                 }
-                line = line.child(cell);
+                cells_row = cells_row.child(cell);
             }
+            line = line.child(
+                div()
+                    .flex_none()
+                    .relative()
+                    .left(px(-shift))
+                    .w(px(CELL_WIDTH * columns as f32))
+                    .h_full()
+                    .overflow_hidden()
+                    .child(cells_row),
+            );
             rows.push(line);
         }
         rows
     }
 
+    /// Whether the cell at `row` and `column` is inside one of the rectangles.
     fn in_range(&self, row: usize, column: usize) -> bool {
-        let Some((selected_row, selected_column)) = self.selected else {
-            return false;
-        };
-        let (top, bottom, left, right) = match self.anchor {
-            Some((anchor_row, anchor_column)) => (
-                selected_row.min(anchor_row),
-                selected_row.max(anchor_row),
-                selected_column.min(anchor_column),
-                selected_column.max(anchor_column),
-            ),
-            None => (selected_row, selected_row, selected_column, selected_column),
-        };
-        row >= top && row <= bottom && column >= left && column <= right
+        self.rects.iter().any(|span| span.contains(row, column))
     }
 }
 
 impl Render for DatabaseDataView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+        // The rows scroll first, so that the header and the numbers below read this frame's offset.
+        let gutter = self.gutter_width(window);
+        self.edge_scroll(window, gutter);
+        let shift = f32::from(self.scroll.0.borrow().base_handle.offset().x);
         let toolbar = self.toolbar(&theme, cx);
         let question = self.question_band(&theme, cx);
         let status = self.status_line(&theme);
-        let header = self.header(&theme, cx);
+        let header = self.header(&theme, gutter, shift, cx);
         let count = self.model.row_count();
         let columns = self.columns.len();
-        let width = CELL_WIDTH * columns as f32;
+        let width = gutter + CELL_WIDTH * columns as f32;
+        let view = cx.entity();
         let grid = div()
             .flex()
             .flex_col()
@@ -1479,7 +2221,7 @@ impl Render for DatabaseDataView {
                             "database-data-rows",
                             count,
                             cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                                this.rows(range, &theme, cx)
+                                this.rows(range, &theme, gutter, shift, cx)
                             }),
                         )
                         .track_scroll(&self.scroll)
@@ -1503,6 +2245,7 @@ impl Render for DatabaseDataView {
             .key_context("Database Data")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event, _, cx| this.key(event, cx)))
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -1511,6 +2254,53 @@ impl Render for DatabaseDataView {
             .child(question)
             .child(status)
             .child(grid)
+            // The window hears the pointer everywhere, so a drag ends on a release outside the
+            // grid. The canvas draws nothing and takes no pointer.
+            .child(
+                canvas(
+                    |_, _, _| {},
+                    move |_, _, window, _| {
+                        let moved = view.clone();
+                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Capture {
+                                let held = event.pressed_button == Some(MouseButton::Left);
+                                moved.update(cx, |this, cx| {
+                                    this.drag_pointer(event.position, held, cx)
+                                });
+                            }
+                        });
+                        let released = view;
+                        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Capture && event.button == MouseButton::Left
+                            {
+                                released.update(cx, |this, _| this.end_drag());
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            )
+    }
+}
+
+/// The offset of the rows along one axis after one frame of a drag that holds the pointer past
+/// an edge of them. `start` and `end` are the edges of the rows on that axis, and `unit` is the
+/// size of a row or a cell there. The offset moves by one unit or more, as many as the pointer
+/// is past the edge (at most four), and it stops at the ends. Offsets are negative when the
+/// rows are scrolled down or to the right, as GPUI keeps them, and `max` is the distance that
+/// they can scroll. The result is `None` while the pointer is among the rows, or when they
+/// cannot move that way.
+fn edge_step(offset: f32, max: f32, pointer: f32, start: f32, end: f32, unit: f32) -> Option<f32> {
+    let step = |distance: f32| (distance / unit).ceil().clamp(1., 4.) * unit;
+    if pointer < start {
+        let next = (offset + step(start - pointer)).min(0.);
+        (next > offset).then_some(next)
+    } else if pointer > end {
+        let next = (offset - step(pointer - end)).max(-max);
+        (next < offset).then_some(next)
+    } else {
+        None
     }
 }
 
@@ -1520,5 +2310,57 @@ fn count_of(value: &Value) -> Option<u64> {
         Value::Decimal(text) => text.trim().parse::<u64>().ok(),
         Value::Real(real) if *real >= 0. => Some(*real as u64),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Explicit imports: a glob of the parent would bring the gpui `test` macro in place of `#[test]`.
+    use super::{CELL_WIDTH, DATA_ROW_HEIGHT, Pick, Span, edge_step};
+
+    #[test]
+    fn a_cell_taken_out_of_a_rectangle_leaves_the_rest_of_it() {
+        let span = Span::new(Pick::Cells, (0, 0), (2, 2));
+        let rest = span.without(1, 1);
+        assert_eq!(rest.len(), 4, "{rest:?}");
+        assert!(rest.iter().all(|part| !part.contains(1, 1)));
+        let kept = (0..=2)
+            .flat_map(|row| (0..=2).map(move |column| (row, column)))
+            .filter(|&(row, column)| rest.iter().any(|part| part.contains(row, column)))
+            .count();
+        assert_eq!(kept, 8, "every other cell stays selected");
+        assert_eq!(
+            span.without(5, 5),
+            vec![span],
+            "a cell outside stays as it is"
+        );
+    }
+
+    #[test]
+    fn the_grid_scrolls_at_an_edge_a_unit_at_a_time_and_stops_at_the_ends() {
+        // The pointer is among the rows.
+        assert_eq!(edge_step(-100., 500., 50., 0., 200., DATA_ROW_HEIGHT), None);
+        // Above the top by 5 pixels: one row up.
+        assert_eq!(
+            edge_step(-100., 500., -5., 0., 200., DATA_ROW_HEIGHT),
+            Some(-76.)
+        );
+        // Already at the top.
+        assert_eq!(edge_step(0., 500., -5., 0., 200., DATA_ROW_HEIGHT), None);
+        // Below the bottom by 50 pixels: three rows down.
+        assert_eq!(
+            edge_step(-100., 500., 250., 0., 200., DATA_ROW_HEIGHT),
+            Some(-172.)
+        );
+        // At the bottom already.
+        assert_eq!(
+            edge_step(-500., 500., 250., 0., 200., DATA_ROW_HEIGHT),
+            None
+        );
+        // Past the right edge by 200 pixels: two cells to the left.
+        assert_eq!(
+            edge_step(-100., 900., 1000., 0., 800., CELL_WIDTH),
+            Some(-420.)
+        );
     }
 }

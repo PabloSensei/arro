@@ -76,16 +76,16 @@ fn window_tests_settings_checks_empty_box_is_drawn_and_a_click_ticks_it(cx: &mut
 fn window_tests_settings_checks_empty_field_shows_its_default_as_a_hint(cx: &mut TestAppContext) {
     let window = open_build_tool_page(cx, "settings-checks-hint");
     assert!(
-        on_screen(cx, window, "settings-build-tool-first-home"),
-        "the field of the home is on the screen"
+        on_screen(cx, window, "settings-build-tool-first-settings-file"),
+        "the field of the settings file is on the screen"
     );
     assert!(
-        on_screen(cx, window, "settings-build-tool-first-home-hint"),
+        on_screen(cx, window, "settings-build-tool-first-settings-file-hint"),
         "an empty field shows its default inside it"
     );
     assert_eq!(
-        text_hint(SettingField::BuildToolFirstHome),
-        "Wrapper or bundled"
+        text_hint(SettingField::BuildToolFirstSettingsFile),
+        "~/.m2/settings.xml"
     );
 }
 

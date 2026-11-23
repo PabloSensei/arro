@@ -184,6 +184,7 @@ fn config(root: PathBuf, state_dir: PathBuf) -> JdtlsConfig {
         gradle_java_home: None,
         offline: true,
         environment: HashMap::new(),
+        max_heap_mb: None,
     }
 }
 

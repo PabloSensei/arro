@@ -717,6 +717,7 @@ impl RealLanguage {
             gradle_java_home: None,
             offline: true,
             environment: HashMap::new(),
+            max_heap_mb: None,
         };
         Self::start(config, root, java_home, state_dir)
     }
@@ -751,6 +752,7 @@ impl RealLanguage {
             gradle_java_home: Some(jdk(&corpus, "17")),
             offline: false,
             environment: HashMap::new(),
+            max_heap_mb: None,
         };
         Self::start(config, root, java_home, state_dir)
     }

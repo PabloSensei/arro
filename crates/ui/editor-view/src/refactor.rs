@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use lang_api::{
     ActionEntry, ActionKind, Confidence, DocumentEdit, DocumentSpot, ExpressionTypePlace,
     ExtractKind, MoveDestination, MoveKind, MovePlace, MoveQuery, MoveRequest, NameRole,
-    PrepareRename, RenamePosition, RenameQuery, SelectionQuery, SourceSpan, TextPoint, TextSpan,
+    PrepareRename, RenamePosition, RenameQuery, SelectionQuery, SourceSpan, TextSpan,
     WorkspaceChange, apply_to_text, ask,
 };
 use text_core::{EditKind, TextStore};
@@ -149,76 +149,51 @@ fn name_role(entry: &ActionEntry) -> Option<NameRole> {
     }
 }
 
-/// The expression an action replaces in a file, and the text it puts in its place.
-struct Replaced {
-    /// The expression, as a byte range of the text before the change.
-    range: Range<usize>,
-    text: String,
-    /// How far the edits before the expression move the text, in bytes.
-    shift: isize,
-}
-
-/// The expression an action replaces in the file `uri`: the only replacement of the action,
-/// or the one the caret is in when there are several. `offset` converts the places of the
-/// edits to bytes.
-fn replaced_expression(
-    entry: &ActionEntry,
-    uri: &str,
-    offset: impl Fn(TextPoint) -> usize,
-    caret: usize,
-) -> Option<Replaced> {
-    let source = entry.edits.iter().find(|source| source.uri == uri)?;
-    // The order `apply_to_text` applies the edits in, so the shift is the one it makes.
-    let mut edits: Vec<(Range<usize>, &str)> = source
-        .edits
-        .iter()
-        .map(|edit| {
-            let start = offset(edit.span.start);
-            let end = offset(edit.span.end).max(start);
-            (start..end, edit.text.as_str())
-        })
-        .collect();
-    edits.sort_by_key(|(range, _)| (range.start, range.end));
-    let replacing: Vec<usize> = (0..edits.len())
-        .filter(|&index| !edits[index].0.is_empty())
-        .collect();
-    let index = match replacing.as_slice() {
-        [only] => *only,
-        _ => replacing.iter().copied().find(|&index| {
-            let range = &edits[index].0;
-            range.start <= caret && caret <= range.end
-        })?,
-    };
-    let shift: isize = edits[..index]
-        .iter()
-        .map(|(range, text)| text.len() as isize - range.len() as isize)
-        .sum();
-    let (range, text) = edits[index].clone();
-    Some(Replaced {
-        range,
-        text: text.to_owned(),
-        shift,
-    })
-}
-
 /// The place of the name an Introduce Parameter gave the parameter, in the text after the
-/// change: the expression it replaced now holds that name. `None` unless the text there is
-/// the name the replacement put, so that a place is never guessed.
+/// change, for a server that marks none: the expression it replaced now holds that name. The
+/// line of the expression must read the same before and after the name, at the start of one
+/// line of the new text, so the place is found by the text around it. `None` unless exactly
+/// one line matches, so that a place is never guessed.
 fn introduced_name_place(
     entry: &ActionEntry,
     uri: &str,
     text: &str,
-    replaced: &Replaced,
+    expression: &Range<usize>,
 ) -> Option<RenamePosition> {
     let after = text_after(entry, uri, text)?;
-    let at = usize::try_from(replaced.range.start as isize + replaced.shift).ok()?;
-    if !after.get(at..)?.starts_with(replaced.text.as_str()) {
+    let line_start = text[..expression.start]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    let line_end = text[expression.end..]
+        .find('\n')
+        .map_or(text.len(), |index| expression.end + index);
+    let before = &text[line_start..expression.start];
+    let behind = &text[expression.end..line_end];
+    if before.is_empty() {
+        return None;
+    }
+    let mut found = Vec::new();
+    for (index, _) in after.match_indices(before) {
+        if index > 0 && after.as_bytes()[index - 1] != b'\n' {
+            continue;
+        }
+        let from = index + before.len();
+        let rest = &after[from..];
+        let line = &rest[..rest.find('\n').unwrap_or(rest.len())];
+        if let Some(name) = line.strip_suffix(behind) {
+            found.push((from, name));
+        }
+    }
+    let [(from, name)] = found.as_slice() else {
+        return None;
+    };
+    if name.is_empty() {
         return None;
     }
     Some(RenamePosition {
         uri: uri.to_owned(),
-        offset: after.get(..at)?.encode_utf16().count() as u32,
-        length: replaced.text.encode_utf16().count() as u32,
+        offset: after.get(..*from)?.encode_utf16().count() as u32,
+        length: name.encode_utf16().count() as u32,
     })
 }
 
@@ -1886,11 +1861,16 @@ impl EditorView {
     /// An action without such a place applies as it is. An Introduce Parameter opens the
     /// field only with a suggestion, since its name is the text its edits put in place of
     /// the expression.
+    ///
+    /// The expression is the one the action was asked about, `asked`, else the selection, else
+    /// the innermost expression at the caret. The edits of the server do not tell it: a server
+    /// may replace the value with one wide edit, which is no expression.
     pub(crate) fn start_extract_name(
         &mut self,
         version: i32,
         entry: ActionEntry,
         label: Option<&'static str>,
+        asked: Option<Range<usize>>,
         cx: &mut Context<Self>,
     ) {
         let apply = |this: &mut Self, cx: &mut Context<Self>| {
@@ -1908,14 +1888,23 @@ impl EditorView {
             return;
         };
         let text = state.text();
-        let store = state.store();
         let caret = state.selections().primary().head;
-        let replaced =
-            replaced_expression(&entry, &lsp.uri, |point| offset_at(&store, point), caret);
-        let placed = match role {
-            Some(NameRole::Parameter) => replaced
-                .as_ref()
-                .and_then(|replaced| introduced_name_place(&entry, &lsp.uri, &text, replaced)),
+        let selection = state.selections().primary().range();
+        let expression = asked
+            .filter(|range| range.start < range.end && range.end <= text.len())
+            .or_else(|| (!selection.is_empty()).then_some(selection))
+            .or_else(|| {
+                lsp.support
+                    .expressions_at(&text, caret)
+                    .into_iter()
+                    .filter(|range| range.start <= caret && caret <= range.end)
+                    .min_by_key(|range| range.len())
+            });
+        let placed = match (role, expression.as_ref()) {
+            (Some(NameRole::Parameter), Some(expression)) => entry
+                .rename
+                .clone()
+                .or_else(|| introduced_name_place(&entry, &lsp.uri, &text, expression)),
             _ => entry.rename.clone(),
         };
         let Some(rename) = placed else {
@@ -1943,16 +1932,16 @@ impl EditorView {
             apply(self, cx);
             return;
         }
-        let suggested = match (role, replaced.as_ref()) {
-            (Some(role), Some(replaced)) => {
+        let suggested = match (role, expression.as_ref()) {
+            (Some(role), Some(expression)) => {
                 // The parameter hint before the expression names the parameter it fills.
                 let hint = state
                     .inlays()
                     .iter()
-                    .find(|inlay| inlay.offset == replaced.range.start)
+                    .find(|inlay| inlay.offset == expression.start)
                     .and_then(|inlay| parameter_label(&inlay.text));
                 lsp.support
-                    .suggest_name(&text, replaced.range.clone(), role, hint.as_deref())
+                    .suggest_name(&text, expression.clone(), role, hint.as_deref())
             }
             _ => None,
         };
@@ -2939,120 +2928,132 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         let only = Some(ActionKind::Refactor);
+        // The expression the action is asked about, as byte offsets of the text it is asked in.
+        let asked = self.state.as_ref().map(|state| {
+            let store = state.store();
+            let start = offset_at(&store, span.start);
+            start..offset_at(&store, span.end).max(start)
+        });
         let task = self.ask_actions_task(
             Some(token),
             span,
             only,
             cx,
             move |this, version, caret, entries, cx| {
-                let choose = move |this: &mut Self,
-                                   entries: Vec<ActionEntry>,
-                                   cx: &mut Context<Self>| {
-                    let mut found: Vec<ActionEntry> = entries
-                        .into_iter()
-                        .filter(|entry| {
-                            entry
-                                .code
-                                .as_deref()
-                                .is_some_and(|code| code.starts_with(refactoring.code()))
-                        })
-                        .collect();
-                    match found.len() {
-                        0 => this.show_note(caret, refactoring.missing(), cx),
-                        1 => {
-                            let entry = found.remove(0);
-                            if let Some(handle) = entry.handle {
-                                cx.emit(EditorEvent::RefactorForm(handle));
-                                return;
-                            }
-                            this.apply_entry_labeled(version, entry, Some(refactoring.label()), cx);
-                        }
-                        _ => {
-                            // An extract of a value has two rows of the server, this place and
-                            // every place: they say what they replace before they run.
-                            let replacing = refactoring == Refactoring::ExtractVariable
-                                && found.iter().all(|entry| {
-                                    entry.code.as_deref().is_some_and(|code| {
-                                        code.starts_with("refactor.extract.variable")
-                                    })
-                                });
-                            if replacing {
-                                let all = found
-                                    .iter()
-                                    .position(|entry| entry.title.to_lowercase().contains("all"));
-                                let places = all.map_or(0, |row| replaced_places(&found[row]));
-                                if places == 1 {
-                                    // One occurrence has no choice to make: the row of this
-                                    // place runs and the name of the new variable is typed
-                                    // over, as IDEA goes straight to the name.
-                                    let this_row = found
-                                        .iter()
-                                        .position(|entry| {
-                                            !entry.title.to_lowercase().contains("all")
-                                        })
-                                        .or(all)
-                                        .unwrap_or(0);
-                                    let entry = found.swap_remove(this_row);
-                                    if let Some(handle) = entry.handle {
-                                        cx.emit(EditorEvent::RefactorForm(handle));
-                                        return;
-                                    }
-                                    this.apply_entry_labeled(
-                                        version,
-                                        entry,
-                                        Some(refactoring.label()),
-                                        cx,
-                                    );
+                let choose =
+                    move |this: &mut Self, entries: Vec<ActionEntry>, cx: &mut Context<Self>| {
+                        let mut found: Vec<ActionEntry> = entries
+                            .into_iter()
+                            .filter(|entry| {
+                                entry
+                                    .code
+                                    .as_deref()
+                                    .is_some_and(|code| code.starts_with(refactoring.code()))
+                            })
+                            .collect();
+                        match found.len() {
+                            0 => this.show_note(caret, refactoring.missing(), cx),
+                            1 => {
+                                let entry = found.remove(0);
+                                if let Some(handle) = entry.handle {
+                                    cx.emit(EditorEvent::RefactorForm(handle));
                                     return;
                                 }
+                                this.apply_entry_labeled(
+                                    version,
+                                    entry,
+                                    Some(refactoring.label()),
+                                    asked.clone(),
+                                    cx,
+                                );
                             }
-                            let mut all = false;
-                            let rows = found
-                                .into_iter()
-                                .filter_map(|entry| {
-                                    let mut entry = entry;
-                                    if replacing {
-                                        let every = entry.title.to_lowercase().contains("all");
-                                        if every && all {
-                                            return None;
+                            _ => {
+                                // An extract of a value has two rows of the server, this place and
+                                // every place: they say what they replace before they run.
+                                let replacing = refactoring == Refactoring::ExtractVariable
+                                    && found.iter().all(|entry| {
+                                        entry.code.as_deref().is_some_and(|code| {
+                                            code.starts_with("refactor.extract.variable")
+                                        })
+                                    });
+                                if replacing {
+                                    let all = found.iter().position(|entry| {
+                                        entry.title.to_lowercase().contains("all")
+                                    });
+                                    let places = all.map_or(0, |row| replaced_places(&found[row]));
+                                    if places == 1 {
+                                        // One occurrence has no choice to make: the row of this
+                                        // place runs and the name of the new variable is typed
+                                        // over, as IDEA goes straight to the name.
+                                        let this_row = found
+                                            .iter()
+                                            .position(|entry| {
+                                                !entry.title.to_lowercase().contains("all")
+                                            })
+                                            .or(all)
+                                            .unwrap_or(0);
+                                        let entry = found.swap_remove(this_row);
+                                        if let Some(handle) = entry.handle {
+                                            cx.emit(EditorEvent::RefactorForm(handle));
+                                            return;
                                         }
-                                        all |= every;
-                                        entry.title = if every {
-                                            format!(
-                                                "Replace all {} occurrences",
-                                                replaced_places(&entry)
-                                            )
-                                        } else {
-                                            "Replace this occurrence only".to_owned()
-                                        };
+                                        this.apply_entry_labeled(
+                                            version,
+                                            entry,
+                                            Some(refactoring.label()),
+                                            asked.clone(),
+                                            cx,
+                                        );
+                                        return;
                                     }
-                                    match entry.handle {
-                                        Some(handle) => Some(Pick::Form {
-                                            label: entry.title,
-                                            handle,
-                                        }),
-                                        None if !entry.edits.is_empty()
-                                            || !entry.renames.is_empty() =>
-                                        {
-                                            Some(Pick::Action(entry))
-                                        }
-                                        None => None,
-                                    }
-                                })
-                                .collect();
-                            this.show_picks(caret, rows, refactoring.missing(), cx);
-                            if replacing {
-                                if let Some(menu) =
-                                    this.lsp.as_mut().and_then(|lsp| lsp.actions.as_mut())
-                                {
-                                    menu.title = Some("Multiple occurrences found");
                                 }
-                                this.highlight_action_row();
-                                cx.notify();
+                                let mut all = false;
+                                let rows = found
+                                    .into_iter()
+                                    .filter_map(|entry| {
+                                        let mut entry = entry;
+                                        if replacing {
+                                            let every = entry.title.to_lowercase().contains("all");
+                                            if every && all {
+                                                return None;
+                                            }
+                                            all |= every;
+                                            entry.title = if every {
+                                                format!(
+                                                    "Replace all {} occurrences",
+                                                    replaced_places(&entry)
+                                                )
+                                            } else {
+                                                "Replace this occurrence only".to_owned()
+                                            };
+                                        }
+                                        match entry.handle {
+                                            Some(handle) => Some(Pick::Form {
+                                                label: entry.title,
+                                                handle,
+                                            }),
+                                            None if !entry.edits.is_empty()
+                                                || !entry.renames.is_empty() =>
+                                            {
+                                                Some(Pick::Action(entry))
+                                            }
+                                            None => None,
+                                        }
+                                    })
+                                    .collect();
+                                this.show_picks(caret, rows, refactoring.missing(), cx);
+                                if replacing {
+                                    if let Some(menu) =
+                                        this.lsp.as_mut().and_then(|lsp| lsp.actions.as_mut())
+                                    {
+                                        menu.title = Some("Multiple occurrences found");
+                                    }
+                                    this.highlight_action_row();
+                                    cx.notify();
+                                }
                             }
                         }
-                    }
-                };
+                    };
                 if refactoring != Refactoring::Inline {
                     this.end_refactor_wait(token, cx);
                     choose(this, entries, cx);

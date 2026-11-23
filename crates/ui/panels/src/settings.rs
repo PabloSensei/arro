@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use editor_view::Semantic;
 use plugin_host::{Manifest, PluginSettings, default_plugins_dir};
-use project_model::RuntimeInfo;
+use project_model::{RuntimeInfo, ToolHome};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
 use ui_kit::*;
@@ -17,6 +17,7 @@ use workspace::{McpToolChoice, Settings, Workspace};
 
 use crate::project_structure::{ProjectEnvironmentGlobal, ProjectStructureDialog};
 use crate::prompt::TextField;
+pub(crate) use crate::settings_catalog::text_hint;
 use crate::settings_catalog::{self, Setting, SettingField, SettingKind, SettingsPage};
 use crate::settings_file_types::{FileTypesPage, IGNORED_FIELD};
 use crate::settings_keymap::KeymapPage;
@@ -727,6 +728,103 @@ impl SettingsView {
         }))
     }
 
+    /// The row of a local installation of a build tool: its folder and the button that
+    /// asks for it. It stands under the Home row while Local installation is the chosen
+    /// source.
+    fn installation_path_row(
+        &self,
+        entry: &'static Setting,
+        label_width: f32,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let id = entry.id;
+        let current = settings_catalog::text(&self.draft, id).unwrap_or_default();
+        let active = self.editing == Some(id);
+        let start = current.clone();
+        let typed;
+        let value = if active {
+            &self.text_field
+        } else {
+            typed = TextField::from_text(current);
+            &typed
+        };
+        let press_start = start.clone();
+        let mouse = FieldMouse::new(cx, move |this| {
+            if this.editing == Some(id) {
+                Some(&mut this.text_field)
+            } else {
+                None
+            }
+        })
+        .starting(cx, move |this, _| this.begin_value_edit(id, &press_start));
+        let input_selector = format!("settings-{}", id.replace('_', "-"));
+        let browse_selector = format!(
+            "settings-{}-browse",
+            id.trim_end_matches("_path").replace('_', "-")
+        );
+        let input = field(mouse, id, value, text_hint(entry.field), active, theme)
+            .debug_selector(move || input_selector.clone())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if this.begin_value_edit(id, &start) {
+                    cx.notify();
+                }
+            }));
+        let browse = icon_button(
+            "settings-build-tool-home-browse",
+            "general/folder",
+            "Choose Folder",
+            None,
+            theme,
+        )
+        .debug_selector(move || browse_selector.clone())
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.browse_installation_folder(id, window, cx);
+        }));
+        let control = div()
+            .flex()
+            .items_center()
+            .gap(px(SPACE_S))
+            .flex_1()
+            .child(input)
+            .child(browse);
+        let label = div().text_color(theme.text).child(entry.title);
+        setting_row(entry, label, control, false, Some(label_width), theme)
+    }
+
+    /// Asks for the folder of a local installation and puts it into the draft.
+    fn browse_installation_folder(
+        &mut self,
+        id: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let chosen = paths
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .flatten()
+                .and_then(|mut paths| paths.pop());
+            let Some(folder) = chosen else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                settings_catalog::set_text(&mut this.draft, id, &folder.display().to_string());
+                this.editing = None;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// The list of the open dropdown, under the row of its setting.
     fn choice_menu(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<Div> {
         let open = self.choice_open.as_ref()?;
@@ -948,6 +1046,11 @@ impl SettingsView {
             semantic
                 .0
                 .set_dependency_updates(current.check_dependency_updates);
+            if saved.language_max_heap_megabytes != current.language_max_heap_megabytes {
+                semantic
+                    .0
+                    .set_max_heap_megabytes(current.language_max_heap());
+            }
         }
         self.saved = current.clone();
         self.draft = current;
@@ -1890,26 +1993,6 @@ fn row(label: impl IntoElement, control: impl IntoElement, theme: &Theme) -> Div
         // The label gives way before the control: a long label wraps, the control keeps its width.
         .child(div().min_w_0().text_color(theme.text).child(label))
         .child(control)
-}
-
-/// The grey text of an empty text field: the value applied when the field stays empty.
-pub(crate) fn text_hint(field: SettingField) -> &'static str {
-    match field {
-        SettingField::EditorFontFamily => "JetBrains Mono",
-        SettingField::BuildToolFirstHome => "Wrapper or bundled",
-        SettingField::BuildToolFirstSettingsFile => "~/.m2/settings.xml",
-        SettingField::BuildToolFirstVmOptions => "-Xmx2g",
-        SettingField::BuildToolSecondHome => "Wrapper",
-        SettingField::BuildToolSecondUserHome => "Default",
-        SettingField::GitPath => "Found on PATH",
-        SettingField::TerminalShell => "Detected automatically",
-        SettingField::TerminalStartDirectory => "Project root",
-        SettingField::TerminalEnvironment => "NAME=value per line",
-        SettingField::KubectlPath => "Found on PATH",
-        SettingField::KubeconfigPath => "~/.kube/config",
-        SettingField::McpBinary => "Next to Arro",
-        _ => "",
-    }
 }
 
 /// The Test button of the Git page and the line it brings back.
@@ -3471,6 +3554,12 @@ impl Render for SettingsView {
                         &theme,
                     ));
                 }
+                if self.page == SettingsPage::Memory {
+                    content.push(note(
+                        "The memory limits apply at once. The heap applies when the language server starts next.",
+                        &theme,
+                    ));
+                }
                 if self.page == SettingsPage::EditorCodeStyle {
                     content.push(self.project_style_row(&theme, cx));
                 }
@@ -3489,6 +3578,14 @@ impl Render for SettingsView {
                     if entry.field == SettingField::IconSet {
                         // The Icons section above draws the choices as cards, as the
                         // themes are drawn: a click applies the set at once.
+                        continue;
+                    }
+                    if matches!(
+                        entry.field,
+                        SettingField::BuildToolFirstHome | SettingField::BuildToolSecondHomePath
+                    ) {
+                        // The folder belongs to the Home row and is drawn there, only while
+                        // the local installation is the chosen source.
                         continue;
                     }
                     if self.page == SettingsPage::Mcp
@@ -3530,6 +3627,9 @@ impl Render for SettingsView {
                                     workspace::COMPLETION_DELAY_STEP_MS as f32
                                 }
                                 SettingField::RightMargin => workspace::RIGHT_MARGIN_STEP as f32,
+                                SettingField::MemoryLowMegabytes => {
+                                    workspace::MEMORY_LOW_STEP_MB as f32
+                                }
                                 _ => 1.,
                             };
                             let text = settings_catalog::number_label(&settings, entry.id)
@@ -3639,6 +3739,14 @@ impl Render for SettingsView {
                         && let Some(menu) = self.choice_menu(&theme, cx)
                     {
                         content.push(menu);
+                    }
+                    if let Some(path) =
+                        settings_catalog::home_path_id(entry.field).and_then(settings_catalog::find)
+                        && (settings_catalog::chosen_home(&settings, entry.field)
+                            == Some(ToolHome::Custom)
+                            || (!query.trim().is_empty() && path.matches(&query)))
+                    {
+                        content.push(self.installation_path_row(path, value_width, &theme, cx));
                     }
                 }
                 if self.page == SettingsPage::Appearance {

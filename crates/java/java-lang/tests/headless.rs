@@ -146,6 +146,7 @@ fn fixture(project: &str, module: &str, drop: &[&str]) -> Fixture {
         gradle_java_home: None,
         offline: true,
         environment: HashMap::new(),
+        max_heap_mb: None,
     };
     Fixture { probe, config }
 }

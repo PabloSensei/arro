@@ -6,7 +6,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use editor_view::{EditorEvent, EditorView};
 use local_history::{Cause, LocalHistory, Revision};
@@ -147,19 +146,6 @@ fn current_text(workspace: &WeakEntity<Workspace>, path: &Path, cx: &App) -> Str
         None => std::fs::read(path)
             .map(|bytes| decode(&bytes).text)
             .unwrap_or_default(),
-    }
-}
-
-/// "5 min ago" and the like; no clock of the user's zone is needed for that.
-pub(crate) fn age(at: SystemTime) -> String {
-    let seconds = SystemTime::now()
-        .duration_since(at)
-        .map_or(0, |age| age.as_secs());
-    match seconds {
-        0..60 => "just now".to_string(),
-        60..3600 => format!("{} min ago", seconds / 60),
-        3600..86400 => format!("{} h ago", seconds / 3600),
-        _ => format!("{} days ago", seconds / 86400),
     }
 }
 
@@ -901,7 +887,7 @@ impl HistoryView {
                         .child(
                             div()
                                 .text_color(theme.text_secondary)
-                                .child(age(revision.at)),
+                                .child(ui_kit::time::ago_now(revision.at)),
                         ),
                 );
             rows.push(row.into_any_element());

@@ -324,7 +324,7 @@ fn entry_path(path: &Path, top: &str) -> Result<PathBuf, DownloadError> {
     Ok(parts.iter().collect())
 }
 
-fn extract_zip(
+pub(crate) fn extract_zip(
     archive: &Path,
     into: &Path,
     top: &str,
@@ -400,7 +400,7 @@ fn directory_mode(recorded: u32) -> u32 {
     }
 }
 
-fn extract_tar_gz(
+pub(crate) fn extract_tar_gz(
     archive: &Path,
     into: &Path,
     top: &str,
@@ -641,7 +641,7 @@ pub(crate) fn fetch(url: &str) -> Result<Vec<u8>, DownloadError> {
 }
 
 /// Writes the archive to `path` as it comes, reporting the bytes and stopping on `cancel`.
-fn stream_to(
+pub(crate) fn stream_to(
     url: &str,
     path: &Path,
     progress: &ToolProgress,
@@ -691,6 +691,17 @@ fn stream_to(
 fn verify(url: &str, path: &Path, algorithm: Checksum) -> Result<(), DownloadError> {
     let bytes = fetch(url)?;
     let expected = parse_checksum(&bytes)?;
+    verify_expected(&expected, path, algorithm)
+}
+
+/// Checks `path` against a checksum the caller already has, such as the one a wrapper
+/// properties file names.
+pub(crate) fn verify_expected(
+    expected: &str,
+    path: &Path,
+    algorithm: Checksum,
+) -> Result<(), DownloadError> {
+    let expected = expected.trim().to_ascii_lowercase();
     let actual = digest_file(algorithm.algorithm(), path).map_err(DownloadError::Files)?;
     if !expected.eq_ignore_ascii_case(&actual) {
         return Err(DownloadError::Checksum { expected, actual });

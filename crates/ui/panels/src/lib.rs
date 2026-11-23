@@ -76,6 +76,7 @@ mod mcp_debug;
 mod mcp_edits;
 mod mcp_runs;
 mod member_form;
+mod memory_stop;
 mod merge_view;
 mod method_hierarchy;
 mod move_members;
@@ -741,6 +742,8 @@ mod bookmarks;
 #[cfg(test)]
 mod window_tests_build_profiles;
 #[cfg(test)]
+mod window_tests_gradle_wrapper;
+#[cfg(test)]
 mod window_tests_scratch_languages;
 
 mod choice;
@@ -1042,19 +1045,25 @@ pub fn apply_setup(workspace: &mut Workspace, setup: LanguageSetup, cx: &mut Con
 }
 
 fn watch_status(
-    _workspace: &mut Workspace,
+    workspace: &mut Workspace,
     mut status: UnboundedReceiver<String>,
     cx: &mut Context<Workspace>,
 ) {
+    memory_stop::register(workspace);
+    memory_stop::watch_warning(cx);
     cx.spawn(async move |workspace, cx| {
         // A server that gave up says so once per run, not on every crash.
         let mut failure_shown = false;
+        // Whether the line before was a stop for low memory: one stop shows its notice once.
+        let mut stopped = false;
         while let Some(text) = status.next().await {
             let reason = if failure_shown {
                 None
             } else {
                 failed_reason(&text).map(str::to_owned)
             };
+            let stop = memory_stop::stop_of(&text).map(|stop| (stop.name.to_owned(), stop.manual));
+            let was_stopped = std::mem::replace(&mut stopped, stop.is_some());
             let shown = workspace.update(cx, |workspace, cx| {
                 if let Some(reason) = reason.clone() {
                     workspace.notify_error_with_command(
@@ -1065,12 +1074,21 @@ fn watch_status(
                         cx,
                     );
                 }
+                if let Some((name, manual)) = &stop
+                    && !was_stopped
+                {
+                    memory_stop::notify(name, *manual, workspace, cx);
+                }
                 let failed_import = import_failed(&text);
+                let action = if failed_import {
+                    Some("language.show_import_failure")
+                } else if stop.is_some() {
+                    Some(memory_stop::SHOW_COMMAND)
+                } else {
+                    None
+                };
                 workspace.set_language_status(Some(text.into()), cx);
-                workspace.set_language_action(
-                    failed_import.then_some("language.show_import_failure"),
-                    cx,
-                )
+                workspace.set_language_action(action, cx)
             });
             if shown.is_err() {
                 break;
@@ -2443,3 +2461,24 @@ mod window_tests_insert_template;
 
 #[cfg(test)]
 mod window_tests_recent_changes;
+
+#[cfg(test)]
+mod window_tests_find_in_files_preview_match;
+
+#[cfg(test)]
+mod window_tests_recent_changes_time;
+
+#[cfg(test)]
+mod window_tests_note_place;
+
+#[cfg(test)]
+mod window_tests_memory_stop;
+
+#[cfg(test)]
+mod window_tests_settings_memory;
+
+#[cfg(test)]
+mod window_tests_extract_wide;
+
+#[cfg(test)]
+mod window_tests_real_extract_name;

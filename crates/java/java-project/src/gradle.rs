@@ -2,7 +2,8 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use base::{Cancel, Result};
 use proc_sup::{ProcessClass, ProcessSpec};
@@ -17,6 +18,7 @@ use crate::dependencies::{ReportTrees, exclude_in_script};
 use crate::env::{fresh_directory, run_tool};
 use crate::fingerprint::{BuildStamp, has_classes};
 use crate::gradle_download;
+use crate::gradle_wrapper::{self, WrapperDistribution};
 use crate::tool_download;
 use crate::tool_home::{self, Tool};
 use crate::{BuildEnv, Jdk, find_jdks};
@@ -120,6 +122,30 @@ fn version_in_name(name: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
+/// The name of a distribution in the messages of the window: `Gradle 9.5.1`, or the
+/// folder name when the URL does not follow the usual form.
+fn distribution_label(distribution: &WrapperDistribution) -> String {
+    match distribution.version() {
+        Some(version) => format!("Gradle {version}"),
+        None => distribution.name().unwrap_or_else(|| "Gradle".to_owned()),
+    }
+}
+
+/// Whether the machine names a proxy for the transfer. The window has no proxy page, so
+/// the notification can only point at the variables the system uses.
+fn proxy_configured() -> bool {
+    [
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+        "https_proxy",
+        "http_proxy",
+        "all_proxy",
+    ]
+    .iter()
+    .any(|name| env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
 /// The version of a Gradle the search found, when its name or the wrapper says it. The
 /// copy on `PATH` may be anything, so it is not guessed.
 fn version_of(gradle: &GradleHome, root: &Path) -> Option<(u32, u32)> {
@@ -138,6 +164,17 @@ pub struct Gradle {
     stamp: BuildStamp,
     /// The home the user chose in this session, which wins over the settings file.
     chosen: Mutex<Option<PathBuf>>,
+    /// The bytes of the distribution of the wrapper while the sync downloads it.
+    wrapper_progress: Mutex<Option<Arc<ToolProgress>>>,
+    /// What the button of the missing distribution does when the window asks.
+    pending: Mutex<Option<WrapperDistribution>>,
+    /// The project the last notification named, for the button that writes its wrapper.
+    last_root: Mutex<Option<PathBuf>>,
+    /// The last transfer of a wrapper distribution failed, so the notification offers
+    /// Retry rather than Download.
+    wrapper_failed: AtomicBool,
+    /// Why that transfer failed, for the notification.
+    wrapper_error: Mutex<Option<String>>,
 }
 
 impl Gradle {
@@ -146,7 +183,181 @@ impl Gradle {
             env,
             stamp: BuildStamp::new(),
             chosen: Mutex::new(None),
+            wrapper_progress: Mutex::new(None),
+            pending: Mutex::new(None),
+            last_root: Mutex::new(None),
+            wrapper_failed: AtomicBool::new(false),
+            wrapper_error: Mutex::new(None),
         }
+    }
+
+    fn set_pending(&self, distribution: Option<WrapperDistribution>) {
+        *self
+            .pending
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = distribution;
+    }
+
+    fn take_pending(&self) -> Option<WrapperDistribution> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+    }
+
+    fn remember_root(&self, root: &Path) {
+        *self
+            .last_root
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(root.to_path_buf());
+    }
+
+    fn last_root(&self) -> Option<PathBuf> {
+        self.last_root
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    fn set_wrapper_error(&self, error: Option<String>) {
+        *self
+            .wrapper_error
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = error;
+    }
+
+    /// The folder the wrapper of this project keeps its distributions in, as the settings
+    /// of the tool, the environment and the profile of the user name it.
+    fn gradle_user_home(&self) -> Option<PathBuf> {
+        gradle_wrapper::gradle_user_home(
+            self.env.build_tools.second.user_home_path().map(Path::new),
+        )
+    }
+
+    /// Whether a build of the project starts the wrapper rather than a named installation.
+    fn uses_wrapper(&self, root: &Path) -> bool {
+        matches!(
+            self.resolve(root).map(|gradle| gradle.origin),
+            Ok(GradleOrigin::Wrapper)
+        )
+    }
+
+    /// Downloads the distribution the wrapper names, when the wrapper is what a build
+    /// starts and the distribution is not there yet. The transfer follows the settings of
+    /// the tool and is off with the switch of the page.
+    fn ensure_wrapper(&self, root: &Path, cancel: &Cancel) -> Result {
+        if !self.uses_wrapper(root) {
+            return Ok(());
+        }
+        let Some(distribution) = WrapperDistribution::read(root) else {
+            return Ok(());
+        };
+        let Some(user_home) = self.gradle_user_home() else {
+            return Ok(());
+        };
+        if distribution.installed(&user_home) {
+            self.set_pending(None);
+            self.wrapper_failed.store(false, Ordering::Release);
+            self.set_wrapper_error(None);
+            return Ok(());
+        }
+        self.set_pending(Some(distribution.clone()));
+        if !self.env.build_tools.second.download_wrapper {
+            return Err(format!(
+                "{} is not downloaded; the automatic download is off in the settings",
+                distribution_label(&distribution)
+            )
+            .into());
+        }
+        let progress = Arc::new(ToolProgress::new());
+        *self
+            .wrapper_progress
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(progress.clone());
+        let result = gradle_wrapper::install(&distribution, &user_home, &progress, cancel);
+        *self
+            .wrapper_progress
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+        match result {
+            Ok(_) => {
+                self.set_pending(None);
+                self.wrapper_failed.store(false, Ordering::Release);
+                self.set_wrapper_error(None);
+                Ok(())
+            }
+            Err(error) => {
+                self.wrapper_failed.store(true, Ordering::Release);
+                self.set_wrapper_error(Some(error.to_string()));
+                Err(format!(
+                    "{} was not downloaded: {error}",
+                    distribution_label(&distribution)
+                )
+                .into())
+            }
+        }
+    }
+
+    /// The Gradle that writes the wrapper of a project: the one a build starts, or the
+    /// copy the IDE downloads.
+    fn wrapper_program(
+        &self,
+        root: &Path,
+        progress: &ToolProgress,
+        cancel: &Cancel,
+    ) -> Result<PathBuf> {
+        if let Ok(found) = self.resolve(root) {
+            return Ok(found.program);
+        }
+        let home = gradle_download::download(
+            gradle_download::REPOSITORY,
+            &self.env.data_dir(),
+            None,
+            progress,
+            cancel,
+        )?;
+        let program = TOOL
+            .programs
+            .iter()
+            .map(|name| home.join("bin").join(name))
+            .find(|program| program.is_file())
+            .ok_or_else(|| format!("the downloaded Gradle has no bin at {}", home.display()))?;
+        Ok(program)
+    }
+
+    /// Writes the wrapper of `root` with the Gradle the machine has or the IDE downloads.
+    fn write_wrapper(&self, root: &Path, progress: &ToolProgress, cancel: &Cancel) -> Result<()> {
+        let program = self.wrapper_program(root, progress, cancel)?;
+        let jdk = self.env.project_jdk(root).ok();
+        crate::wrapper::generate_with(
+            crate::wrapper::Wrapper::Gradle,
+            &program,
+            root,
+            jdk.as_ref(),
+            cancel,
+        )
+        .map_err(|error| error.into())
+    }
+
+    /// The copy of Gradle the IDE downloaded, or a fresh one, as the installation of this
+    /// project from now on.
+    fn use_downloaded_gradle(
+        &self,
+        progress: &ToolProgress,
+        cancel: &Cancel,
+    ) -> Result<Option<PathBuf>> {
+        let home = match bundled_home(&self.env.data_dir()) {
+            Some(home) => home,
+            None => gradle_download::download(
+                gradle_download::REPOSITORY,
+                &self.env.data_dir(),
+                None,
+                progress,
+                cancel,
+            )?,
+        };
+        self.use_home(&home);
+        Ok(Some(home))
     }
 
     /// Where the fingerprint of the last successful build waits.
@@ -164,7 +375,10 @@ impl Gradle {
             .clone();
         let (kind, configured) = match &chosen {
             Some(home) => (ToolHome::Custom, Some(home.as_path())),
-            None => (settings.home_kind, settings.home_path().map(Path::new)),
+            None => (
+                settings.chosen_home_kind(),
+                settings.home_path().map(Path::new),
+            ),
         };
         tool_home::find(
             &TOOL,
@@ -327,6 +541,7 @@ impl BuildSystem for Gradle {
     }
 
     fn sync(&self, root: &Path, cancel: &Cancel) -> Result<ProjectModel> {
+        self.ensure_wrapper(root, cancel)?;
         let directory = cache_file(&self.env.cache_root(), root).with_file_name("sync");
         let directory = fresh_directory(&directory)?;
         let script = directory.join("ide-model.init.gradle");
@@ -347,6 +562,65 @@ impl BuildSystem for Gradle {
     }
 
     fn missing_tool(&self, root: &Path) -> Option<ToolSetup> {
+        // The buttons of the last notification must not survive into this one.
+        self.set_pending(None);
+        // The wrapper of the project is what a build starts, and the distribution it
+        // names may be absent: that is the first thing to offer.
+        if self.uses_wrapper(root)
+            && let Some(distribution) = WrapperDistribution::read(root)
+            && let Some(user_home) = self.gradle_user_home()
+            && !distribution.installed(&user_home)
+        {
+            self.set_pending(Some(distribution.clone()));
+            let label = distribution_label(&distribution);
+            let automatic = self.env.build_tools.second.download_wrapper;
+            let download = if !automatic {
+                "Download"
+            } else if self.wrapper_failed.load(Ordering::Acquire) {
+                "Retry"
+            } else {
+                "Download"
+            };
+            let mut text = if automatic {
+                format!(
+                    "{label} is not downloaded. Arro downloads it for the wrapper; check \
+                     the connection and try again."
+                )
+            } else {
+                format!(
+                    "{label} is not downloaded. The automatic download of the wrapper \
+                     distribution is off in the settings."
+                )
+            };
+            if automatic
+                && let Some(error) = self
+                    .wrapper_error
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone()
+            {
+                text.push(' ');
+                text.push_str(&error);
+            }
+            if proxy_configured() {
+                text.push_str(
+                    " If the network goes through a proxy, check the HTTP proxy settings.",
+                );
+            }
+            return Some(ToolSetup {
+                name: "Gradle".into(),
+                title: format!("{label} for the wrapper is not downloaded"),
+                text,
+                download: Some(download.into()),
+                choose: None,
+                create_wrapper: None,
+                use_downloaded: None,
+                settings: Some((
+                    "Build Tools \u{2192} Gradle".into(),
+                    "build_tool_second_home",
+                )),
+            });
+        }
         match self.resolve(root) {
             Ok(gradle) => {
                 // The tool is there, so the failure may be the JVM that runs it.
@@ -368,38 +642,114 @@ impl BuildSystem for Gradle {
                     download: (gradle.origin != GradleOrigin::Bundled)
                         .then(|| "Download Gradle".to_owned()),
                     choose: Some("Choose Gradle home\u{2026}".into()),
+                    create_wrapper: None,
+                    use_downloaded: None,
                     settings: Some((
                         "Build Tools \u{2192} Gradle".into(),
                         "build_tool_second_home",
                     )),
                 })
             }
-            Err(missing) => Some(ToolSetup {
-                name: "Gradle".into(),
-                title: "Gradle not found".into(),
-                text: format!(
-                    "{missing}. Download Gradle from services.gradle.org or choose a Gradle \
-                     home folder."
-                ),
-                download: Some("Download Gradle".into()),
-                choose: Some("Choose Gradle home\u{2026}".into()),
-                settings: Some((
-                    "Build Tools \u{2192} Gradle".into(),
-                    "build_tool_second_home",
-                )),
-            }),
+            Err(missing) => {
+                // Without a wrapper the project has to be told how it gets one, or how a
+                // copy of Gradle can run it without a wrapper.
+                self.remember_root(root);
+                let wrapper = WRAPPERS.iter().any(|name| root.join(name).is_file());
+                if wrapper {
+                    self.set_pending(None);
+                    return Some(ToolSetup {
+                        name: "Gradle".into(),
+                        title: "Gradle not found".into(),
+                        text: format!(
+                            "{missing}. Download Gradle from services.gradle.org or choose a \
+                             Gradle home folder."
+                        ),
+                        download: Some("Download Gradle".into()),
+                        choose: Some("Choose Gradle home\u{2026}".into()),
+                        create_wrapper: None,
+                        use_downloaded: None,
+                        settings: Some((
+                            "Build Tools \u{2192} Gradle".into(),
+                            "build_tool_second_home",
+                        )),
+                    });
+                }
+                self.set_pending(None);
+                Some(ToolSetup {
+                    name: "Gradle".into(),
+                    title: "Gradle not found".into(),
+                    text: format!(
+                        "{missing}. Create the wrapper of the project with the Gradle Arro \
+                         finds or downloads, or use the downloaded copy without a wrapper."
+                    ),
+                    download: Some("Download Gradle".into()),
+                    choose: Some("Choose Gradle home\u{2026}".into()),
+                    create_wrapper: Some("Create Gradle Wrapper".into()),
+                    use_downloaded: Some("Use Downloaded Gradle".into()),
+                    settings: Some((
+                        "Build Tools \u{2192} Gradle".into(),
+                        "build_tool_second_home",
+                    )),
+                })
+            }
         }
     }
 
     fn install_tool(&self, progress: &ToolProgress, cancel: &Cancel) -> Result<Option<PathBuf>> {
-        let home = gradle_download::download(
-            gradle_download::REPOSITORY,
-            &self.env.data_dir(),
-            None,
-            progress,
-            cancel,
-        )?;
-        Ok(Some(home))
+        match self.take_pending() {
+            Some(distribution) => {
+                let user_home = self
+                    .gradle_user_home()
+                    .ok_or_else(|| "no user home for the wrapper of Gradle".to_owned())?;
+                let installed =
+                    gradle_wrapper::install(&distribution, &user_home, progress, cancel);
+                match installed {
+                    Ok(_) => {
+                        self.wrapper_failed.store(false, Ordering::Release);
+                        self.set_wrapper_error(None);
+                        // The wrapper reads the folder itself: no home of a build changes.
+                        Ok(None)
+                    }
+                    Err(error) => {
+                        // The notification offers Retry: the distribution stays the work
+                        // of the next press.
+                        self.set_pending(Some(distribution));
+                        self.wrapper_failed.store(true, Ordering::Release);
+                        self.set_wrapper_error(Some(error.to_string()));
+                        Err(error.into())
+                    }
+                }
+            }
+            None => {
+                let home = gradle_download::download(
+                    gradle_download::REPOSITORY,
+                    &self.env.data_dir(),
+                    None,
+                    progress,
+                    cancel,
+                )?;
+                Ok(Some(home))
+            }
+        }
+    }
+
+    fn create_wrapper(&self, progress: &ToolProgress, cancel: &Cancel) -> Result<Option<PathBuf>> {
+        let root = self
+            .last_root()
+            .ok_or_else(|| "the project of the notification is not known".to_owned())?;
+        self.write_wrapper(&root, progress, cancel)?;
+        Ok(None)
+    }
+
+    fn use_downloaded(&self, progress: &ToolProgress, cancel: &Cancel) -> Result<Option<PathBuf>> {
+        self.use_downloaded_gradle(progress, cancel)
+    }
+
+    fn wrapper_progress(&self) -> Option<Arc<ToolProgress>> {
+        self.wrapper_progress
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
     }
 
     fn use_home(&self, home: &Path) {
@@ -1389,6 +1739,95 @@ mod tests {
             daemon_idle_timeout(&root).is_some(),
             "a commented property is not a choice"
         );
+    }
+
+    #[test]
+    fn the_sync_downloads_the_distribution_of_the_wrapper_and_then_reads_it() {
+        use crate::tool_download::testing::{Server, sha256, zip_archive};
+
+        let root = test_support::TempDir::new("gradle-wrapper-sync");
+        let bytes = zip_archive(
+            "gradle-9.5.1",
+            &[
+                ("bin/gradle", b"#!/bin/sh\n"),
+                ("bin/gradle.bat", b"@echo off\n"),
+            ],
+        );
+        let path = "/distributions/gradle-9.5.1-bin.zip".to_owned();
+        let server = Server::start(vec![(path.clone(), bytes.clone())]);
+        let directory = root.path().join("gradle/wrapper");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("gradle-wrapper.properties"),
+            format!(
+                "distributionUrl={}{path}\ndistributionSha256Sum={}\n",
+                server.base,
+                sha256(&bytes)
+            ),
+        )
+        .unwrap();
+        fs::write(root.path().join(wrapper()), b"@echo off\n").unwrap();
+        let user_home = test_support::TempDir::new("gradle-wrapper-user-home");
+        let mut env = BuildEnv::default();
+        env.build_tools.second.home_kind = ToolHome::Wrapper;
+        env.build_tools.second.user_home = user_home.path().display().to_string();
+        let tool = Gradle::new(env);
+
+        tool.ensure_wrapper(root.path(), &Cancel::new())
+            .expect("the distribution is downloaded before the import");
+
+        let distribution =
+            WrapperDistribution::read(root.path()).expect("the project names a distribution");
+        assert!(distribution.installed(user_home.path()));
+        let requests = server.requests();
+        assert_eq!(requests, 1, "one archive, its sum comes from the file");
+
+        tool.ensure_wrapper(root.path(), &Cancel::new())
+            .expect("the second import reads the copy that is there");
+        assert_eq!(
+            server.requests(),
+            requests,
+            "no request for a distribution the wrapper has"
+        );
+    }
+
+    #[test]
+    fn the_switch_off_offers_the_download_of_the_wrapper_distribution() {
+        let root = test_support::TempDir::new("gradle-wrapper-switch-off");
+        let directory = root.path().join("gradle/wrapper");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("gradle-wrapper.properties"),
+            "distributionUrl=https\\://127.0.0.1:1/distributions/gradle-9.5.1-bin.zip\n",
+        )
+        .unwrap();
+        fs::write(root.path().join(wrapper()), b"@echo off\n").unwrap();
+        let user_home = test_support::TempDir::new("gradle-wrapper-switch-home");
+        let mut env = BuildEnv::default();
+        env.build_tools.second.home_kind = ToolHome::Wrapper;
+        env.build_tools.second.user_home = user_home.path().display().to_string();
+        env.build_tools.second.download_wrapper = false;
+        let tool = Gradle::new(env);
+
+        let error = tool
+            .ensure_wrapper(root.path(), &Cancel::new())
+            .expect_err("the automatic download is off");
+
+        assert!(
+            error.to_string().contains("automatic download is off"),
+            "{error}"
+        );
+        let setup = tool
+            .missing_tool(root.path())
+            .expect("the window names the distribution");
+        assert_eq!(
+            setup.title, "Gradle 9.5.1 for the wrapper is not downloaded",
+            "{}",
+            setup.title
+        );
+        assert_eq!(setup.download.as_deref(), Some("Download"));
+        assert!(setup.text.contains("automatic download"), "{}", setup.text);
+        assert!(setup.create_wrapper.is_none());
     }
 
     #[test]

@@ -3653,6 +3653,11 @@ impl Workspace {
                 || before.theme_dark != settings.theme_dark);
         let keep_theme = before.theme_sync_with_os && !settings.theme_sync_with_os;
         let ui_scale = settings.ui_scale;
+        // The memory check of the process reads its thresholds from the settings, so a
+        // change of them takes effect without a restart.
+        if before.memory_thresholds() != settings.memory_thresholds() {
+            ::platform::MemoryPressure::configure(settings.memory_thresholds());
+        }
         cx.set_global(settings.clone());
         if scale_changed {
             self.apply_ui_scale(ui_scale, cx);
@@ -5550,6 +5555,12 @@ impl Workspace {
         self.balloon
             .as_ref()
             .map(|balloon| (balloon.title.clone(), balloon.text.clone()))
+    }
+
+    /// Whether a notification is on screen now. A notice that the window shows once per
+    /// event asks this before it shows the same notice again.
+    pub fn notification_shown(&self) -> bool {
+        self.balloon_visible && self.balloon.is_some()
     }
 
     /// The importance of the last notification, for scripts and tests.

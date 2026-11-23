@@ -123,6 +123,7 @@ fn the_daemon_of_the_import_stops_after_its_idle_timeout() {
             "IDE_GRADLE_IDLE_TIMEOUT_MS".to_owned(),
             IDLE_MS.to_string(),
         )]),
+        max_heap_mb: None,
     };
     let session = JavaSession::open(config, Trust::Trusted).expect("the server starts");
     let (sender, statuses) = channel();

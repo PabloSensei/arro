@@ -389,6 +389,10 @@ impl LanguageSupport for JavaProject {
         self.build_scripts.set_enabled(enabled);
     }
 
+    fn set_max_heap_megabytes(&self, megabytes: Option<u32>) {
+        self.set_max_heap_mb(megabytes);
+    }
+
     fn semantic_tokens(&self) -> Option<&SemanticTokensProvider> {
         Some(self.providers.as_ref())
     }

@@ -282,6 +282,9 @@ impl FilePreview {
                 // The preview tells the place with the row it highlights; its own crumbs
                 // would name the declarations of the file under the list.
                 breadcrumbs: false,
+                // The word at the caret would cover the found part of a longer word: the
+                // preview marks the matches of the search alone.
+                highlight_occurrences: false,
                 sticky_lines: false,
                 highlight_current_line: false,
                 inlay_type_hints: false,

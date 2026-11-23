@@ -49,6 +49,8 @@ pub enum SettingsPage {
     SystemSettings,
     /// The automatic check for a new version.
     Updates,
+    /// The free memory that stops a language server, and the heap it takes.
+    Memory,
 }
 
 /// The names the language gives its two build tools. They are no part of this crate:
@@ -76,7 +78,7 @@ fn build_tool_name(index: usize) -> &'static str {
 
 impl SettingsPage {
     /// The pages in the order the window shows them.
-    pub const ALL: [SettingsPage; 32] = [
+    pub const ALL: [SettingsPage; 33] = [
         SettingsPage::Appearance,
         SettingsPage::Keymap,
         SettingsPage::Editor,
@@ -109,6 +111,7 @@ impl SettingsPage {
         SettingsPage::Plugins,
         SettingsPage::SystemSettings,
         SettingsPage::Updates,
+        SettingsPage::Memory,
     ];
 
     pub fn title(self) -> &'static str {
@@ -145,6 +148,7 @@ impl SettingsPage {
             SettingsPage::EditorFont => "Font",
             SettingsPage::SystemSettings => "System Settings",
             SettingsPage::Updates => "Updates",
+            SettingsPage::Memory => "Memory",
         }
     }
 
@@ -172,6 +176,7 @@ impl SettingsPage {
             SettingsPage::EditorFileTypes => 1,
             SettingsPage::EditorFont => 1,
             SettingsPage::Updates => 1,
+            SettingsPage::Memory => 1,
             _ => 0,
         }
     }
@@ -203,6 +208,7 @@ impl SettingsPage {
             SettingsPage::EditorFileTypes => Some(SettingsPage::Editor),
             SettingsPage::EditorFont => Some(SettingsPage::Editor),
             SettingsPage::Updates => Some(SettingsPage::SystemSettings),
+            SettingsPage::Memory => Some(SettingsPage::SystemSettings),
             SettingsPage::BuildToolsFirst | SettingsPage::BuildToolsSecond => {
                 Some(SettingsPage::BuildTools)
             }
@@ -275,10 +281,16 @@ pub enum SettingField {
     BuildToolFirstUpdateSnapshots,
     DownloadSourcesAutomatically,
     CheckDependencyUpdates,
+    /// The source of the distribution of the second build tool: the wrapper of the
+    /// project, a local installation or the copy the IDE downloaded.
     BuildToolSecondHome,
     BuildToolSecondOffline,
     BuildToolSecondUserHome,
     BuildToolSecondRuntimeHome,
+    /// The folder of a local installation of the second build tool.
+    BuildToolSecondHomePath,
+    /// Whether the IDE downloads the distribution the wrapper of the project names.
+    BuildToolSecondWrapperDownload,
     GitPath,
     GitUpdateMethod,
     GitAutoUpdateOnReject,
@@ -349,6 +361,14 @@ pub enum SettingField {
     IgnoredFiles,
     /// Whether Escape in the terminal moves the focus to the editor.
     TerminalEscapeFocus,
+    /// Whether the memory check stops a language server at all.
+    MemoryLowCheck,
+    /// The free memory in megabytes below which the check stops a language server.
+    MemoryLowMegabytes,
+    /// The share of the total memory below which the check stops a language server.
+    MemoryLowPercent,
+    /// The most heap of the language server in megabytes; empty lets it choose.
+    LanguageMaxHeap,
 }
 
 /// The value of a build tool field inside [`workspace::Settings`].
@@ -375,7 +395,7 @@ fn tool_property(field: SettingField) -> Option<(usize, ToolProperty)> {
         F::BuildToolFirstOffline => (0, P::Offline),
         F::BuildToolFirstVmOptions => (0, P::VmOptions),
         F::BuildToolFirstUpdateSnapshots => (0, P::UpdateSnapshots),
-        F::BuildToolSecondHome => (1, P::Home),
+        F::BuildToolSecondHomePath => (1, P::Home),
         F::BuildToolSecondOffline => (1, P::Offline),
         F::BuildToolSecondUserHome => (1, P::UserHome),
         F::BuildToolSecondRuntimeHome => (1, P::RuntimeHome),
@@ -689,9 +709,9 @@ pub const SETTINGS: &[Setting] = &[
         id: "build_tool_first_home",
         title: "Home",
         page: SettingsPage::BuildToolsFirst,
-        kind: SettingKind::Text,
-        field: SettingField::BuildToolFirstHome,
-        keywords: "home install location build tools wrapper",
+        kind: SettingKind::Choice,
+        field: SettingField::BuildToolFirstHomeKind,
+        keywords: "home distribution wrapper local installation downloaded location build tools",
     },
     Setting {
         id: "build_tool_first_settings_file",
@@ -753,9 +773,9 @@ pub const SETTINGS: &[Setting] = &[
         id: "build_tool_second_home",
         title: "Distribution",
         page: SettingsPage::BuildToolsSecond,
-        kind: SettingKind::Text,
+        kind: SettingKind::Choice,
         field: SettingField::BuildToolSecondHome,
-        keywords: "distribution wrapper install location build tools",
+        keywords: "distribution wrapper local installation downloaded location build tools",
     },
     Setting {
         id: "build_tool_second_user_home",
@@ -1046,14 +1066,6 @@ pub const SETTINGS: &[Setting] = &[
         keywords: "project tree select opened file autoscroll source follow editor tab",
     },
     Setting {
-        id: "build_tool_first_home_kind",
-        title: "Home source",
-        page: SettingsPage::BuildToolsFirst,
-        kind: SettingKind::Choice,
-        field: SettingField::BuildToolFirstHomeKind,
-        keywords: "home source bundled downloaded path wrapper automatic install location build tools",
-    },
-    Setting {
         id: "build_tool_first_terminal_path",
         title: "Add the downloaded tool to the PATH of terminals",
         page: SettingsPage::BuildToolsFirst,
@@ -1181,6 +1193,62 @@ pub const SETTINGS: &[Setting] = &[
         field: SettingField::TerminalEscapeFocus,
         keywords: "escape focus editor terminal move shell vim less",
     },
+    Setting {
+        id: "memory_low_check",
+        title: "Stop the language server when memory is low",
+        page: SettingsPage::Memory,
+        kind: SettingKind::Toggle,
+        field: SettingField::MemoryLowCheck,
+        keywords: "memory ram swap commit stop language server low check off",
+    },
+    Setting {
+        id: "memory_low_megabytes",
+        title: "Stop the language server when free memory is below",
+        page: SettingsPage::Memory,
+        kind: SettingKind::Number,
+        field: SettingField::MemoryLowMegabytes,
+        keywords: "memory ram swap commit stop language server megabytes floor threshold",
+    },
+    Setting {
+        id: "memory_low_percent",
+        title: "and below this percentage of the total memory",
+        page: SettingsPage::Memory,
+        kind: SettingKind::Number,
+        field: SettingField::MemoryLowPercent,
+        keywords: "memory ram swap commit stop language server percent share total threshold",
+    },
+    Setting {
+        id: "language_max_heap_megabytes",
+        title: "Maximum heap of the language server",
+        page: SettingsPage::Memory,
+        kind: SettingKind::Text,
+        field: SettingField::LanguageMaxHeap,
+        keywords: "memory heap xmx megabytes limit language server automatic choose",
+    },
+    Setting {
+        id: "build_tool_second_home_path",
+        title: "Local installation",
+        page: SettingsPage::BuildToolsSecond,
+        kind: SettingKind::Text,
+        field: SettingField::BuildToolSecondHomePath,
+        keywords: "local installation folder path distribution wrapper build tools",
+    },
+    Setting {
+        id: "build_tool_second_wrapper_download",
+        title: "Download the wrapper distribution automatically",
+        page: SettingsPage::BuildToolsSecond,
+        kind: SettingKind::Toggle,
+        field: SettingField::BuildToolSecondWrapperDownload,
+        keywords: "download wrapper distribution automatic network build tools",
+    },
+    Setting {
+        id: "build_tool_first_home_path",
+        title: "Local installation",
+        page: SettingsPage::BuildToolsFirst,
+        kind: SettingKind::Text,
+        field: SettingField::BuildToolFirstHome,
+        keywords: "local installation folder path distribution wrapper build tools",
+    },
 ];
 
 /// Every setting the window and the search know.
@@ -1215,13 +1283,47 @@ pub fn section_of(id: &str) -> Option<&'static str> {
     }
 }
 
+/// The grey text of an empty text field: the value applied when the field stays empty.
+pub fn text_hint(field: SettingField) -> &'static str {
+    match field {
+        SettingField::EditorFontFamily => "JetBrains Mono",
+        SettingField::BuildToolFirstHome => "C:/tools/build-tool",
+        SettingField::BuildToolFirstSettingsFile => "~/.m2/settings.xml",
+        SettingField::BuildToolFirstVmOptions => "-Xmx2g",
+        SettingField::BuildToolSecondHomePath => "C:/tools/build-tool",
+        SettingField::BuildToolSecondUserHome => "Default",
+        SettingField::GitPath => "Found on PATH",
+        SettingField::TerminalShell => "Detected automatically",
+        SettingField::TerminalStartDirectory => "Project root",
+        SettingField::TerminalEnvironment => "NAME=value per line",
+        SettingField::KubectlPath => "Found on PATH",
+        SettingField::KubeconfigPath => "~/.kube/config",
+        SettingField::McpBinary => "Next to Arro",
+        SettingField::LanguageMaxHeap => "Automatic",
+        _ => "",
+    }
+}
+
+/// Every word of `query` is in `text`, case ignored.
+fn words_in(text: &str, query: &str) -> bool {
+    let text = text.to_lowercase();
+    query
+        .split_whitespace()
+        .all(|word| text.contains(&word.to_lowercase()))
+}
+
 impl Setting {
-    /// Every word of `query` is in the name, the page or the extra words, case ignored.
+    /// Every word of `query` is in the name, the page, the extra words or the hint of the
+    /// field, case ignored.
     pub fn matches(&self, query: &str) -> bool {
-        let text = format!("{} {} {}", self.title, self.page.title(), self.keywords).to_lowercase();
-        query
-            .split_whitespace()
-            .all(|word| text.contains(&word.to_lowercase()))
+        let text = format!(
+            "{} {} {} {}",
+            self.title,
+            self.page.title(),
+            self.keywords,
+            text_hint(self.field)
+        );
+        words_in(&text, query)
     }
 }
 
@@ -1234,17 +1336,56 @@ pub fn search(query: &str, limit: usize) -> Vec<&'static Setting> {
         .collect()
 }
 
-/// The page the search opens for `query`: the page of the first setting of the list that
-/// matches it, or of the group that holds that page. None for an empty query, which keeps
-/// the page in force.
+/// How a page answers `query`; the smaller the rank, the earlier the search opens it. The
+/// name of the page comes before the name of a setting on it, and both come before the
+/// extra words and the hint of a field.
+fn page_rank(page: SettingsPage, query: &str) -> Option<u8> {
+    let title = page.title().to_lowercase();
+    let wanted = query.to_lowercase();
+    if title == wanted {
+        return Some(0);
+    }
+    if title.starts_with(&wanted) {
+        return Some(1);
+    }
+    // A query that names the page and then adds a word: `font size` opens Font before it
+    // looks for the words in the settings of every page.
+    if wanted.starts_with(&title) && wanted[title.len()..].starts_with(char::is_whitespace) {
+        return Some(2);
+    }
+    let mut title_match = false;
+    let mut word_match = false;
+    for setting in SETTINGS.iter().filter(|setting| setting.page == page) {
+        title_match |= words_in(setting.title, query);
+        word_match |= setting.matches(query);
+    }
+    if title_match {
+        Some(3)
+    } else if word_match {
+        Some(4)
+    } else {
+        None
+    }
+}
+
+/// The page the search opens for `query`: the page with the best match of its name, the
+/// name of a setting on it, or the words and hints of a setting; the first page of the tree
+/// wins a tie. None for an empty query, which keeps the page in force.
 pub fn page_matching(query: &str) -> Option<SettingsPage> {
-    if query.trim().is_empty() {
+    let query = query.trim();
+    if query.is_empty() {
         return None;
     }
-    SETTINGS
-        .iter()
-        .find(|setting| setting.matches(query))
-        .map(|setting| setting.page.target())
+    let mut best: Option<(u8, SettingsPage)> = None;
+    for page in SettingsPage::ALL {
+        let Some(rank) = page_rank(page, query) else {
+            continue;
+        };
+        if best.is_none_or(|(best_rank, _)| rank < best_rank) {
+            best = Some((rank, page));
+        }
+    }
+    best.map(|(_, page)| page.target())
 }
 
 /// The pages the search keeps, in the order of the tree: the pages of the settings that
@@ -1346,6 +1487,9 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         SettingField::McpRouterOnlyMode => Some(settings.mcp_router_only_mode),
         SettingField::McpTerminalSuggestions => Some(settings.mcp_terminal_suggestions),
         SettingField::TerminalEscapeFocus => Some(settings.terminal_escape_focus),
+        SettingField::MemoryLowCheck => {
+            Some(settings.memory_check_on(::platform::is_virtual_machine()))
+        }
         SettingField::TodoCaseSensitive => Some(settings.todo_case_sensitive),
         SettingField::AiEnabled => Some(settings.ai_enabled),
         SettingField::ProjectCompactMiddlePackages => {
@@ -1358,6 +1502,9 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
             Some(settings.build_tools.first.update_snapshots)
         }
         SettingField::BuildToolSecondOffline => Some(settings.build_tools.second.offline),
+        SettingField::BuildToolSecondWrapperDownload => {
+            Some(settings.build_tools.second.download_wrapper)
+        }
         SettingField::SqlScriptStopOnError => Some(settings.sql_script_stop_on_error),
         SettingField::DownloadSourcesAutomatically => Some(settings.download_sources_automatically),
         SettingField::CheckDependencyUpdates => Some(settings.check_dependency_updates),
@@ -1396,6 +1543,7 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         | SettingField::BuildToolFirstRepository
         | SettingField::BuildToolFirstVmOptions
         | SettingField::BuildToolSecondHome
+        | SettingField::BuildToolSecondHomePath
         | SettingField::BuildToolSecondUserHome
         | SettingField::BuildToolSecondRuntimeHome
         | SettingField::GitPath
@@ -1419,7 +1567,10 @@ pub fn value(settings: &Settings, id: &str) -> Option<bool> {
         | SettingField::McpRouterOnlyScope
         | SettingField::SqlKeywordCase
         | SettingField::TodoTemplates
-        | SettingField::IgnoredFiles => None,
+        | SettingField::IgnoredFiles
+        | SettingField::MemoryLowMegabytes
+        | SettingField::MemoryLowPercent
+        | SettingField::LanguageMaxHeap => None,
     }
 }
 
@@ -1518,6 +1669,11 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
         Some(SettingField::TerminalEscapeFocus) => {
             settings.terminal_escape_focus = !settings.terminal_escape_focus;
         }
+        Some(SettingField::MemoryLowCheck) => {
+            // The first flip makes the choice explicit: the switch shows the flipped value.
+            let on = settings.memory_check_on(::platform::is_virtual_machine());
+            settings.memory_low_check = Some(!on);
+        }
         Some(SettingField::TodoCaseSensitive) => {
             settings.todo_case_sensitive = !settings.todo_case_sensitive;
         }
@@ -1533,6 +1689,10 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
         }
         Some(SettingField::BuildToolSecondOffline) => {
             settings.build_tools.second.offline = !settings.build_tools.second.offline;
+        }
+        Some(SettingField::BuildToolSecondWrapperDownload) => {
+            settings.build_tools.second.download_wrapper =
+                !settings.build_tools.second.download_wrapper;
         }
         Some(SettingField::DownloadSourcesAutomatically) => {
             settings.download_sources_automatically = !settings.download_sources_automatically;
@@ -1600,6 +1760,7 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
             | SettingField::BuildToolFirstRepository
             | SettingField::BuildToolFirstVmOptions
             | SettingField::BuildToolSecondHome
+            | SettingField::BuildToolSecondHomePath
             | SettingField::BuildToolSecondUserHome
             | SettingField::BuildToolSecondRuntimeHome
             | SettingField::GitPath
@@ -1622,7 +1783,10 @@ pub fn toggle(settings: &mut Settings, id: &str) -> bool {
             | SettingField::McpExecutePermission
             | SettingField::McpRouterOnlyScope
             | SettingField::SqlKeywordCase
-            | SettingField::TodoTemplates,
+            | SettingField::TodoTemplates
+            | SettingField::MemoryLowMegabytes
+            | SettingField::MemoryLowPercent
+            | SettingField::LanguageMaxHeap,
         )
         | None => {
             return false;
@@ -1644,6 +1808,8 @@ pub fn number(settings: &Settings, id: &str) -> Option<f32> {
         SettingField::CompletionDelay => Some(settings.completion_delay_ms as f32),
         SettingField::HttpTimeout => Some(settings.http_timeout_seconds as f32),
         SettingField::DatabasePageRows => Some(settings.database_page_rows as f32),
+        SettingField::MemoryLowMegabytes => Some(settings.memory_low_megabytes as f32),
+        SettingField::MemoryLowPercent => Some(settings.memory_low_percent),
         _ => None,
     }
 }
@@ -1662,6 +1828,8 @@ pub fn number_label(settings: &Settings, id: &str) -> Option<String> {
         SettingField::CompletionDelay => format!("{value} ms"),
         SettingField::HttpTimeout => format!("{value} s"),
         SettingField::DatabasePageRows => format!("{value} rows"),
+        SettingField::MemoryLowMegabytes => format!("{value} MB"),
+        SettingField::MemoryLowPercent => format!("{value} %"),
         _ => format!("{value}"),
     })
 }
@@ -1731,6 +1899,17 @@ pub fn adjust_number(settings: &mut Settings, id: &str, delta: f32) -> bool {
             ) as u32;
             settings.database_page_rows = value;
         }
+        SettingField::MemoryLowMegabytes => {
+            let value = update(
+                settings.memory_low_megabytes as f32,
+                0.,
+                workspace::MAX_MEMORY_LOW_MEGABYTES as f32,
+            ) as u32;
+            settings.memory_low_megabytes = value;
+        }
+        SettingField::MemoryLowPercent => {
+            settings.memory_low_percent = update(settings.memory_low_percent, 0., 100.);
+        }
         _ => return false,
     }
     true
@@ -1786,6 +1965,26 @@ pub fn set_text(settings: &mut Settings, id: &str, text: &str) -> bool {
                 .map(str::to_owned)
                 .collect();
         }
+        SettingField::LanguageMaxHeap => {
+            // Empty or zero leaves the choice to the language server; anything else is a
+            // number of megabytes, kept within the limits of the settings.
+            let text = text.trim();
+            let megabytes = if text.is_empty() {
+                0
+            } else {
+                match text.parse::<u32>() {
+                    Ok(megabytes) => megabytes,
+                    Err(_) => return false,
+                }
+            };
+            settings.language_max_heap_megabytes = match megabytes {
+                0 => 0,
+                megabytes => megabytes.clamp(
+                    workspace::MIN_LANGUAGE_MAX_HEAP_MB,
+                    workspace::MAX_LANGUAGE_MAX_HEAP_MB,
+                ),
+            };
+        }
         _ => return false,
     }
     true
@@ -1821,6 +2020,8 @@ pub fn text(settings: &Settings, id: &str) -> Option<String> {
         SettingField::McpBinary => settings.mcp_binary.clone(),
         SettingField::TodoTemplates => settings.todo_templates.join(", "),
         SettingField::IgnoredFiles => settings.ignored_files.join("; "),
+        SettingField::LanguageMaxHeap if settings.language_max_heap_megabytes == 0 => String::new(),
+        SettingField::LanguageMaxHeap => settings.language_max_heap_megabytes.to_string(),
         _ => return None,
     })
 }
@@ -1844,7 +2045,8 @@ pub fn chosen_theme<'a>(settings: &'a Settings, dark: bool, on_screen: &'a str) 
 
 /// The chosen name of a setting with named choices, for the window to show.
 pub fn choice_label(settings: &Settings, id: &str) -> Option<String> {
-    let label = match find(id)?.field {
+    let field = find(id)?.field;
+    let label = match field {
         SettingField::TrimTrailingWhitespace => {
             settings.trim_trailing_whitespace.label().to_owned()
         }
@@ -1858,8 +2060,8 @@ pub fn choice_label(settings: &Settings, id: &str) -> Option<String> {
         SettingField::ThemeLight => Theme::label(&settings.theme_light),
         SettingField::ThemeDark => Theme::label(&settings.theme_dark),
         SettingField::IconSet => IconCatalog::label(&settings.icon_set),
-        SettingField::BuildToolFirstHomeKind => {
-            home_kind_label(settings.build_tools.first.home_kind).to_owned()
+        SettingField::BuildToolFirstHomeKind | SettingField::BuildToolSecondHome => {
+            distribution_label(chosen_home(settings, field)?).to_owned()
         }
         SettingField::McpExecutePermission => settings.mcp_execute_permission.label().to_owned(),
         SettingField::McpRouterOnlyScope => settings.mcp_router_only_scope.label().to_owned(),
@@ -1869,62 +2071,88 @@ pub fn choice_label(settings: &Settings, id: &str) -> Option<String> {
     Some(label)
 }
 
-/// The name of a way to find the home of the first build tool.
-fn home_kind_label(kind: ToolHome) -> &'static str {
+/// The name of a way to find the home of a build tool. The list has three items; the
+/// automatic order of an old file shows the wrapper it starts with. An old file whose
+/// kind is `PATH` shows the wrapper too, and keeps its kind until the list is used.
+fn distribution_label(kind: ToolHome) -> &'static str {
     match kind {
-        ToolHome::Auto => "Automatic",
-        ToolHome::Bundled => "Bundled",
-        ToolHome::Path => "PATH",
-        ToolHome::Wrapper => "Project wrapper",
-        ToolHome::Custom => "Folder",
+        ToolHome::Bundled => "Downloaded by Arro",
+        ToolHome::Custom => "Local installation",
+        ToolHome::Auto | ToolHome::Wrapper | ToolHome::Path => "Wrapper",
     }
+}
+
+/// The kinds a home list offers, in its order.
+const HOME_KINDS: [ToolHome; 3] = [ToolHome::Wrapper, ToolHome::Custom, ToolHome::Bundled];
+
+/// The tool of a home list and the row of the folder of a local installation.
+fn home_choice(field: SettingField) -> Option<(usize, &'static str)> {
+    match field {
+        SettingField::BuildToolFirstHomeKind => Some((0, "build_tool_first_home_path")),
+        SettingField::BuildToolSecondHome => Some((1, "build_tool_second_home_path")),
+        _ => None,
+    }
+}
+
+/// The source of the home a list names.
+pub fn chosen_home(settings: &Settings, field: SettingField) -> Option<ToolHome> {
+    let (tool, _) = home_choice(field)?;
+    Some(settings.build_tools.tool(tool).chosen_home_kind())
+}
+
+/// The id of the row of the folder of a home list: the row that belongs to the choice.
+pub fn home_path_id(field: SettingField) -> Option<&'static str> {
+    home_choice(field).map(|(_, id)| id)
 }
 
 /// The next choice of a setting with named choices. False when it has none.
 pub fn next_choice(settings: &mut Settings, id: &str) -> bool {
-    match find(id).map(|setting| setting.field) {
-        Some(SettingField::TrimTrailingWhitespace) => {
+    let Some(field) = find(id).map(|setting| setting.field) else {
+        return false;
+    };
+    if let Some((tool, _)) = home_choice(field) {
+        let current = settings.build_tools.tool(tool).chosen_home_kind();
+        let index = HOME_KINDS
+            .iter()
+            .position(|kind| *kind == current)
+            .unwrap_or(0);
+        settings.build_tools.tool_mut(tool).home_kind = HOME_KINDS[(index + 1) % HOME_KINDS.len()];
+        return true;
+    }
+    match field {
+        SettingField::TrimTrailingWhitespace => {
             settings.trim_trailing_whitespace = settings.trim_trailing_whitespace.next();
         }
-        Some(SettingField::ActionsOnSaveScope) => {
+        SettingField::ActionsOnSaveScope => {
             settings.actions_on_save_reformat_scope =
                 settings.actions_on_save_reformat_scope.next();
         }
-        Some(SettingField::UseTabs) => settings.use_tabs = !settings.use_tabs,
-        Some(SettingField::CompletionCase) => {
+        SettingField::UseTabs => settings.use_tabs = !settings.use_tabs,
+        SettingField::CompletionCase => {
             settings.completion_case = settings.completion_case.next();
         }
-        Some(SettingField::InlayParameterNames) => {
+        SettingField::InlayParameterNames => {
             settings.inlay_parameter_names = settings.inlay_parameter_names.next();
         }
-        Some(SettingField::GitUpdateMethod) => {
+        SettingField::GitUpdateMethod => {
             settings.git_update_method = settings.git_update_method.next();
         }
-        Some(SettingField::ThemeLight) => settings.theme_light = next_theme(&settings.theme_light),
-        Some(SettingField::ThemeDark) => settings.theme_dark = next_theme(&settings.theme_dark),
-        Some(SettingField::IconSet) => {
+        SettingField::ThemeLight => settings.theme_light = next_theme(&settings.theme_light),
+        SettingField::ThemeDark => settings.theme_dark = next_theme(&settings.theme_dark),
+        SettingField::IconSet => {
             settings.icon_set = if settings.icon_set == INTELLIJ {
                 ARRO.to_owned()
             } else {
                 INTELLIJ.to_owned()
             };
         }
-        Some(SettingField::BuildToolFirstHomeKind) => {
-            settings.build_tools.first.home_kind = match settings.build_tools.first.home_kind {
-                ToolHome::Auto => ToolHome::Bundled,
-                ToolHome::Bundled => ToolHome::Path,
-                ToolHome::Path => ToolHome::Wrapper,
-                ToolHome::Wrapper => ToolHome::Custom,
-                ToolHome::Custom => ToolHome::Auto,
-            };
-        }
-        Some(SettingField::McpExecutePermission) => {
+        SettingField::McpExecutePermission => {
             settings.mcp_execute_permission = settings.mcp_execute_permission.next();
         }
-        Some(SettingField::McpRouterOnlyScope) => {
+        SettingField::McpRouterOnlyScope => {
             settings.mcp_router_only_scope = settings.mcp_router_only_scope.next();
         }
-        Some(SettingField::SqlKeywordCase) => {
+        SettingField::SqlKeywordCase => {
             settings.sql_keyword_case = settings.sql_keyword_case.next();
         }
         _ => return false,
@@ -1943,8 +2171,8 @@ pub fn choices(id: &str) -> Vec<String> {
         Some(SettingField::CompletionCase) => &["None", "First letter", "All"],
         Some(SettingField::InlayParameterNames) => &["None", "Literals", "All"],
         Some(SettingField::GitUpdateMethod) => &["Merge", "Rebase"],
-        Some(SettingField::BuildToolFirstHomeKind) => {
-            &["Automatic", "Bundled", "PATH", "Project wrapper", "Folder"]
+        Some(SettingField::BuildToolFirstHomeKind | SettingField::BuildToolSecondHome) => {
+            &["Wrapper", "Local installation", "Downloaded by Arro"]
         }
         Some(SettingField::McpExecutePermission) => &[
             "Always ask",
@@ -1974,6 +2202,15 @@ pub fn set_choice(settings: &mut Settings, id: &str, index: usize) -> bool {
     let count = choices(id).len();
     if count == 0 {
         return false;
+    }
+    // A home list names its kind directly: an old file whose label already reads Wrapper
+    // still has to become the explicit source the user picked.
+    if let Some((tool, _)) = find(id).map(|setting| setting.field).and_then(home_choice) {
+        let Some(kind) = HOME_KINDS.get(index).copied() else {
+            return false;
+        };
+        settings.build_tools.tool_mut(tool).home_kind = kind;
+        return true;
     }
     let steps = (index + count - chosen_choice(settings, id)) % count;
     for _ in 0..steps {
@@ -2052,7 +2289,8 @@ mod tests {
             "the extra words count too"
         );
         assert!(search("zzz", 10).is_empty());
-        assert_eq!(search("", 100).len(), super::all().len());
+        let every = super::all().len();
+        assert_eq!(search("", every).len(), every);
     }
 
     #[test]
@@ -2142,6 +2380,64 @@ mod tests {
     }
 
     #[test]
+    fn the_distribution_choice_reads_the_old_folder() {
+        let mut settings = Settings::default();
+        assert_eq!(
+            super::choice_label(&settings, "build_tool_second_home").as_deref(),
+            Some("Wrapper"),
+            "an empty value of an old file is the wrapper"
+        );
+        assert_eq!(super::choices("build_tool_second_home").len(), 3);
+
+        settings.build_tools.second.home = "C:/tool-dist".into();
+        assert_eq!(
+            super::choice_label(&settings, "build_tool_second_home").as_deref(),
+            Some("Local installation"),
+            "a folder of an old file is a local installation"
+        );
+
+        settings.build_tools.second.home.clear();
+        settings.build_tools.second.home_kind = project_model::ToolHome::Bundled;
+        assert_eq!(
+            super::choice_label(&settings, "build_tool_second_home").as_deref(),
+            Some("Downloaded by Arro")
+        );
+
+        // A file with only a folder shows Local installation; picking the Wrapper of the
+        // list has to store that choice even though the row already showed it.
+        settings.build_tools.second.home = "C:/tool-dist".into();
+        settings.build_tools.second.home_kind = project_model::ToolHome::Auto;
+        assert!(super::set_choice(
+            &mut settings,
+            "build_tool_second_home",
+            0
+        ));
+        assert_eq!(
+            settings.build_tools.second.home_kind,
+            project_model::ToolHome::Wrapper
+        );
+        assert!(
+            !settings.build_tools.second.home.is_empty(),
+            "the folder stays for the next local installation"
+        );
+    }
+
+    #[test]
+    fn the_wrapper_download_switch_is_on_by_default() {
+        let mut settings = Settings::default();
+        assert_eq!(
+            value(&settings, "build_tool_second_wrapper_download"),
+            Some(true)
+        );
+        assert!(toggle(&mut settings, "build_tool_second_wrapper_download"));
+        assert_eq!(
+            value(&settings, "build_tool_second_wrapper_download"),
+            Some(false)
+        );
+        assert!(!settings.build_tools.second.download_wrapper);
+    }
+
+    #[test]
     fn the_appearance_page_marks_the_theme_the_window_shows() {
         let mut settings = Settings {
             theme_sync_with_os: false,
@@ -2164,5 +2460,34 @@ mod tests {
         settings.theme_sync_with_os = true;
         assert_eq!(super::chosen_theme(&settings, true, "mocha"), "nord");
         assert_eq!(super::chosen_theme(&settings, false, "mocha"), "paper");
+    }
+
+    #[test]
+    fn the_memory_check_is_a_switch_and_an_off_check_takes_no_memory_as_low() {
+        // Without a choice the check follows the machine: on, except on a virtual machine.
+        let machine = ::platform::is_virtual_machine();
+        let mut settings = Settings::default();
+        assert_eq!(value(&settings, "memory_low_check"), Some(!machine));
+        assert!(toggle(&mut settings, "memory_low_check"));
+        assert_eq!(value(&settings, "memory_low_check"), Some(machine));
+        assert_eq!(
+            settings.memory_low_check,
+            Some(machine),
+            "the switch keeps the explicit choice"
+        );
+        let thresholds = if machine {
+            platform::MemoryThresholds::new(5., 512)
+        } else {
+            platform::MemoryThresholds::new(0., 0)
+        };
+        assert_eq!(
+            settings.memory_thresholds(),
+            thresholds,
+            "a switch off takes no memory as low, so no server stops for memory"
+        );
+        assert_eq!(
+            super::number_label(&settings, "memory_low_megabytes").as_deref(),
+            Some("512 MB")
+        );
     }
 }

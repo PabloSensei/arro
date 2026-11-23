@@ -64,6 +64,7 @@ pub(crate) fn options_of(cx: &App) -> EditorOptions {
         line_numbers: settings.show_line_numbers && !appearance.distraction_free,
         gutter_icons: settings.show_gutter_icons && !appearance.distraction_free,
         highlight_current_line: settings.highlight_current_line,
+        highlight_occurrences: true,
         indent_guides: settings.show_indent_guides,
         breadcrumbs: settings.show_breadcrumbs
             && settings.navigation_bar_visible

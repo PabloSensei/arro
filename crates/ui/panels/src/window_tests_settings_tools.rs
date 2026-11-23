@@ -261,7 +261,7 @@ fn the_second_build_tool_takes_its_distribution_and_user_home() {
     let mut settings = Settings::default();
     assert!(crate::settings_catalog::set_text(
         &mut settings,
-        "build_tool_second_home",
+        "build_tool_second_home_path",
         &distribution.display().to_string()
     ));
     assert!(crate::settings_catalog::set_text(
@@ -324,7 +324,7 @@ fn the_second_build_tool_command_takes_the_offline_flag_and_the_user_home() {
     let mut settings = Settings::default();
     assert!(crate::settings_catalog::set_text(
         &mut settings,
-        "build_tool_second_home",
+        "build_tool_second_home_path",
         &distribution.display().to_string()
     ));
     assert!(crate::settings_catalog::set_text(

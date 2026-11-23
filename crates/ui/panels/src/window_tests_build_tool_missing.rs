@@ -153,6 +153,8 @@ impl BuildSystem for FakeTool {
             text: "The build tool of the project is not installed.".into(),
             download: Some("Download build tool".into()),
             choose: Some("Choose home\u{2026}".into()),
+            create_wrapper: None,
+            use_downloaded: None,
             settings: Some(("Build Tools".into(), "build_tool_first_home")),
         })
     }
