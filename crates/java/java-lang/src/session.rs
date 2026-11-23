@@ -114,11 +114,19 @@ fn config_for(
         state_dir: project_state_dir(state_dir, root),
         runtimes,
         maven_settings,
-        gradle_home: build_tools.second.home_path().map(PathBuf::from),
+        // A named folder is the installation; the wrapper serves the other choices, and
+        // its distribution is the one Arro keeps under the user home.
+        gradle_home: matches!(
+            build_tools.second.chosen_home_kind(),
+            project_model::ToolHome::Custom
+        )
+        .then(|| build_tools.second.home_path().map(PathBuf::from))
+        .flatten(),
         gradle_user_home: build_tools.second.user_home_path().map(PathBuf::from),
         gradle_java_home,
         offline: std::env::var_os(OFFLINE).is_some() || offline,
         environment: HashMap::new(),
+        max_heap_mb: None,
     }
 }
 
@@ -352,6 +360,11 @@ pub(crate) fn follow_failures(
 /// is imported, and a `ready` line would hide the reason. A failure that another import
 /// is about to clear, and the import that runs after it, read as `importing`.
 pub fn status_line(status: &Status, failure: Option<&ImportFailure>, importing: bool) -> String {
+    // A stop for low memory is the line whatever the import says: an import that the stop
+    // cut short would otherwise hide the reason, and the user needs it.
+    if status.stopped_for_memory() {
+        return status_text(status);
+    }
     match failure {
         Some(failure) if failure.retry => "Java: importing".to_owned(),
         Some(failure) => format!("Java: import failed: {}", failure.summary),
@@ -551,6 +564,17 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_for_memory_is_the_line_even_while_an_import_runs() {
+        let mut stopped = status(State::Stopped);
+        stopped.last_error = Some("memory is low, it starts again when memory frees".to_owned());
+        let failure = failure_with("the import failed");
+        assert_eq!(
+            status_line(&stopped, Some(&failure), true),
+            "Java: stopped: memory is low, it starts again when memory frees"
+        );
+    }
+
+    #[test]
     fn a_failed_import_is_the_line_and_hides_ready() {
         let mut ready = status(State::Ready);
         ready.last_error = None;
@@ -686,6 +710,7 @@ mod tests {
             gradle_java_home: None,
             offline: true,
             environment: HashMap::new(),
+            max_heap_mb: None,
         });
         let outcome = JavaSession::open(config, Trust::Untrusted);
         assert!(matches!(outcome, Err(OpenError::NotTrusted)));

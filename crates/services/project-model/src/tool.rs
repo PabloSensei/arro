@@ -18,6 +18,10 @@ pub struct ToolSetup {
     pub download: Option<String>,
     /// The label of the button that chooses a folder of the tool.
     pub choose: Option<String>,
+    /// The label of the button that writes the wrapper of the project.
+    pub create_wrapper: Option<String>,
+    /// The label of the button that uses the downloaded tool without a wrapper.
+    pub use_downloaded: Option<String>,
     /// The label of the settings button and the row it opens.
     pub settings: Option<(String, &'static str)>,
 }

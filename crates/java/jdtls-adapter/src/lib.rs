@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,6 +29,7 @@ use tokio::sync::watch;
 mod code_style;
 mod import;
 mod install;
+mod log;
 mod startup;
 
 pub use import::{BuildTool, ImportFailure, is_build_file};
@@ -97,7 +98,15 @@ const LAUNCH_SETTINGS: &[&str] = &[
     "java.base/java.lang=ALL-UNNAMED",
 ];
 
+/// The stderr of the JVM, which the sidecar writes and the crash checks read.
 const LOG_FILE: &str = "jdtls-stderr.log";
+
+/// The heading of the JVM output that joins the log of the server messages.
+const JVM_OUTPUT_HEADING: &str = "--- JVM output ---";
+
+/// A JVM of this version knows `--sun-misc-unsafe-memory-access`, which silences the
+/// warning of JEP 498 about Guice and other libraries of the bundles.
+const UNSAFE_MEMORY_FLAG_JAVA: u32 = 24;
 
 /// The configuration folder of the jdtls release for this system.
 const CONFIG_DIRECTORY: &str = if cfg!(windows) {
@@ -265,6 +274,10 @@ pub struct JdtlsConfig {
     /// No network for dependency resolution during import.
     pub offline: bool,
     pub environment: HashMap<String, String>,
+    /// The most heap of the server in megabytes, which is also its heap from the first
+    /// start on. `None` lets the server pick the heap from the size of the machine and
+    /// grow it after an out-of-memory end.
+    pub max_heap_mb: Option<u32>,
 }
 
 /// jdtls as a server of the sidecar.
@@ -284,6 +297,9 @@ pub struct Jdtls {
     installation: install::InstallMark,
     autobuild: Autobuild,
     heap_mb: AtomicU32,
+    /// The heap the user set in megabytes, zero when the server chooses. A set heap is the
+    /// heap of every start: the ladder does not grow it.
+    max_heap_mb: AtomicU32,
     /// `java.configuration.runtimes` as the server reads it at every start. Project
     /// Structure changes it without starting a new process of the window.
     runtimes: Mutex<Vec<Runtime>>,
@@ -301,6 +317,10 @@ pub struct Jdtls {
     lombok: Mutex<Option<Lombok>>,
     /// When the last start began, so that a stale log is not read as its cause.
     started: Mutex<Option<SystemTime>>,
+    /// The log of the messages of the server, open while it runs.
+    messages: Mutex<Option<log::ServerLog>>,
+    /// How much of the stderr of the JVM is already in the log of messages.
+    jvm_output: Mutex<u64>,
     /// The latest import failure the server reported, and the imports running now.
     imports: import::ImportState,
     /// The legend of the semantic tokens, which the server gives at `initialize`.
@@ -335,6 +355,12 @@ impl Jdtls {
             let message = "jdtls already runs for this project in another window";
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, message));
         }
+        let max_heap = config.max_heap_mb.filter(|mb| *mb > 0).unwrap_or(0);
+        let heap = if max_heap > 0 {
+            max_heap
+        } else {
+            first_heap_mb(platform::physical_memory())
+        };
         Ok(Self {
             runtimes: Mutex::new(config.runtimes.clone()),
             inlay: Mutex::new(InlayHints::default()),
@@ -347,13 +373,29 @@ impl Jdtls {
             launcher_jar,
             installation,
             autobuild: Autobuild::default(),
-            heap_mb: AtomicU32::new(first_heap_mb(platform::physical_memory())),
+            heap_mb: AtomicU32::new(heap),
+            max_heap_mb: AtomicU32::new(max_heap),
             started: Mutex::new(None),
+            messages: Mutex::new(None),
+            jvm_output: Mutex::new(0),
             imports: import::ImportState::new(),
             semantic_tokens: SemanticTokensSetup::new(),
             code_lens: CodeLensSetup::new(),
             _lock: lock,
         })
+    }
+
+    /// Sets the most heap the server takes from its next start on; `None` lets the server
+    /// choose again. A running server keeps the heap it started with.
+    pub fn set_max_heap_mb(&self, megabytes: Option<u32>) {
+        let max = megabytes.filter(|mb| *mb > 0).unwrap_or(0);
+        self.max_heap_mb.store(max, Ordering::Relaxed);
+        let heap = if max > 0 {
+            max
+        } else {
+            first_heap_mb(platform::physical_memory())
+        };
+        self.heap_mb.store(heap, Ordering::Relaxed);
     }
 
     /// The legend the server declared, filled when it answers `initialize`.
@@ -545,8 +587,98 @@ impl Jdtls {
         self.autobuild.clone()
     }
 
+    /// The log of the server messages, which Show Log opens. The stderr of the JVM
+    /// stays in its own file and reaches this one through [`Self::append_jvm_output`].
     pub fn log_file(&self) -> PathBuf {
+        self.config.state_dir.join(log::MESSAGES_LOG)
+    }
+
+    fn stderr_file(&self) -> PathBuf {
         self.config.state_dir.join(LOG_FILE)
+    }
+
+    /// Appends the lines of the JVM output that are not the warnings of a new JDK to
+    /// the log of messages, under a heading, and waits until the log is written. Each
+    /// line moves once; the stderr file stays as the sidecar writes it.
+    pub fn append_jvm_output(&self) {
+        let lines = self.unseen_jvm_output();
+        let log = self
+            .messages
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        if let Some(log) = log {
+            if let Some(lines) = lines {
+                log.section(JVM_OUTPUT_HEADING, &lines);
+            }
+            log.flush();
+        }
+    }
+
+    /// The JVM output since the previous call, without the warnings of the JVM.
+    fn unseen_jvm_output(&self) -> Option<String> {
+        let mut seen = self
+            .jvm_output
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let path = self.stderr_file();
+        let metadata = fs::metadata(&path).ok()?;
+        // The sidecar truncates the file at every start; a shorter file is a new one.
+        if metadata.len() < *seen {
+            *seen = 0;
+        }
+        let mut file = fs::File::open(&path).ok()?;
+        file.seek(SeekFrom::Start(*seen)).ok()?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).ok()?;
+        // A line without its newline may still be written by the sidecar, so it waits.
+        let end = bytes.iter().rposition(|byte| *byte == b'\n')? + 1;
+        *seen += end as u64;
+        let text = String::from_utf8_lossy(&bytes[..end]);
+        let lines: String = text
+            .lines()
+            .filter(|line| !line.starts_with("WARNING:"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        (!lines.is_empty()).then_some(lines)
+    }
+
+    /// Waits until every message of the server that has arrived is in the log, for a
+    /// caller that opens the file right away.
+    pub fn flush_log(&self) {
+        let log = self
+            .messages
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        if let Some(log) = log {
+            log.flush();
+        }
+    }
+
+    /// One message of the server, as Show Log shows it. A multi-line stack trace stays
+    /// whole. Works on the reader of the protocol, so it only queues the line.
+    fn log_message(&self, method: &str, params: &Value) {
+        if !matches!(method, "window/logMessage" | "window/showMessage") {
+            return;
+        }
+        let Some(text) = params.get("message").and_then(Value::as_str) else {
+            return;
+        };
+        let level = match params.get("type").and_then(Value::as_i64) {
+            Some(1) => "Error",
+            Some(2) => "Warning",
+            Some(3) => "Info",
+            _ => "Log",
+        };
+        let log = self
+            .messages
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        if let Some(log) = log {
+            log.line(level, text);
+        }
     }
 
     /// The latest failure of the build import, and every later one.
@@ -1014,6 +1146,31 @@ impl ServerSpec for Jdtls {
             .started
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = Some(now);
+        *self
+            .jvm_output
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = 0;
+        let heading = format!(
+            "===== jdtls {JDTLS_VERSION} started {} with Java {} =====",
+            log::timestamp(now),
+            self.config.java_home.display()
+        );
+        let opened = match log::ServerLog::open(&self.log_file(), &heading) {
+            Ok(log) => Some(log),
+            Err(error) => {
+                eprintln!("the messages of the server are not saved: {error}");
+                None
+            }
+        };
+        let previous = {
+            let mut messages = self
+                .messages
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            std::mem::replace(&mut *messages, opened)
+        };
+        // The writer of the previous start drains before the new one writes.
+        drop(previous);
     }
 
     fn crash_reason(&self) -> Option<String> {
@@ -1053,6 +1210,14 @@ impl ServerSpec for Jdtls {
         {
             args.push(format!("-javaagent:{}", lombok.jar.display()));
         }
+        // A JVM of 24 and newer warns about `sun.misc.Unsafe` for every library that
+        // still uses it, Guice inside the bundles among them. An older JVM refuses the
+        // flag it does not know, so only a version that knows it gets it.
+        if startup::java_version(&config.java_home)
+            .is_some_and(|version| version >= UNSAFE_MEMORY_FLAG_JAVA)
+        {
+            args.push("--sun-misc-unsafe-memory-access=allow".to_owned());
+        }
         args.extend([
             "-jar".to_owned(),
             self.launcher_jar.display().to_string(),
@@ -1066,7 +1231,7 @@ impl ServerSpec for Jdtls {
             args,
             env: config.environment.clone(),
             directory: Some(config.state_dir.clone()),
-            log: Some(self.log_file()),
+            log: Some(self.stderr_file()),
             label: Some("Language server"),
         }
     }
@@ -1074,7 +1239,8 @@ impl ServerSpec for Jdtls {
     fn crashed(&self, exit_code: Option<i32>) {
         // A new server imports the project again, so an old failure says nothing.
         self.imports.reset();
-        if exit_code == Some(EXIT_OUT_OF_MEMORY) {
+        // A heap the user set is the ceiling of the ladder as well as its only step.
+        if exit_code == Some(EXIT_OUT_OF_MEMORY) && self.max_heap_mb.load(Ordering::Relaxed) == 0 {
             let _ = self
                 .heap_mb
                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |heap| {
@@ -1133,6 +1299,7 @@ impl ServerSpec for Jdtls {
     }
 
     fn state_of(&self, method: &str, params: &Value) -> Option<State> {
+        self.log_message(method, params);
         self.imports.observe(method, params);
         if method != "language/status" {
             return None;
@@ -1176,6 +1343,10 @@ mod tests {
     }
 
     fn jdtls_with_gradle_java_home(gradle_java_home: Option<PathBuf>) -> (Jdtls, PathBuf) {
+        jdtls_with(gradle_java_home, None)
+    }
+
+    fn jdtls_with(gradle_java_home: Option<PathBuf>, max_heap_mb: Option<u32>) -> (Jdtls, PathBuf) {
         let root = test_support::scratch("jdtls-adapter");
         let plugins = root.join("home").join("plugins");
         fs::create_dir_all(&plugins).unwrap();
@@ -1198,6 +1369,7 @@ mod tests {
             gradle_java_home,
             offline: true,
             environment: HashMap::new(),
+            max_heap_mb,
         };
         (Jdtls::new(config).unwrap(), root)
     }
@@ -1221,8 +1393,32 @@ mod tests {
             gradle_java_home: None,
             offline: true,
             environment: HashMap::new(),
+            max_heap_mb: None,
         };
         (Jdtls::new(config).unwrap(), root)
+    }
+
+    #[test]
+    fn a_set_heap_goes_to_xmx_and_limits_the_ladder() {
+        // From the first start on, even above the largest step of the ladder.
+        let (capped, _) = jdtls_with(None, Some(5000));
+        assert!(capped.plan().args.iter().any(|arg| arg == "-Xmx5000m"));
+        capped.crashed(Some(EXIT_OUT_OF_MEMORY));
+        assert!(
+            capped.plan().args.iter().any(|arg| arg == "-Xmx5000m"),
+            "an out-of-memory end does not grow a heap the user set"
+        );
+
+        // Setting the heap at run time applies at the next start, and clearing it goes back
+        // to the heap of the machine.
+        let (jdtls, _) = jdtls();
+        jdtls.set_max_heap_mb(Some(3072));
+        assert!(jdtls.plan().args.iter().any(|arg| arg == "-Xmx3072m"));
+        jdtls.crashed(Some(EXIT_OUT_OF_MEMORY));
+        assert!(jdtls.plan().args.iter().any(|arg| arg == "-Xmx3072m"));
+        jdtls.set_max_heap_mb(None);
+        let automatic = format!("-Xmx{}m", first_heap_mb(platform::physical_memory()));
+        assert!(jdtls.plan().args.contains(&automatic));
     }
 
     #[test]

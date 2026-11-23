@@ -661,7 +661,10 @@ impl EditorView {
                 }
                 marks.push((range.clone(), style.occurrence));
             }
-        } else if !semantic && let Some(word) = state.caret_word() {
+        } else if self.options.highlight_occurrences
+            && !semantic
+            && let Some(word) = state.caret_word()
+        {
             let store = state.store();
             let needle = store.slice(word);
             let text = store.slice(visible.clone());

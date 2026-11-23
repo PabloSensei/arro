@@ -170,6 +170,12 @@ pub trait LanguageSupport: Send + Sync {
         let _ = enabled;
     }
 
+    /// The most heap in megabytes the server takes at its next start, or `None` when the
+    /// language chooses it. A server that runs keeps the heap it started with.
+    fn set_max_heap_megabytes(&self, megabytes: Option<u32>) {
+        let _ = megabytes;
+    }
+
     /// Hints the language puts between the characters of a line: parameter names,
     /// types. The editor filters what Settings shows.
     fn inlay_hints(&self) -> Option<&crate::InlayHintProvider> {

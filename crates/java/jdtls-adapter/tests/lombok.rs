@@ -58,6 +58,7 @@ fn config(root: &Path) -> JdtlsConfig {
         gradle_java_home: None,
         offline: true,
         environment: HashMap::new(),
+        max_heap_mb: None,
     }
 }
 
@@ -262,6 +263,7 @@ fn config_for(project: PathBuf, settings: PathBuf, state: PathBuf) -> JdtlsConfi
         gradle_java_home: None,
         offline: true,
         environment: HashMap::new(),
+        max_heap_mb: None,
     }
 }
 

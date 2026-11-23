@@ -30,6 +30,8 @@ fn limits() -> Limits {
     Limits {
         initialize: Duration::from_secs(5),
         shutdown: Duration::from_millis(200),
+        // The stops of these tests come at once; the hold has tests of its own.
+        memory_hold: Duration::ZERO,
         ..Limits::default()
     }
 }
@@ -582,6 +584,58 @@ async fn low_memory_during_backoff_also_waits_for_memory() {
     assert!(freed.elapsed() >= hold);
     assert_eq!(ready.generation, 2);
     assert_eq!(launcher.launches(), 2);
+
+    timeout(LIMIT, sidecar.stop()).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_hold_before_a_stop_is_thirty_seconds_by_default() {
+    assert_eq!(Limits::default().memory_hold, Duration::from_secs(30));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dip_of_low_memory_shorter_than_the_hold_stops_nothing() {
+    let launcher = FakeLauncher::scripted(&[]);
+    let (signal, memory) = watch::channel(false);
+    let mut limits = limits();
+    limits.memory_hold = Duration::from_secs(30);
+    let sidecar = start(&launcher, memory, limits);
+    let mut status = sidecar.status();
+    until(&mut status, |status| status.state == State::Ready).await;
+
+    signal.send(true).unwrap();
+    advance(Duration::from_secs(10)).await;
+    signal.send(false).unwrap();
+    advance(Duration::from_secs(600)).await;
+
+    assert_eq!(status.borrow().state, State::Ready);
+    assert_eq!(status.borrow().generation, 1);
+    assert_eq!(status.borrow().last_error, None);
+    assert_eq!(launcher.launches(), 1);
+
+    timeout(LIMIT, sidecar.stop()).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn low_memory_that_lasts_the_hold_stops_the_server() {
+    let launcher = FakeLauncher::scripted(&[]);
+    let (signal, memory) = watch::channel(false);
+    let mut limits = limits();
+    limits.memory_hold = Duration::from_secs(30);
+    let sidecar = start(&launcher, memory, limits);
+    let mut status = sidecar.status();
+    until(&mut status, |status| status.state == State::Ready).await;
+
+    let low = Instant::now();
+    signal.send(true).unwrap();
+    let stopped = until(&mut status, |status| status.state == State::Stopped).await;
+    assert!(
+        low.elapsed() >= Duration::from_secs(30),
+        "stopped after {:?}",
+        low.elapsed()
+    );
+    assert_eq!(stopped.last_error.as_deref(), Some(AUTOMATIC));
+    assert_eq!(launcher.launches(), 1);
 
     timeout(LIMIT, sidecar.stop()).await.unwrap();
 }

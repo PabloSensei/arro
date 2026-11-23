@@ -25,6 +25,8 @@ fn limits() -> Limits {
         restarts: 2,
         backoff: Duration::from_millis(5),
         stable: Duration::from_secs(60),
+        // The stop waits for the hold, which tests/memory.rs covers; these tests check the stop.
+        memory_hold: Duration::ZERO,
         ..Limits::default()
     }
 }

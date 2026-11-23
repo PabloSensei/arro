@@ -30,7 +30,7 @@ use crate::{AgentOptions, LanguageServer, connect, install};
 const SOURCE: SourceId = SourceId::new("fake-naming");
 
 /// The one line of the tests: its value is the expression an extraction takes.
-const LINE: &str = "int pageSize = 5;\n";
+pub(crate) const LINE: &str = "int pageSize = 5;\n";
 
 unsafe extern "C" fn no_grammar() -> *const () {
     std::ptr::null()
@@ -63,14 +63,14 @@ fn span_in(text: &str, start: usize, end: usize) -> TextSpan {
     }
 }
 
-fn edit_in(text: &str, start: usize, end: usize, new_text: &str) -> DocumentEdit {
+pub(crate) fn edit_in(text: &str, start: usize, end: usize, new_text: &str) -> DocumentEdit {
     DocumentEdit {
         span: span_in(text, start, end),
         text: new_text.to_owned(),
     }
 }
 
-fn uri_of(path: &Path) -> String {
+pub(crate) fn uri_of(path: &Path) -> String {
     CanonPath::new(path).unwrap().to_uri()
 }
 
@@ -94,7 +94,7 @@ fn replace_words(text: &str, word: &str, new_word: &str) -> Vec<DocumentEdit> {
 
 /// The language of the test: the actions are set and no process runs. The name it suggests
 /// is the one of its role, and it suggests none when `suggests` is off.
-struct NamingLanguage {
+pub(crate) struct NamingLanguage {
     syntax: NoSyntax,
     documents: Mutex<HashMap<String, Arc<str>>>,
     actions: Mutex<Vec<ActionEntry>>,
@@ -104,7 +104,7 @@ struct NamingLanguage {
 }
 
 impl NamingLanguage {
-    fn new(introduced: &'static str, suggests: bool) -> Arc<Self> {
+    pub(crate) fn new(introduced: &'static str, suggests: bool) -> Arc<Self> {
         Arc::new(Self {
             syntax: NoSyntax(Queries::default()),
             documents: Mutex::new(HashMap::new()),
@@ -114,7 +114,7 @@ impl NamingLanguage {
         })
     }
 
-    fn set_actions(&self, actions: Vec<ActionEntry>) {
+    pub(crate) fn set_actions(&self, actions: Vec<ActionEntry>) {
         *self.actions.lock().unwrap() = actions;
     }
 
@@ -231,7 +231,7 @@ impl LanguageSupport for NamingLanguage {
     }
 }
 
-fn project(name: &str, files: &[(&str, &str)]) -> PathBuf {
+pub(crate) fn project(name: &str, files: &[(&str, &str)]) -> PathBuf {
     let root = scratch(name);
     for (path, text) in files {
         let path = root.join(path);
@@ -243,7 +243,7 @@ fn project(name: &str, files: &[(&str, &str)]) -> PathBuf {
     root
 }
 
-fn open_window(
+pub(crate) fn open_window(
     cx: &mut TestAppContext,
     root: PathBuf,
     language: Arc<NamingLanguage>,
@@ -361,7 +361,7 @@ fn parameter_action(path: &Path) -> ActionEntry {
 
 /// Selects the value of the line: the caret goes to the end of the line, one step back, and
 /// the selection takes the character before it.
-fn select_value(cx: &mut TestAppContext, window: WindowHandle<Workspace>) {
+pub(crate) fn select_value(cx: &mut TestAppContext, window: WindowHandle<Workspace>) {
     press(cx, window, "end");
     press(cx, window, "left");
     press(cx, window, "shift-left");

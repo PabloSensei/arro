@@ -13,6 +13,7 @@ mod job;
 #[cfg(unix)]
 #[path = "job_unix.rs"]
 mod job;
+mod machine;
 #[cfg(windows)]
 mod memory;
 #[cfg(unix)]
@@ -74,7 +75,8 @@ mod waiter;
 
 pub use crash::{install as install_crash_handler, module_of};
 pub use job::Job;
-pub use memory::{MemoryPressure, MemoryState, MemoryThresholds, physical_memory};
+pub use machine::{bios_names_a_virtual_machine, is_virtual_machine};
+pub use memory::{LOW_MEMORY_HOLD, MemoryPressure, MemoryState, MemoryThresholds, physical_memory};
 pub use mode::{make_executable, mode, private_file, set_mode};
 pub use os::version as os_version;
 pub use path::{CanonPath, file_url_path, path_from_uri, path_key};

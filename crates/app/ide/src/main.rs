@@ -311,6 +311,7 @@ fn language_server(
     launch: &Launch,
     toolchain: Result<Toolchain, Missing>,
     build_tools: &BuildTools,
+    max_heap_mb: Option<u32>,
 ) -> (
     Option<JavaSession>,
     LanguageServer,
@@ -339,14 +340,16 @@ fn language_server(
                     root: launch.root.clone(),
                     state_dir: launch.state_dir.clone(),
                     build_tools: build_tools.clone(),
+                    max_heap_mb,
                     session: Arc::new(Mutex::new(None)),
                 })),
             };
             return (None, none(status), Some(setup));
         }
     };
-    let config =
+    let mut config =
         java_lang::config_of_with(&toolchain, &launch.root, &launch.state_dir, build_tools);
+    config.max_heap_mb = max_heap_mb;
     match JavaSession::open(config, trust_of(&launch.root)) {
         Ok(session) => {
             session.watch_status(move |text| {
@@ -374,6 +377,7 @@ struct JavaSetupCheck {
     root: PathBuf,
     state_dir: PathBuf,
     build_tools: BuildTools,
+    max_heap_mb: Option<u32>,
     session: Arc<Mutex<Option<JavaSession>>>,
 }
 
@@ -385,6 +389,7 @@ impl panels::SetupCheck for JavaSetupCheck {
         let root = self.root.clone();
         let state_dir = self.state_dir.clone();
         let build_tools = self.build_tools.clone();
+        let max_heap_mb = self.max_heap_mb;
         let session = Arc::clone(&self.session);
         thread::spawn(move || {
             let exe = std::env::current_exe().ok();
@@ -393,7 +398,8 @@ impl panels::SetupCheck for JavaSetupCheck {
                 let _ = started.unbounded_send(None);
                 return;
             };
-            let config = java_lang::config_of_with(&toolchain, &root, &state_dir, &build_tools);
+            let mut config = java_lang::config_of_with(&toolchain, &root, &state_dir, &build_tools);
+            config.max_heap_mb = max_heap_mb;
             let Ok(started_session) = JavaSession::open(config, Trust::Trusted) else {
                 let _ = started.unbounded_send(None);
                 return;
@@ -663,16 +669,17 @@ fn main() -> ExitCode {
                 workspace::Settings::load(&launch.settings_dir.join(workspace::SETTINGS_FILE));
             panels::set_build_tool_names("Maven", "Gradle");
             set_project_generators(&launch.state_dir);
-            platform::MemoryPressure::configure(platform::MemoryThresholds::new(
-                settings.memory_low_percent,
-                settings.memory_low_megabytes,
-            ));
+            platform::MemoryPressure::configure(settings.memory_thresholds());
             let languages = Languages {
                 resolve: language_for,
                 templates: java_lang::templates_for,
             };
-            let (session, server, setup) =
-                language_server(&launch, toolchain, &settings.build_tools);
+            let (session, server, setup) = language_server(
+                &launch,
+                toolchain,
+                &settings.build_tools,
+                settings.language_max_heap(),
+            );
             let mut project = project;
             if let Some(session) = &session {
                 let debugger =

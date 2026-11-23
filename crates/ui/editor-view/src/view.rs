@@ -970,6 +970,8 @@ pub struct EditorOptions {
     pub gutter_icons: bool,
     /// The background of the caret line.
     pub highlight_current_line: bool,
+    /// The other occurrences of the word at the caret carry the occurrence mark.
+    pub highlight_occurrences: bool,
     /// The vertical lines at the steps of the indentation.
     pub indent_guides: bool,
     /// The declarations around the caret under the text.
@@ -1032,6 +1034,7 @@ impl Default for EditorOptions {
             line_numbers: true,
             gutter_icons: true,
             highlight_current_line: true,
+            highlight_occurrences: true,
             indent_guides: true,
             breadcrumbs: true,
             sticky_lines: true,
@@ -6230,6 +6233,19 @@ pub(crate) fn popup_placement(
     }
 }
 
+/// A rough height of a note before layout, for placing it above or below the line. The
+/// note wraps at its widest room and shows at most thirty lines.
+fn note_height(text: &str, line_height: f32, font_size: f32) -> f32 {
+    let room = (640. - 2. * SPACE_M) / (font_size * 0.62).max(1.);
+    let rows: f32 = text
+        .lines()
+        .take(30)
+        .map(|line| (line.chars().count() as f32 / room).ceil().max(1.))
+        .sum::<f32>()
+        .max(1.);
+    rows * line_height.max(16.) + 2. * SPACE_M
+}
+
 /// The number of class groups in an Override or Implement list.
 fn override_groups(popup: &crate::hierarchy::OverridePopup) -> usize {
     let mut groups = 0;
@@ -7245,7 +7261,10 @@ impl EditorView {
             popups.push(catcher);
         }
         if let Some(note) = &lsp.note
-            && let Some(position) = self.below(note.at)
+            && let Some((position, anchor)) = self.popup_position(
+                note.at,
+                note_height(&note.text, self.style.line_height, self.style.font_size),
+            )
         {
             let text: String = note.text.lines().take(30).collect::<Vec<_>>().join(
                 "
@@ -7261,6 +7280,7 @@ impl EditorView {
             popups.push(
                 deferred(
                     anchored()
+                        .anchor(anchor)
                         .position(position)
                         .snap_to_window_with_margin(px(SPACE_M))
                         .child(body),

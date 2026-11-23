@@ -243,6 +243,8 @@ pub struct RunPanel {
     tool_setup: Option<ToolSetup>,
     /// The download of the missing build tool, until it ends.
     tool_download: Option<ToolDownload>,
+    /// The bytes of the distribution of the wrapper the sync downloaded last shown.
+    wrapper_written: u64,
     title: SharedString,
     lines: VecDeque<Line>,
     /// The unfinished lines of the writers of the main console, each process and stream
@@ -447,10 +449,22 @@ struct DrainingConsole {
 /// did not.
 type ToolDownloadAnswer = Result<Option<PathBuf>, String>;
 
+/// What a job of the missing build tool does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MissingToolJob {
+    /// Downloads the tool, or the distribution a wrapper names.
+    Download,
+    /// Writes the wrapper of the project with the tool.
+    CreateWrapper,
+    /// Uses the copy the IDE downloaded, without a wrapper.
+    UseDownloaded,
+}
+
 /// A download of the missing build tool: the worker writes the bytes, the panel reads
 /// them for the status line and the notification, and Stop cancels the transfer.
 struct ToolDownload {
     name: String,
+    job: MissingToolJob,
     progress: Arc<ToolProgress>,
     cancel: Cancel,
     done: Arc<AtomicBool>,
@@ -502,6 +516,26 @@ pub(crate) fn bind_actions(workspace: &mut Workspace) {
             if let Some(panel) = cx.try_global::<crate::script::ActiveRunPanel>() {
                 let panel = panel.0.clone();
                 panel.update(cx, |panel, cx| panel.choose_tool_home(window, cx));
+            }
+        },
+    );
+    workspace.register_command(
+        "build_tool.create_wrapper",
+        "Create Build Tool Wrapper",
+        |_workspace, _window, cx| {
+            if let Some(panel) = cx.try_global::<crate::script::ActiveRunPanel>() {
+                let panel = panel.0.clone();
+                panel.update(cx, |panel, cx| panel.create_tool_wrapper(cx));
+            }
+        },
+    );
+    workspace.register_command(
+        "build_tool.use_downloaded",
+        "Use Downloaded Build Tool",
+        |_workspace, _window, cx| {
+            if let Some(panel) = cx.try_global::<crate::script::ActiveRunPanel>() {
+                let panel = panel.0.clone();
+                panel.update(cx, |panel, cx| panel.use_downloaded_tool(cx));
             }
         },
     );
@@ -631,6 +665,7 @@ impl RunPanel {
                 problems: Vec::new(),
                 tool_setup: None,
                 tool_download: None,
+                wrapper_written: 0,
                 title: "Run".into(),
                 lines: VecDeque::new(),
                 output: OutputBuffers::default(),
@@ -4655,6 +4690,7 @@ impl RunPanel {
         self.drain_debug_live(cx);
         let mut changed = self.poll_sync(cx);
         changed |= self.poll_tool_download(cx);
+        changed |= self.poll_wrapper_progress(cx);
         let mut done = Vec::new();
         // The test console of a debug run shows the lines the parser has completed, so a
         // piece of a line held back here is not cut in two there.
@@ -5086,6 +5122,20 @@ impl RunPanel {
         if let Some(label) = &setup.choose {
             buttons.push(("choose", label.clone().into(), "build_tool.choose"));
         }
+        if let Some(label) = &setup.create_wrapper {
+            buttons.push((
+                "create-wrapper",
+                label.clone().into(),
+                "build_tool.create_wrapper",
+            ));
+        }
+        if let Some(label) = &setup.use_downloaded {
+            buttons.push((
+                "use-downloaded",
+                label.clone().into(),
+                "build_tool.use_downloaded",
+            ));
+        }
         if let Some((label, row)) = &setup.settings {
             // A tool may live on the second page of Settings: its notification opens the
             // row of that page and not the first one.
@@ -5108,6 +5158,20 @@ impl RunPanel {
     /// Downloads the missing build tool in a background thread. The status line and the
     /// notification follow its bytes, and Cancel stops it; the sync follows when it ends.
     pub(crate) fn download_tool(&mut self, cx: &mut Context<Self>) {
+        self.start_tool_job(MissingToolJob::Download, cx);
+    }
+
+    /// Writes the wrapper of the project with the tool, in a background thread.
+    pub(crate) fn create_tool_wrapper(&mut self, cx: &mut Context<Self>) {
+        self.start_tool_job(MissingToolJob::CreateWrapper, cx);
+    }
+
+    /// Uses the copy of the tool the IDE downloaded, without writing a wrapper.
+    pub(crate) fn use_downloaded_tool(&mut self, cx: &mut Context<Self>) {
+        self.start_tool_job(MissingToolJob::UseDownloaded, cx);
+    }
+
+    fn start_tool_job(&mut self, job: MissingToolJob, cx: &mut Context<Self>) {
         if self.tool_download.is_some() {
             return;
         }
@@ -5129,9 +5193,16 @@ impl RunPanel {
         // flag rather than the task.
         cx.background_executor()
             .spawn(async move {
-                let answer = tool
-                    .install_tool(&job_progress, &job_cancel)
-                    .map_err(|error| error.to_string());
+                let answer = match job {
+                    MissingToolJob::Download => tool.install_tool(&job_progress, &job_cancel),
+                    MissingToolJob::CreateWrapper => {
+                        tool.create_wrapper(&job_progress, &job_cancel)
+                    }
+                    MissingToolJob::UseDownloaded => {
+                        tool.use_downloaded(&job_progress, &job_cancel)
+                    }
+                }
+                .map_err(|error| error.to_string());
                 if let Ok(mut slot) = job_result.lock() {
                     *slot = Some(answer);
                 }
@@ -5140,6 +5211,7 @@ impl RunPanel {
             .detach();
         self.tool_download = Some(ToolDownload {
             name: setup.name.clone(),
+            job,
             progress,
             cancel,
             done,
@@ -5202,10 +5274,17 @@ impl RunPanel {
     /// Writes the bytes of the transfer into the status line and the notification.
     fn tell_tool_download(&self, name: &str, cx: &mut Context<Self>) {
         let text = match &self.tool_download {
+            Some(job) if job.job != MissingToolJob::Download && job.progress.written() == 0 => {
+                format!("Preparing {name}\u{2026}")
+            }
             Some(job) => download_text(name, &job.progress),
             None => return,
         };
-        let title = format!("Downloading {name}");
+        let title = match self.tool_download.as_ref().map(|job| job.job) {
+            Some(MissingToolJob::CreateWrapper) => format!("Creating the {name} wrapper"),
+            Some(MissingToolJob::UseDownloaded) => format!("Preparing {name}"),
+            _ => format!("Downloading {name}"),
+        };
         let workspace = self.workspace.clone();
         // A button of the notification reaches here while the workspace is being updated,
         // so the write waits for the end of that update.
@@ -5243,6 +5322,25 @@ impl RunPanel {
         let job = self.tool_download.take().expect("the job was checked");
         let answer = job.result.lock().ok().and_then(|mut slot| slot.take());
         let name = job.name;
+        let (done_text, done_status) = match job.job {
+            MissingToolJob::Download => (
+                format!("{name} was downloaded. The project syncs again."),
+                format!("{name} was downloaded"),
+            ),
+            MissingToolJob::CreateWrapper => (
+                format!("The {name} wrapper was written. The project syncs again."),
+                format!("The {name} wrapper was written"),
+            ),
+            MissingToolJob::UseDownloaded => (
+                format!("The downloaded {name} is used. The project syncs again."),
+                format!("The downloaded {name} is used"),
+            ),
+        };
+        let retry_command = match job.job {
+            MissingToolJob::Download => "build_tool.install",
+            MissingToolJob::CreateWrapper => "build_tool.create_wrapper",
+            MissingToolJob::UseDownloaded => "build_tool.use_downloaded",
+        };
         match answer {
             Some(Ok(home)) => {
                 self.tool_setup = None;
@@ -5260,13 +5358,8 @@ impl RunPanel {
                     cx.set_global(crate::terminal_panel::ToolTerminalPath(Some(bin)));
                 }
                 let _ = self.workspace.update(cx, |workspace, cx| {
-                    workspace
-                        .set_language_status(Some(format!("{name} was downloaded").into()), cx);
-                    workspace.notify_user(
-                        "Build tool",
-                        format!("{name} was downloaded. The project syncs again."),
-                        cx,
-                    );
+                    workspace.set_language_status(Some(done_status.into()), cx);
+                    workspace.notify_user("Build tool", done_text, cx);
                 });
                 self.reload_project(cx);
             }
@@ -5283,10 +5376,18 @@ impl RunPanel {
                 let setup = self.tool_setup.clone();
                 let mut buttons = Vec::new();
                 if setup.as_ref().is_some_and(|setup| setup.download.is_some()) {
-                    buttons.push(("retry", "Try again".into(), "build_tool.install"));
+                    buttons.push(("retry", "Try again".into(), retry_command));
                 }
                 if let Some((label, _)) = setup.as_ref().and_then(|setup| setup.settings.clone()) {
-                    buttons.push(("settings", label.into(), "settings.build_tools"));
+                    let command = match setup
+                        .as_ref()
+                        .and_then(|setup| setup.settings.as_ref())
+                        .map(|(_, row)| *row)
+                    {
+                        Some("build_tool_second_home") => "settings.build_tool_second",
+                        _ => "settings.build_tools",
+                    };
+                    buttons.push(("settings", label.into(), command));
                 }
                 let _ = self.workspace.update(cx, |workspace, cx| {
                     workspace
@@ -5301,6 +5402,28 @@ impl RunPanel {
             }
             None => {}
         }
+        true
+    }
+
+    /// Follows the distribution of the wrapper the sync downloads: the status line keeps
+    /// the bytes it read last, so a slow sync redraws nothing.
+    fn poll_wrapper_progress(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(progress) = self.tool.as_ref().and_then(|tool| tool.wrapper_progress()) else {
+            self.wrapper_written = 0;
+            return false;
+        };
+        let written = progress.written();
+        if written == self.wrapper_written {
+            return false;
+        }
+        self.wrapper_written = written;
+        let text = download_text("Build tool wrapper", &progress);
+        let workspace = self.workspace.clone();
+        cx.defer(move |cx| {
+            let _ = workspace.update(cx, |workspace, cx| {
+                workspace.set_language_status(Some(text.into()), cx);
+            });
+        });
         true
     }
 

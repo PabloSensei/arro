@@ -10,7 +10,7 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 use workspace::Workspace;
 
-use crate::history_view::{self, HistoryView};
+use crate::history_view::HistoryView;
 
 /// The versions the popup reads from the history of the project root.
 const MAX_VERSIONS: usize = 50;
@@ -250,7 +250,7 @@ impl Render for RecentChangesPopup {
                             div()
                                 .flex_none()
                                 .text_color(theme.text_secondary)
-                                .child(SharedString::from(history_view::age(row.revision.at))),
+                                .child(SharedString::from(ui_kit::time::ago_now(row.revision.at))),
                         )
                         .on_click(
                             cx.listener(move |this, _, window, cx| this.pick(position, window, cx)),
@@ -381,6 +381,23 @@ pub(crate) fn report(cx: &App) -> Vec<String> {
         .into_iter()
         .filter_map(|index| view.rows.get(index))
         .map(|row| format!("recent-change {} · {}", row.title, row.name))
+        .collect()
+}
+
+/// The time cell of every visible row, for scripts.
+#[cfg(test)]
+pub(crate) fn report_ages(cx: &App) -> Vec<String> {
+    let Some(view) = cx
+        .try_global::<ActiveRecentChanges>()
+        .and_then(|active| active.0.upgrade())
+    else {
+        return Vec::new();
+    };
+    let view = view.read(cx);
+    view.visible()
+        .into_iter()
+        .filter_map(|index| view.rows.get(index))
+        .map(|row| ui_kit::time::ago_now(row.revision.at))
         .collect()
 }
 

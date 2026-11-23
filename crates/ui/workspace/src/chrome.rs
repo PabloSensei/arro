@@ -4259,7 +4259,7 @@ impl Render for StatusBarView {
                 let workspace = self.workspace.clone();
                 widget
                     .cursor_pointer()
-                    .tooltip(|_, cx| tooltip("Import failed. Click for details.", None, cx))
+                    .tooltip(|_, cx| tooltip("Click for details.", None, cx))
                     .tooltip_show_delay(ui_kit::tooltip_show_delay())
                     .on_click(cx.listener(move |_, _, window, cx| {
                         let shown = workspace

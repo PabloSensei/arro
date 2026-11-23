@@ -193,11 +193,7 @@ fn a_gradle_project_without_a_wrapper_offers_a_download_and_syncs_with_it(cx: &m
         .unwrap()
         .expect("the sync failure names the missing tool");
     assert_eq!(title.to_string(), "Gradle not found");
-    assert!(
-        text.to_string()
-            .contains("Download Gradle from services.gradle.org"),
-        "{text}"
-    );
+    assert!(text.to_string().contains("Create the wrapper"), "{text}");
     let buttons: Vec<String> = window
         .read_with(cx, |workspace, _| workspace.last_notification_buttons())
         .unwrap()
@@ -209,6 +205,8 @@ fn a_gradle_project_without_a_wrapper_offers_a_download_and_syncs_with_it(cx: &m
         [
             "Download Gradle",
             "Choose Gradle home\u{2026}",
+            "Create Gradle Wrapper",
+            "Use Downloaded Gradle",
             "Build Tools \u{2192} Gradle"
         ]
     );

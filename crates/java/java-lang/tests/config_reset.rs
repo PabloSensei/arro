@@ -90,6 +90,7 @@ fn config(root: &Path, state: &Path) -> JdtlsConfig {
         gradle_java_home: Some(jdk("17")),
         offline: false,
         environment: HashMap::new(),
+        max_heap_mb: None,
     }
 }
 

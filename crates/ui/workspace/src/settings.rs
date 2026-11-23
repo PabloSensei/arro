@@ -17,6 +17,15 @@ pub const MAX_FONT_SIZE: f32 = 32.;
 const DEFAULT_FONT_SIZE: f32 = 13.;
 const DEFAULT_MEMORY_LOW_PERCENT: f32 = 5.;
 const DEFAULT_MEMORY_LOW_MEGABYTES: u32 = 512;
+/// The step of the memory floor in the Settings window, in megabytes.
+pub const MEMORY_LOW_STEP_MB: u32 = 64;
+/// The largest memory floor the settings may hold, in megabytes.
+pub const MAX_MEMORY_LOW_MEGABYTES: u32 = 1024 * 1024;
+/// The smallest heap the language server takes when a heap is set; a smaller one stops
+/// the server from starting.
+pub const MIN_LANGUAGE_MAX_HEAP_MB: u32 = 256;
+/// The largest heap the language server takes when a heap is set, in megabytes.
+pub const MAX_LANGUAGE_MAX_HEAP_MB: u32 = 65_536;
 /// The reach of Alt+Shift+= and Alt+Shift+-.
 pub const MIN_UI_SCALE: f32 = 0.8;
 pub const MAX_UI_SCALE: f32 = 2.;
@@ -531,6 +540,12 @@ pub struct Settings {
     pub memory_low_percent: f32,
     /// The absolute floor of the same check, in megabytes.
     pub memory_low_megabytes: u32,
+    /// Whether the memory check stops a language server. Unset, the check is on, except on
+    /// a virtual machine, whose host adds memory on demand; a choice of the user always wins.
+    pub memory_low_check: Option<bool>,
+    /// The most heap the language server takes, in megabytes, from its next start. Zero
+    /// lets the language server choose it from the size of the machine.
+    pub language_max_heap_megabytes: u32,
     /// Reformat File dialog: organize the imports as well.
     pub reformat_optimize_imports: bool,
     /// Reformat File dialog: only the lines changed since the last commit.
@@ -726,6 +741,8 @@ impl Default for Settings {
             heap_snapshot_folder: String::new(),
             memory_low_percent: DEFAULT_MEMORY_LOW_PERCENT,
             memory_low_megabytes: DEFAULT_MEMORY_LOW_MEGABYTES,
+            memory_low_check: None,
+            language_max_heap_megabytes: 0,
             reformat_optimize_imports: false,
             reformat_only_changed: false,
             reformat_selection: false,
@@ -806,6 +823,38 @@ impl Default for Settings {
 impl Global for Settings {}
 
 impl Settings {
+    /// Whether the memory check stops a language server on a machine that is or is not a
+    /// virtual one: the choice of the user when there is one, otherwise the default of the
+    /// machine.
+    pub fn memory_check_on(&self, virtual_machine: bool) -> bool {
+        self.memory_low_check.unwrap_or(!virtual_machine)
+    }
+
+    /// The thresholds of the memory check in force on this computer: zero when the check is
+    /// off, so that no server stops for memory.
+    pub fn memory_thresholds(&self) -> ::platform::MemoryThresholds {
+        self.memory_thresholds_on(::platform::is_virtual_machine())
+    }
+
+    /// The thresholds of the memory check on a machine that is or is not a virtual one.
+    pub fn memory_thresholds_on(&self, virtual_machine: bool) -> ::platform::MemoryThresholds {
+        if !self.memory_check_on(virtual_machine) {
+            return ::platform::MemoryThresholds::new(0., 0);
+        }
+        self.memory_numbers()
+    }
+
+    /// The numbers of the memory check, whether the check stops or not: a virtual machine
+    /// that leaves the check off still warns from them.
+    pub fn memory_numbers(&self) -> ::platform::MemoryThresholds {
+        ::platform::MemoryThresholds::new(self.memory_low_percent, self.memory_low_megabytes)
+    }
+
+    /// The heap the language server takes at its next start, or `None` when it chooses.
+    pub fn language_max_heap(&self) -> Option<u32> {
+        (self.language_max_heap_megabytes > 0).then_some(self.language_max_heap_megabytes)
+    }
+
     /// A damaged or missing file is not an error: the defaults come back.
     pub fn load(path: &Path) -> Self {
         Self::load_with_theme_choice(path, false)
@@ -886,7 +935,12 @@ impl Settings {
             self.memory_low_percent = DEFAULT_MEMORY_LOW_PERCENT;
         }
         self.memory_low_percent = self.memory_low_percent.clamp(0., 100.);
-        self.memory_low_megabytes = self.memory_low_megabytes.min(1024 * 1024);
+        self.memory_low_megabytes = self.memory_low_megabytes.min(MAX_MEMORY_LOW_MEGABYTES);
+        if self.language_max_heap_megabytes != 0 {
+            self.language_max_heap_megabytes = self
+                .language_max_heap_megabytes
+                .clamp(MIN_LANGUAGE_MAX_HEAP_MB, MAX_LANGUAGE_MAX_HEAP_MB);
+        }
         if !self.ui_scale.is_finite() {
             self.ui_scale = DEFAULT_UI_SCALE;
         }
@@ -1237,5 +1291,111 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["settings.json"], "only the settings file stays");
+    }
+
+    #[test]
+    fn the_memory_and_heap_settings_round_trip() {
+        let dir = test_support::scratch("settings-memory-heap");
+        let file = dir.join("settings.json");
+        let settings = Settings {
+            memory_low_megabytes: 1024,
+            memory_low_percent: 10.,
+            language_max_heap_megabytes: 3072,
+            ..Settings::default()
+        };
+        settings.save(&file).unwrap();
+
+        let loaded = Settings::load(&file);
+        assert_eq!(loaded.memory_low_megabytes, 1024);
+        assert_eq!(loaded.memory_low_percent, 10.);
+        assert_eq!(loaded.language_max_heap(), Some(3072));
+        assert_eq!(
+            loaded.memory_low_check, None,
+            "no choice is written by default"
+        );
+        assert_eq!(
+            loaded.memory_thresholds_on(false),
+            ::platform::MemoryThresholds::new(10., 1024)
+        );
+
+        let off = Settings {
+            memory_low_check: Some(false),
+            ..loaded.clone()
+        };
+        off.save(&file).unwrap();
+        let reloaded = Settings::load(&file);
+        assert_eq!(
+            reloaded.memory_low_check,
+            Some(false),
+            "a choice of the user is saved"
+        );
+        assert_eq!(
+            reloaded.memory_thresholds_on(false),
+            ::platform::MemoryThresholds::new(0., 0),
+            "a check that is off takes no memory as low"
+        );
+    }
+
+    #[test]
+    fn the_memory_check_defaults_to_on_except_on_a_virtual_machine() {
+        let settings = Settings::default();
+        assert!(
+            settings.memory_check_on(false),
+            "an ordinary computer stops for memory"
+        );
+        assert!(
+            !settings.memory_check_on(true),
+            "a virtual machine does not stop for memory by default"
+        );
+        assert_eq!(
+            settings.memory_thresholds_on(true),
+            ::platform::MemoryThresholds::new(0., 0)
+        );
+        assert_eq!(
+            settings.memory_thresholds_on(false),
+            ::platform::MemoryThresholds::new(5., 512)
+        );
+        assert_eq!(
+            settings.memory_numbers(),
+            ::platform::MemoryThresholds::new(5., 512),
+            "the numbers stay for the warning of a virtual machine"
+        );
+    }
+
+    #[test]
+    fn an_explicit_choice_wins_over_the_machine_both_ways() {
+        let on = Settings {
+            memory_low_check: Some(true),
+            ..Settings::default()
+        };
+        assert!(
+            on.memory_check_on(true),
+            "a virtual machine stops when the user turned it on"
+        );
+        assert_eq!(
+            on.memory_thresholds_on(true),
+            ::platform::MemoryThresholds::new(5., 512)
+        );
+        let off = Settings {
+            memory_low_check: Some(false),
+            ..Settings::default()
+        };
+        assert!(
+            !off.memory_check_on(false),
+            "an ordinary computer stops nothing when the user turned it off"
+        );
+    }
+
+    #[test]
+    fn a_heap_below_the_floor_is_raised_and_zero_lets_the_server_choose() {
+        let dir = test_support::scratch("settings-heap-limits");
+        let file = dir.join("settings.json");
+        std::fs::write(&file, r#"{"language_max_heap_megabytes": 64}"#).unwrap();
+        assert_eq!(
+            Settings::load(&file).language_max_heap(),
+            Some(super::MIN_LANGUAGE_MAX_HEAP_MB)
+        );
+        std::fs::write(&file, r#"{"language_max_heap_megabytes": 0}"#).unwrap();
+        assert_eq!(Settings::load(&file).language_max_heap(), None);
     }
 }

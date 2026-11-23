@@ -30,7 +30,8 @@ pub trait BuildSystem: Send + Sync {
     }
 
     /// Downloads and installs the missing tool of the project. Blocks; `progress` follows
-    /// the bytes, `cancel` stops the work. Returns the home of the installed tool.
+    /// the bytes, `cancel` stops the work. Returns the home of the installed tool, or
+    /// `None` when the tool itself reads the folder it was given.
     fn install_tool(
         &self,
         _progress: &crate::ToolProgress,
@@ -41,6 +42,32 @@ pub trait BuildSystem: Send + Sync {
 
     /// Uses `home` as the folder of the tool from now on, for this session.
     fn use_home(&self, _home: &Path) {}
+
+    /// Writes the wrapper of the project with the tool the IDE found or downloaded.
+    /// Blocks; the progress follows a download of the tool, `cancel` stops the work.
+    /// `None` when the wrapper is the result and no home changes.
+    fn create_wrapper(
+        &self,
+        _progress: &crate::ToolProgress,
+        _cancel: &Cancel,
+    ) -> Result<Option<PathBuf>> {
+        Err("this tool cannot write a wrapper".into())
+    }
+
+    /// Uses the downloaded copy of the tool without writing a wrapper. Blocks; the
+    /// progress follows a download of the tool, `cancel` stops the work.
+    fn use_downloaded(
+        &self,
+        _progress: &crate::ToolProgress,
+        _cancel: &Cancel,
+    ) -> Result<Option<PathBuf>> {
+        Err("this tool cannot be downloaded".into())
+    }
+
+    /// The bytes of a distribution the wrapper needs while the sync downloads it.
+    fn wrapper_progress(&self) -> Option<Arc<crate::ToolProgress>> {
+        None
+    }
 
     /// The folder of the programs of a tool the IDE downloaded, when it has one.
     fn tool_bin(&self) -> Option<PathBuf> {

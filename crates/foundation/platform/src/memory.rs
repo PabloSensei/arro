@@ -21,6 +21,10 @@ use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORY
 /// How often the free memory is looked at while the process runs.
 const POLL: Duration = Duration::from_secs(2);
 
+/// How long memory must stay low before a server stops for it. A reading that clears in
+/// less time, as on a host that gives memory to its guest on demand, stops nothing.
+pub const LOW_MEMORY_HOLD: Duration = Duration::from_secs(30);
+
 /// Memory must free beyond this share of the threshold before a low state clears. A
 /// machine that hovers at the threshold does not stop and start its servers in a loop.
 const HYSTERESIS: f64 = 1.25;
@@ -88,6 +92,17 @@ impl MemoryState {
         let floor = thresholds.low_bytes as f64 * margin;
         let share = f64::from(thresholds.low_percent) * margin;
         (available as f64) < floor && (available as f64) * 100.0 < (total as f64) * share
+    }
+
+    /// Whether the commit room is the tighter side: the page file runs out before the
+    /// physical memory does.
+    pub fn commit_is_tighter(&self) -> bool {
+        self.available_commit < self.available_physical
+    }
+
+    /// The numbers Windows reports now, or `None` when it cannot answer.
+    pub fn now() -> Option<Self> {
+        state()
     }
 }
 
@@ -216,6 +231,11 @@ mod tests {
 
     fn gigabytes(count: u64) -> u64 {
         count * 1024 * 1024 * 1024
+    }
+
+    #[test]
+    fn the_low_memory_hold_is_thirty_seconds() {
+        assert_eq!(super::LOW_MEMORY_HOLD, std::time::Duration::from_secs(30));
     }
 
     #[test]

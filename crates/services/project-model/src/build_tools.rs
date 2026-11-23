@@ -23,7 +23,7 @@ pub enum ToolHome {
 }
 
 /// The settings of one build tool.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BuildToolSettings {
     /// Where the tool is installed. Empty means the wrapper of the project, or the
@@ -48,6 +48,33 @@ pub struct BuildToolSettings {
     pub user_home: String,
     /// The runtime that starts the tool. Empty means the runtime of the project.
     pub runtime_home: String,
+    /// The IDE downloads the distribution a project wrapper names before the tool runs.
+    /// A file written before this switch existed reads as on.
+    #[serde(default = "default_true")]
+    pub download_wrapper: bool,
+}
+
+/// The value of a switch that a file written before the switch existed means.
+fn default_true() -> bool {
+    true
+}
+
+impl Default for BuildToolSettings {
+    fn default() -> Self {
+        Self {
+            home: String::new(),
+            home_kind: ToolHome::Auto,
+            terminal_path: false,
+            settings_file: String::new(),
+            repository: String::new(),
+            offline: false,
+            vm_options: String::new(),
+            update_snapshots: false,
+            user_home: String::new(),
+            runtime_home: String::new(),
+            download_wrapper: true,
+        }
+    }
 }
 
 impl BuildToolSettings {
@@ -75,6 +102,16 @@ impl BuildToolSettings {
     /// The runtime of the tool, when the user set one.
     pub fn runtime_home_path(&self) -> Option<&str> {
         Self::path(&self.runtime_home)
+    }
+
+    /// The way the tool is found, as the settings mean it. A file written before the
+    /// distribution choice existed has the automatic order, and a folder there means a
+    /// local installation rather than the fallback: the folder wins over the wrapper.
+    pub fn chosen_home_kind(&self) -> ToolHome {
+        match self.home_kind {
+            ToolHome::Auto if self.home_path().is_some() => ToolHome::Custom,
+            kind => kind,
+        }
     }
 }
 
@@ -113,7 +150,7 @@ impl BuildTools {
 
 #[cfg(test)]
 mod tests {
-    use super::{BuildToolSettings, BuildTools};
+    use super::{BuildToolSettings, BuildTools, ToolHome};
 
     #[test]
     fn the_tools_are_found_by_the_index_of_their_page() {
@@ -136,5 +173,41 @@ mod tests {
         assert!(tool.home_path().is_none());
         tool.home = " C:/tool ".into();
         assert_eq!(tool.home_path(), Some("C:/tool"));
+    }
+
+    #[test]
+    fn a_file_before_the_distribution_choice_keeps_its_meaning() {
+        let mut tool = BuildToolSettings::default();
+        assert_eq!(
+            tool.chosen_home_kind(),
+            ToolHome::Auto,
+            "an empty old value leaves the automatic order, which starts with the wrapper"
+        );
+        assert!(tool.download_wrapper, "the download is on by default");
+
+        tool.home = "C:/tool-dist".into();
+        assert_eq!(
+            tool.chosen_home_kind(),
+            ToolHome::Custom,
+            "an old folder is a local installation"
+        );
+
+        tool.home_kind = ToolHome::Bundled;
+        tool.home = String::new();
+        assert_eq!(
+            tool.chosen_home_kind(),
+            ToolHome::Bundled,
+            "a named kind does not depend on the old folder"
+        );
+    }
+
+    #[test]
+    fn an_old_file_reads_the_download_switch_as_on() {
+        let tool: BuildToolSettings = serde_json::from_str(r#"{"home":"C:/tool-dist"}"#).unwrap();
+
+        assert!(tool.download_wrapper);
+        assert_eq!(tool.chosen_home_kind(), ToolHome::Custom);
+        let off: BuildToolSettings = serde_json::from_str(r#"{"download_wrapper":false}"#).unwrap();
+        assert!(!off.download_wrapper);
     }
 }

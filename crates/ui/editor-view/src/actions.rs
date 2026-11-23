@@ -494,20 +494,22 @@ impl EditorView {
     }
 
     fn apply_entry(&mut self, version: i32, entry: ActionEntry, cx: &mut Context<Self>) {
-        self.apply_entry_labeled(version, entry, None, cx);
+        self.apply_entry_labeled(version, entry, None, None, cx);
     }
 
-    /// Applies the entry, or first opens the field of the name it introduces.
+    /// Applies the entry, or first opens the field of the name it introduces. `asked` is the
+    /// expression the action was asked about, when the editor knows it.
     pub(crate) fn apply_entry_labeled(
         &mut self,
         version: i32,
         entry: ActionEntry,
         label: Option<&'static str>,
+        asked: Option<Range<usize>>,
         cx: &mut Context<Self>,
     ) {
-        // The place the server marks is the name of the extract. The parameter of
-        // Introduce Parameter is placed by its type, which is not a name to type: its name
-        // is the expression the action replaced, found in `start_extract_name`.
+        // The place the server marks is the name of the extract. An Introduce Parameter names
+        // its parameter at the expression it replaced, where the server marks the place in most
+        // answers; `start_extract_name` finds that place from the text when the server marks none.
         let introduces_a_name = entry.code.as_deref().is_some_and(|code| {
             code.starts_with("refactor.extract.variable")
                 || code.starts_with("refactor.extract.constant")
@@ -519,7 +521,7 @@ impl EditorView {
                 && !code.starts_with("refactor.introduce.parameter.object")
         });
         if (entry.rename.is_some() && introduces_a_name) || introduces_parameter {
-            self.start_extract_name(version, entry, label, cx);
+            self.start_extract_name(version, entry, label, asked, cx);
             return;
         }
         let change = WorkspaceChange {

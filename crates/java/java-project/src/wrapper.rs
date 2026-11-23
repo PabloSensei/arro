@@ -92,6 +92,17 @@ pub fn generate(
             kind.label()
         )
     })?;
+    generate_with(kind, &program, folder, jdk, cancel)
+}
+
+/// Writes the wrapper of `kind` with `program`, which the IDE found or downloaded.
+pub fn generate_with(
+    kind: Wrapper,
+    program: &Path,
+    folder: &Path,
+    jdk: Option<&Jdk>,
+    cancel: &Cancel,
+) -> Result<(), String> {
     let mut spec = ProcessSpec::new(program)
         .cwd(folder)
         .label("Build tool wrapper");

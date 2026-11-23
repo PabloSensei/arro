@@ -11,6 +11,7 @@ mod fingerprint;
 mod frameworks;
 mod gradle;
 mod gradle_download;
+mod gradle_wrapper;
 pub mod heap;
 pub mod initializr;
 mod jdk;
@@ -65,4 +66,4 @@ pub use sources::{
 };
 pub use test_runs::{TEST_LISTENER, TestHook, TestSelection};
 pub use updates::{BuildFile, Metadata, Slot, Updates, Version, VersionSource, kind_of, slot_at};
-pub use wrapper::{Wrapper, generate as generate_wrapper};
+pub use wrapper::{Wrapper, generate as generate_wrapper, generate_with as generate_wrapper_with};
