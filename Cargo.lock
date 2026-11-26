@@ -3975,6 +3975,7 @@ dependencies = [
  "lang-api",
  "proc-sup",
  "project-model",
+ "roxmltree 0.21.2",
  "runner",
  "serde",
  "serde_json",

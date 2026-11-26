@@ -271,6 +271,14 @@ pub fn register(
         },
     );
     workspace.register_command(
+        "run.add_configuration",
+        "Add Configuration…",
+        |workspace, window, cx| {
+            let panel = cx.global::<ActiveRunPanel>().0.clone();
+            RunConfigDialog::show_add(panel, workspace, window, cx);
+        },
+    );
+    workspace.register_command(
         "project.structure",
         "Project Structure...",
         ProjectStructureDialog::show,

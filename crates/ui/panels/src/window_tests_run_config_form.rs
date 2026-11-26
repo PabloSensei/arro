@@ -104,8 +104,8 @@ fn the_before_launch_title_holds_its_buttons_and_the_form_has_no_logs(cx: &mut T
     labels.sort();
     assert_eq!(
         labels,
-        ["Before launch", "Build and run"],
-        "the form has the two sections and no Logs section"
+        ["Before launch"],
+        "the form has the one section and no Logs section"
     );
     let labelled = ui_kit::test_bounds()
         .into_iter()
@@ -153,16 +153,16 @@ fn the_before_launch_title_holds_its_buttons_and_the_form_has_no_logs(cx: &mut T
         "the steps come under the Before launch title"
     );
 
-    let build_and_run = title_box(&titles, "Build and run");
+    let name = bounds(cx, window, "run-config-name").expect("the name field is drawn");
     let link =
         bounds(cx, window, "run-config-modify-options").expect("the Modify options link is drawn");
     assert!(
-        link.center().y >= build_and_run.top() && link.center().y <= build_and_run.bottom(),
-        "the Modify options link sits in the row of the Build and run title"
+        link.top() >= name.bottom(),
+        "the Modify options link comes under the name"
     );
     assert!(
-        link.left() > build_and_run.left(),
-        "the Modify options link is at the right of the title"
+        link.left() > name.left(),
+        "the Modify options link is at the right of the form"
     );
 }
 
@@ -203,6 +203,12 @@ fn the_modify_options_menu_shows_the_fields_it_checks(cx: &mut TestAppContext) {
         "a checked option shows its field"
     );
     assert!(
+        !drawn(cx, window, "run-config-option-environment_file"),
+        "picking an option closes the menu"
+    );
+    click(cx, window, "run-config-modify-options");
+    draw(cx, window);
+    assert!(
         drawn(
             cx,
             window,
@@ -225,11 +231,9 @@ fn the_modify_options_menu_shows_the_fields_it_checks(cx: &mut TestAppContext) {
         drawn(cx, window, "run-config-apply-disabled"),
         "checking and unchecking leaves nothing to apply"
     );
-    assert!(
-        drawn(cx, window, "run-config-option-environment_file"),
-        "the menu stays open between the toggles"
-    );
 
+    click(cx, window, "run-config-modify-options");
+    draw(cx, window);
     click(cx, window, "run-config-modify-options");
     draw(cx, window);
     assert!(

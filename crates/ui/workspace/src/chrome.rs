@@ -1289,7 +1289,14 @@ impl Workspace {
         )
         .debug_selector(|| "t-debug".to_owned())
         .on_click(cx.listener(|this, _, window, cx| this.debug_selected(window, cx)))
-        .child(icon_sized("run/debug", ICON, theme));
+        .child({
+            let icon = icon_sized("run/debug", ICON, theme);
+            if state.can_run() {
+                icon
+            } else {
+                icon.grayscale(true).opacity(0.4)
+            }
+        });
         let coverage = button_frame(
             "t-coverage",
             "Run with Coverage",
@@ -1338,26 +1345,32 @@ impl Workspace {
     fn run_menu_entries(&self, run_on_pick: bool, cx: &mut Context<Self>) -> Vec<MenuEntry> {
         let state = self.run_state(cx);
         let weak = cx.weak_entity();
-        let mut entries: Vec<MenuEntry> = state
-            .configs
-            .iter()
-            .enumerate()
-            .map(|(index, name)| {
-                let weak = weak.clone();
-                let temporary = state.is_temporary(index);
-                let entry = MenuEntry::new(name.clone(), move |window, cx| {
-                    weak.update(cx, |this, cx| {
-                        this.select_run(index, window, cx);
-                        if run_on_pick {
-                            this.run_selected(window, cx);
-                        }
+        let mut entries: Vec<MenuEntry> = if state.configs.is_empty() {
+            // Nothing is stored or temporary yet: the list offers the dialog with its Add
+            // menu, and Run and Debug wait for a configuration.
+            vec![self.command_row(&weak, "run.add_configuration", "Add Configuration…")]
+        } else {
+            state
+                .configs
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    let weak = weak.clone();
+                    let temporary = state.is_temporary(index);
+                    let entry = MenuEntry::new(name.clone(), move |window, cx| {
+                        weak.update(cx, |this, cx| {
+                            this.select_run(index, window, cx);
+                            if run_on_pick {
+                                this.run_selected(window, cx);
+                            }
+                        })
+                        .ok();
                     })
-                    .ok();
+                    .icon("run/run");
+                    if temporary { entry.muted() } else { entry }
                 })
-                .icon("run/run");
-                if temporary { entry.muted() } else { entry }
-            })
-            .collect();
+                .collect()
+        };
         if let Some(index) = state.selected.filter(|index| state.is_temporary(*index))
             && let Some(name) = state.configs.get(index)
         {
@@ -2130,6 +2143,10 @@ impl Workspace {
                 command("debug.attach_jvm", "Attach to Process..."),
                 MenuEntry::separator(),
                 command("run.edit_configurations", "Edit Configurations..."),
+                command(
+                    "run.import_idea_configs",
+                    "Import Run Configurations from IntelliJ IDEA...",
+                ),
             ],
         );
 

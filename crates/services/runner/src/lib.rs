@@ -8,6 +8,7 @@ mod config;
 mod console;
 mod coverage;
 mod environment;
+mod foreign;
 mod history;
 mod live;
 mod profile;
@@ -25,6 +26,7 @@ pub use config::{
 pub use console::{Console, ConsoleEvent, ConsoleEvents, Step, Stream};
 pub use coverage::{CoverageOwner, CoveragePlan, TestCoverageRun};
 pub use environment::{parse_environment_file, read_environment_file, with_environment};
+pub use foreign::{ForeignConfigs, identity as foreign_identity};
 pub use history::{
     HISTORY_FILE, HISTORY_LIMIT, TestHistoryRun, load_test_history, save_test_history,
     test_history_file,

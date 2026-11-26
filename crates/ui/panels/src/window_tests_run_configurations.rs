@@ -320,11 +320,12 @@ fn the_dialog_stores_the_before_launch_list_the_flag_and_the_environment_file(
     draw(cx, window);
     click_selector(cx, window, "run-config-option-environment_file");
     draw(cx, window);
+    click_selector(cx, window, "run-config-modify-options");
+    draw(cx, window);
     click_selector(cx, window, "run-config-option-allow_multiple_instances");
     draw(cx, window);
     click_selector(cx, window, "run-config-environment");
     crate::window_tests::type_text(cx, window, ".env");
-    click_selector(cx, window, "run-config-multiple");
     draw(cx, window);
     click_selector(cx, window, "run-config-ok");
     wait_for(cx, "the saved configuration", |_| {

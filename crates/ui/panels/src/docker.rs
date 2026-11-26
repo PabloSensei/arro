@@ -1076,7 +1076,7 @@ impl DockerPanel {
         };
         let (providers, configs) = {
             let runs = runs.read(cx);
-            (runs.providers(), runs.configurations().to_vec())
+            (runs.providers(), runs.service_configurations())
         };
         let mut groups: Vec<(ServiceGroup, Vec<RunConfig>)> = Vec::new();
         for config in configs {
@@ -1763,10 +1763,9 @@ impl DockerPanel {
             "edit" => {
                 let Some(config) = runs
                     .read(cx)
-                    .configurations()
-                    .iter()
+                    .service_configurations()
+                    .into_iter()
                     .find(|config| config.name == name)
-                    .cloned()
                 else {
                     return;
                 };

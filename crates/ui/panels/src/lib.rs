@@ -353,6 +353,8 @@ mod window_tests_build_tool;
 #[cfg(test)]
 mod window_tests_run_configs;
 #[cfg(test)]
+mod window_tests_run_idea;
+#[cfg(test)]
 mod window_tests_spacing_popups;
 #[cfg(test)]
 mod window_tests_spacing_tools;
@@ -1500,10 +1502,12 @@ fn install(
     jshell_panel::install(workspace, weak.clone(), cx);
 
     let root = workspace.root().to_path_buf();
+    let store = workspace.store();
     let runs = run::RunPanel::create(
         root,
         project.clone(),
         workspace.state_dir().to_path_buf(),
+        store,
         weak.clone(),
         trust.trusted,
         cx,
@@ -1908,6 +1912,28 @@ fn install(
     cx.set_global(bookmarks::ActiveBookmarks(bookmarks));
     settings_archive::bind_commands(workspace, cx);
     idea_import::bind_commands(workspace, cx);
+    // The offer of the run configurations of another IDE and the answer Not Now reach
+    // the Run window through these commands, as the buttons of its notification.
+    workspace.register_command(
+        "run.import_idea_configs",
+        "Import Run Configurations from IntelliJ IDEA...",
+        |_workspace, _window, cx| {
+            if let Some(panel) = cx.try_global::<script::ActiveRunPanel>() {
+                let panel = panel.0.clone();
+                panel.update(cx, |panel, cx| panel.import_foreign_configs(cx));
+            }
+        },
+    );
+    workspace.register_command(
+        "run.dismiss_idea_configs",
+        "Not Now",
+        |_workspace, _window, cx| {
+            if let Some(panel) = cx.try_global::<script::ActiveRunPanel>() {
+                let panel = panel.0.clone();
+                panel.update(cx, |panel, cx| panel.dismiss_foreign_configs(cx));
+            }
+        },
+    );
     workspace.register_command(
         workspace::TRUST_PROJECT_COMMAND,
         "Trust Project...",
@@ -2547,3 +2573,8 @@ mod window_tests_git_safety;
 
 #[cfg(test)]
 mod window_tests_cut_paste;
+
+#[cfg(test)]
+mod window_tests_run_config_look;
+#[cfg(test)]
+mod window_tests_run_list;
