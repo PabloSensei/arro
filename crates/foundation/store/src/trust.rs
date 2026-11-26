@@ -141,6 +141,9 @@ mod tests {
         list.trust(project).unwrap();
         list.trust(project).unwrap();
 
+        assert!(list.is_trusted(project));
+        // Windows compares paths without case; other systems keep it.
+        #[cfg(windows)]
         assert!(list.is_trusted(Path::new(r"c:\work\demo")));
         assert!(!list.is_trusted(Path::new(r"C:\work\Other")));
         let text = fs::read_to_string(dir.join(FILE)).unwrap();

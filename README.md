@@ -69,7 +69,7 @@
       Fast completion with documentation and auto-import, Alt+Enter with quick fixes and intentions and a preview of the change, Ctrl+B that jumps at once, semantic highlighting, parameter name hints, Find Usages, call and type hierarchy, class and sequence diagrams, rename, extract, inline, change signature, safe delete, Structural Search and Replace, live and postfix templates, reformat, optimize imports, Create Test, spell checking of comments, strings and names with fixes through Rename, and per-project inspection levels with suppression on Alt+Enter.
     </td>
     <td width="50%" valign="top">
-      <img src=".github/readme/completion.png" alt="Completion with documentation in the Paper theme">
+      <img src=".github/readme/demo-ide.gif" alt="In the Nightfall theme: Ctrl+N finds OwnerRepository, Ctrl+E goes back to the controller, completion of owners.findBy shows the repository methods with their documentation, and the OwnerControllerTests start in the Tests window">
     </td>
   </tr>
   <tr>
