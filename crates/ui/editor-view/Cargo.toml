@@ -27,3 +27,6 @@ ureq = { version = "3", default-features = false, features = [
     "_ring",
     "platform-verifier",
 ] }
+
+[dev-dependencies]
+test-support = { path = "../../../tools/test-support" }

@@ -59,6 +59,24 @@ pub struct ActiveTerminal(pub Entity<TerminalPanel>);
 
 impl Global for ActiveTerminal {}
 
+/// How the shell that a line is typed into reads it, so that a service can quote the line
+/// for it. The shell is the one of the active tab, else the one of the settings, else the
+/// default shell.
+pub(crate) fn active_dialect(cx: &App) -> terminal::Dialect {
+    let tab_shell = cx
+        .try_global::<ActiveTerminal>()
+        .and_then(|active| active.0.read(cx).active_shell());
+    let configured = cx
+        .try_global::<Settings>()
+        .map(|settings| settings.terminal_shell.trim().to_owned())
+        .filter(|shell| !shell.is_empty());
+    let line = tab_shell
+        .or(configured)
+        .or_else(terminal::default_shell)
+        .unwrap_or_default();
+    terminal::Dialect::of_shell(&line)
+}
+
 /// Opens a tab in `directory` in the terminal of the window, as Open in Terminal of the project
 /// tree does. The caller shows the terminal window. Nothing happens without a terminal.
 pub(crate) fn open_tab_in_directory(directory: PathBuf, window: &mut Window, cx: &mut App) {
@@ -677,6 +695,15 @@ impl TerminalPanel {
     /// The session of the tab the user looks at.
     pub fn session(&self) -> Option<&Arc<TerminalSession>> {
         self.tabs.get(self.active)?.pane().session()
+    }
+
+    /// The command line of the shell of the tab the user looks at, when the tab has its own.
+    pub(crate) fn active_shell(&self) -> Option<String> {
+        self.tabs
+            .get(self.active)?
+            .shell
+            .clone()
+            .filter(|shell| !shell.trim().is_empty())
     }
 
     /// What the panel shows now, for tests: the shell, its start or the reason it failed.

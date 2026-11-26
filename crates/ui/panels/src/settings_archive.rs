@@ -246,11 +246,12 @@ impl ImportSettingsDialog {
         let settings_dir = self.settings_dir.clone();
         let workspace = self.workspace.clone();
         // The manifest is read again with the archive, so the dialog needs no second
-        // copy of the path.
+        // copy of the path. The writes of this process stop first, so that no save of its
+        // settings lands after the import and undoes it.
         let archive = self.archive.clone();
-        let write = cx
-            .background_executor()
-            .spawn(async move { settings_archive::import(&archive, &settings_dir, &selected) });
+        let write = workspace::stop_settings_writes(cx, move || {
+            settings_archive::import(&archive, &settings_dir, &selected)
+        });
         cx.spawn_in(window, async move |this, cx| {
             let written = write.await;
             this.update_in(cx, |this, window, cx| this.close(window, cx))
@@ -270,7 +271,10 @@ impl ImportSettingsDialog {
                             cx,
                         );
                     }
-                    Err(error) => workspace.notify_error("Cannot import the settings", error, cx),
+                    Err(error) => {
+                        workspace::resume_settings_writes(cx);
+                        workspace.notify_error("Cannot import the settings", error, cx)
+                    }
                 })
                 .ok();
         })

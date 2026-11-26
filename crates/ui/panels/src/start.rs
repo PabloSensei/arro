@@ -315,6 +315,14 @@ impl StartScreen {
         cx.notify();
     }
 
+    /// A project that Arro created or cloned at the request of the user is trusted: its
+    /// code came from the user, not from a folder that the user only opened.
+    fn remember_trust(&self, folder: &Path) {
+        if let Err(error) = store::TrustList::new(&self.state_dir).trust(folder) {
+            eprintln!("the project {} is not trusted: {error}", folder.display());
+        }
+    }
+
     /// Starts the program of the project and leaves this window.
     fn open(&mut self, folder: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(test)]
@@ -376,8 +384,11 @@ impl StartScreen {
             .spawn(async move { write_project(&target, &files) });
         cx.spawn_in(window, async move |this, cx| match write.await {
             Ok(()) => {
-                this.update_in(cx, |this, window, cx| this.open(folder, window, cx))
-                    .ok();
+                this.update_in(cx, |this, window, cx| {
+                    this.remember_trust(&folder);
+                    this.open(folder, window, cx)
+                })
+                .ok();
             }
             Err(error) => {
                 this.update(cx, |this, cx| this.fail(error.to_string(), cx))
@@ -400,17 +411,27 @@ impl StartScreen {
         }
         self.busy = true;
         self.message = Some("Cloning...".into());
+        // A password in the address would reach the command line of git and the configuration
+        // of the clone, which keeps the address. Git asks for the credentials through its own
+        // credential helper, so the address goes without them.
+        let remote = vcs::url_without_credentials(&url);
         let task = cx.background_executor().spawn(async move {
             std::fs::create_dir_all(&parent)?;
             let git = vcs::GitRunner::from_env()
                 .ok_or_else(|| std::io::Error::other("git is not found"))?;
-            git.run(&parent, ["clone", url.as_str(), name.as_str()])
-                .map(|_| ())
+            git.run(
+                &parent,
+                ["clone", "--end-of-options", remote.as_str(), name.as_str()],
+            )
+            .map(|_| ())
         });
         cx.spawn_in(window, async move |this, cx| match task.await {
             Ok(()) => {
-                this.update_in(cx, |this, window, cx| this.open(folder, window, cx))
-                    .ok();
+                this.update_in(cx, |this, window, cx| {
+                    this.remember_trust(&folder);
+                    this.open(folder, window, cx)
+                })
+                .ok();
             }
             Err(error) => {
                 this.update(cx, |this, cx| {
@@ -546,8 +567,11 @@ impl StartScreen {
                     }
                 })
                 .ok();
-                this.update_in(cx, |this, window, cx| this.open(opened, window, cx))
-                    .ok();
+                this.update_in(cx, |this, window, cx| {
+                    this.remember_trust(&opened);
+                    this.open(opened, window, cx)
+                })
+                .ok();
             }
             Err(error) => {
                 this.update(cx, |this, cx| {

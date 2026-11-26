@@ -244,7 +244,8 @@ fn a_rebase_conflict_continues_after_a_side_is_taken() {
     assert_eq!(report.operation, Operation::Rebase);
     assert_eq!(report.conflicts, ["main.txt"]);
 
-    repo.accept_side("main.txt", ConflictSide::Theirs).unwrap();
+    // In a rebase Yours is the commit being replayed, the local change.
+    repo.accept_side("main.txt", ConflictSide::Yours).unwrap();
     repo.finish("").unwrap();
     assert_eq!(repo.operation().unwrap(), Operation::None);
     let log = repo.log(1, 0).unwrap();
@@ -517,7 +518,8 @@ fn a_rebase_continue_that_cannot_put_the_local_change_back_reports_its_stash() {
     assert!(report.autostash);
     assert!(report.stash.is_none(), "the apply waits for the end");
 
-    repo.accept_side("main.txt", ConflictSide::Yours).unwrap();
+    // In a rebase Theirs is the upstream: the local change conflicts with it and waits.
+    repo.accept_side("main.txt", ConflictSide::Theirs).unwrap();
     let stash = repo
         .finish("")
         .unwrap()

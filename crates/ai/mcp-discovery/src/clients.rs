@@ -285,9 +285,20 @@ pub fn has_entry(client: Client, path: &Path) -> Result<bool, ConfigError> {
         .is_some_and(|servers| servers.contains_key(ENTRY)))
 }
 
+/// The transport a settings file gets. A project file may be committed to the repository, so
+/// the address of the window and its token never go into one: a streamed or SSE server gets
+/// the stdio shim there, which finds the window by the project folder, as a user file gets it.
+pub fn file_transport(scope: Scope, transport: Transport) -> Transport {
+    match (scope, transport) {
+        (Scope::Project, Transport::HttpStream | Transport::Sse) => Transport::Stdio,
+        _ => transport,
+    }
+}
+
 /// Adds or replaces the entry of Arro. The rest of the file stays as it was: only the
 /// object of the servers or the table of the server changes. A copy of the file lies next
-/// to it under `.arro-backup` after the first write.
+/// to it under `.arro-backup` after the first write. The transport is the one of
+/// [`file_transport`], so a project file never carries the token.
 pub fn configure(
     client: Client,
     scope: Scope,
@@ -297,6 +308,7 @@ pub fn configure(
     project: &Path,
 ) -> Result<PathBuf, ConfigError> {
     let path = client.config(scope, home, project);
+    let transport = file_transport(scope, transport);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),

@@ -843,8 +843,11 @@ impl DockerPanel {
         let Some(cli) = &self.cli else {
             return;
         };
-        let line = cli.exec_command_line(&container.id, EXEC_SHELL);
-        self.in_terminal(line, cx);
+        let dialect = crate::terminal_panel::active_dialect(cx);
+        match cli.exec_command_line(&container.id, EXEC_SHELL, dialect) {
+            Ok(line) => self.in_terminal(line, cx),
+            Err(error) => self.tell("Exec".to_owned(), error.to_string(), cx),
+        }
     }
 
     /// The terminal is another panel that updates the workspace, so this runs deferred.

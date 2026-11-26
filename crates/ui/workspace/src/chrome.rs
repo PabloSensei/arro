@@ -1780,6 +1780,9 @@ impl Workspace {
                 MenuEntry::separator(),
                 MenuEntry::submenu("Open Recent", recent),
                 MenuEntry::separator(),
+                command(crate::window::TRUST_PROJECT_COMMAND, "Trust Project..."),
+                command("file.forget_trust", "Forget Trust"),
+                MenuEntry::separator(),
                 self.command_row(&weak, "file.reload_all", "Reload All from Disk"),
                 command("file.invalidate_caches", "Invalidate Caches..."),
                 MenuEntry::separator(),
@@ -4143,6 +4146,7 @@ impl Render for StatusBarView {
             status_progress,
             agent_clients,
             agent_busy,
+            safe_mode,
         ) = {
             let workspace = workspace.read(cx);
             (
@@ -4165,6 +4169,7 @@ impl Render for StatusBarView {
                 workspace.status_progress().cloned(),
                 workspace.agent_clients,
                 workspace.agent_busy,
+                workspace.safe_mode,
             )
         };
         #[cfg(any(test, feature = "test-support"))]
@@ -4223,6 +4228,47 @@ impl Render for StatusBarView {
         });
         let message = status_message.map(|text| {
             status_widget("st-message", text, &theme).debug_selector(|| "st-message".to_owned())
+        });
+        let safe = safe_mode.then(|| {
+            let workspace = self.workspace.clone();
+            div()
+                .id("st-safe-mode")
+                .debug_selector(|| "st-safe-mode".to_owned())
+                .flex()
+                .items_center()
+                .gap(px(SPACE_XS))
+                .flex_none()
+                .child(
+                    div()
+                        .text_color(theme.warning_mark)
+                        .child("Safe mode: the build is off"),
+                )
+                .child(
+                    div()
+                        .id("st-safe-mode-trust")
+                        .debug_selector(|| "st-safe-mode-trust".to_owned())
+                        .rounded(px(CONTROL_RADIUS))
+                        .px(px(SPACE_XS))
+                        .text_color(theme.link)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.hover))
+                        .tooltip(|_, cx| {
+                            tooltip("Trust the project and turn the build on.", None, cx)
+                        })
+                        .tooltip_show_delay(ui_kit::tooltip_show_delay())
+                        .child("Trust Project...")
+                        .on_click(cx.listener(move |_, _, window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    workspace.run_command(
+                                        crate::window::TRUST_PROJECT_COMMAND,
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .ok();
+                        })),
+                )
         });
         let progress = status_progress.map(|progress| {
             let cancel = progress.cancel.clone();
@@ -4452,6 +4498,7 @@ impl Render for StatusBarView {
             .children(progress)
             .children(zoom)
             .children(message)
+            .children(safe)
             .children(agents)
             .children(language)
             .children(editor);

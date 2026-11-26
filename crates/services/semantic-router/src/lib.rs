@@ -32,14 +32,15 @@ use lsp_client::lsp_types::{
     DocumentFormattingParams, DocumentHighlight, DocumentHighlightParams,
     DocumentRangeFormattingParams, DocumentSymbolParams, DocumentSymbolResponse, FormattingOptions,
     GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, InlayHint, InlayHintParams,
-    Location, PartialResultParams, Position, PrepareRenameResponse, PublishDiagnosticsParams,
-    Range, ReferenceContext, ReferenceParams, RenameParams, SemanticTokens, SemanticTokensParams,
-    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult, SignatureHelp,
-    SignatureHelpParams, TextDocumentContentChangeEvent, TextDocumentIdentifier,
-    TextDocumentPositionParams, TextEdit, TypeHierarchyItem, TypeHierarchyPrepareParams,
-    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri, WorkDoneProgressParams,
-    WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    Location, PartialResultParams, Position, PrepareRenameResponse, Range, ReferenceContext,
+    ReferenceParams, RenameParams, SemanticTokens, SemanticTokensParams, SemanticTokensRangeParams,
+    SemanticTokensRangeResult, SemanticTokensResult, SignatureHelp, SignatureHelpParams,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentPositionParams, TextEdit,
+    TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
+    TypeHierarchySupertypesParams, Uri, WorkDoneProgressParams, WorkspaceEdit,
+    WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
+use lsp_client::uri::{server_uri, server_uri_key};
 use lsp_client::{Client, Error as LspError, ServerEvents};
 use serde_json::Value;
 use sidecar::Status;
@@ -143,7 +144,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Receives what the server publishes. Give it to the sidecar as the consumer.
 #[derive(Default)]
 pub struct Published {
-    diagnostics: Mutex<HashMap<Uri, Vec<Diagnostic>>>,
+    /// Keyed by the normalized path of the document: a server may spell a `file:` URI
+    /// the way `File.toURI` does, with raw non-ASCII and characters Arro percent-encodes.
+    diagnostics: Mutex<HashMap<String, (Uri, Vec<Diagnostic>)>>,
     revision: AtomicU64,
     changed: Option<watch::Sender<u64>>,
     /// A server that changed what hints it would give asks for them again.
@@ -171,8 +174,8 @@ impl Published {
     /// The latest diagnostics of a document, whichever version they describe.
     pub fn diagnostics(&self, uri: &Uri) -> Vec<Diagnostic> {
         lock(&self.diagnostics)
-            .get(uri)
-            .cloned()
+            .get(&server_uri_key(uri.as_str()))
+            .map(|(_, diagnostics)| diagnostics.clone())
             .unwrap_or_default()
     }
 
@@ -211,7 +214,7 @@ impl Published {
     /// The latest diagnostics of every document the server has published.
     pub fn all_diagnostics(&self) -> Vec<(Uri, Vec<Diagnostic>)> {
         let mut all: Vec<(Uri, Vec<Diagnostic>)> = lock(&self.diagnostics)
-            .iter()
+            .values()
             .map(|(uri, list)| (uri.clone(), list.clone()))
             .collect();
         all.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
@@ -232,10 +235,22 @@ impl ServerEvents for Published {
         if method != PublishDiagnostics::METHOD {
             return;
         }
-        let Ok(params) = serde_json::from_value::<PublishDiagnosticsParams>(params) else {
+        let Some(uri_text) = params.get("uri").and_then(Value::as_str) else {
             return;
         };
-        lock(&self.diagnostics).insert(params.uri, params.diagnostics);
+        // A server names the file the way its own URI class writes it, which may keep
+        // raw non-ASCII and other characters Arro percent-encodes. The path decides
+        // which file it is, and the stored URI is the spelling Arro sends.
+        let Some(uri) = server_uri(uri_text) else {
+            return;
+        };
+        let Some(diagnostics) = params.get("diagnostics").cloned() else {
+            return;
+        };
+        let Ok(diagnostics) = serde_json::from_value::<Vec<Diagnostic>>(diagnostics) else {
+            return;
+        };
+        lock(&self.diagnostics).insert(server_uri_key(uri_text), (uri, diagnostics));
         let revision = self.revision.fetch_add(1, Ordering::Relaxed) + 1;
         if let Some(changed) = &self.changed {
             changed.send_replace(revision);
@@ -317,12 +332,18 @@ impl Router {
         if documents.synced == generation {
             return;
         }
+        let mut synced = true;
         for (uri, document) in &documents.open {
             let text = document.text.to_string();
             // Ends with the connection, the next generation replays again.
-            let _ = client.open(uri.clone(), &document.language, text);
+            match client.open(uri.clone(), &document.language, text) {
+                Ok(_) | Err(LspError::AlreadyOpen(_)) => {}
+                Err(_) => synced = false,
+            }
         }
-        documents.synced = generation;
+        if synced {
+            documents.synced = generation;
+        }
     }
 
     pub fn open(&self, uri: Uri, language: &str, version: i32, text: Arc<str>) {

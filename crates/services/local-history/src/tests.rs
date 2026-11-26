@@ -173,3 +173,123 @@ fn a_restore_refuses_to_overwrite_a_file_too_big_to_keep() {
     assert!(history.restore(&saved).is_err());
     assert_eq!(fs::read(&file).unwrap(), b"a file much bigger than the cap");
 }
+
+/// Bytes that do not compress, different for each seed.
+fn noise(seed: u32, len: usize) -> Vec<u8> {
+    let mut state = 0x9E37_79B9u32 ^ seed;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect()
+}
+
+/// The folder name the tests of the skipped folders leave out.
+const SKIPPED: &str = "generated";
+
+fn skipping(fixture: &Fixture, limits: Limits) -> LocalHistory {
+    let skip: Box<SkipFolders> = Box::new(|name: &str| name == SKIPPED);
+    LocalHistory::open_skipping(&fixture.root.join("history"), limits, skip).unwrap()
+}
+
+#[test]
+fn a_skipped_folder_records_nothing_and_the_rest_of_the_tree_is_recorded() {
+    let fixture = Fixture::new();
+    let history = skipping(&fixture, Limits::default());
+    let output = fixture.project(SKIPPED);
+    fs::create_dir_all(output.join("deep")).unwrap();
+    for number in 0..1000u32 {
+        fs::write(
+            output.join("deep").join(format!("Class{number}.class")),
+            [7u8; 64],
+        )
+        .unwrap();
+    }
+    fs::write(fixture.project("src/Main.txt"), "class Main {}").unwrap();
+
+    // The folder itself is named, so nothing under it is recorded.
+    history.record_tree(&output, Cause::BeforeDelete).unwrap();
+    assert!(history.folder_history(&output).is_empty());
+
+    // A walk from the project leaves out the skipped folder inside it, and records the rest.
+    history
+        .record_tree(&fixture.project(""), Cause::BeforeDelete)
+        .unwrap();
+    assert_eq!(history.folder_history(&fixture.project("")).len(), 1);
+    assert_eq!(
+        history.file_history(&fixture.project("src/Main.txt")).len(),
+        1
+    );
+}
+
+#[test]
+fn a_junction_back_into_its_own_folder_does_not_end_the_record() {
+    let fixture = Fixture::new();
+    let owner = fixture.project("src/Owner.txt");
+    fs::write(&owner, b"owner").unwrap();
+    let link = fixture.project("src").join("again");
+    test_support::link_dir(&fixture.project("src"), &link).expect("a link to the folder");
+    let history = fixture.history(Limits::default());
+
+    history
+        .record_tree(&fixture.project("src"), Cause::BeforeDelete)
+        .unwrap();
+
+    assert_eq!(history.file_history(&owner).len(), 1);
+    assert_eq!(history.folder_history(&fixture.project("src")).len(), 1);
+}
+
+#[test]
+fn a_size_limit_takes_the_versions_in_skipped_folders_before_the_history_of_a_source() {
+    let fixture = Fixture::new();
+    let source = fixture.project("src/Source.txt");
+    let limits = Limits {
+        max_age: Duration::from_secs(3600),
+        max_bytes: 3000,
+        ..Limits::default()
+    };
+    let history = skipping(&fixture, limits);
+    // The source is on disk, so its last version stays whatever the limit says.
+    fs::write(&source, "source").unwrap();
+    for round in 0..3u32 {
+        history
+            .record(&source, Some(&noise(round, 300)), Cause::Saved)
+            .unwrap();
+    }
+    assert_eq!(history.file_history(&source).len(), 3);
+
+    // Output written into the skipped folder pushes the limit over, eight times.
+    for round in 0..8u32 {
+        let output = fixture.project(SKIPPED).join(format!("out{round}.bin"));
+        history
+            .record(&output, Some(&noise(100 + round, 900)), Cause::Saved)
+            .unwrap();
+    }
+
+    assert_eq!(
+        history.file_history(&source).len(),
+        3,
+        "the history of the source stays"
+    );
+    let output_left = history.folder_history(&fixture.project(SKIPPED)).len();
+    assert!(output_left < 8, "some output went: {output_left}");
+    assert!(history.blobs.total().unwrap() <= 3000);
+}
+
+#[test]
+fn a_file_over_the_size_cap_is_not_read_into_the_history() {
+    let fixture = Fixture::new();
+    let file = fixture.project("src/Huge.bin");
+    fs::write(&file, noise(9, 64 * 1024)).unwrap();
+    let limits = Limits {
+        max_file_bytes: 1024,
+        ..Limits::default()
+    };
+    let history = fixture.history(limits);
+
+    assert!(history.record_file(&file, Cause::Saved).unwrap().is_none());
+    assert!(history.file_history(&file).is_empty());
+}

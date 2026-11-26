@@ -1,10 +1,17 @@
 //! Everything that talks to the operating system, behind safe types.
 
+mod clipboard;
+mod containment;
 #[cfg(windows)]
 mod crash;
 #[cfg(unix)]
 #[path = "crash_unix.rs"]
 mod crash;
+#[cfg(windows)]
+mod file_identity;
+#[cfg(unix)]
+#[path = "file_identity_unix.rs"]
+mod file_identity;
 /// One program per state folder: a second start hands its path to the first one.
 #[cfg(any(unix, windows))]
 pub mod instance;
@@ -13,6 +20,7 @@ mod job;
 #[cfg(unix)]
 #[path = "job_unix.rs"]
 mod job;
+mod link;
 mod machine;
 #[cfg(windows)]
 mod memory;
@@ -73,13 +81,17 @@ mod waiter;
 #[path = "waiter_unix.rs"]
 mod waiter;
 
+pub use clipboard::copy_secret;
+pub use containment::inside_root;
 pub use crash::{install as install_crash_handler, module_of};
+pub use file_identity::same_file;
 pub use job::Job;
+pub use link::symlink_file;
 pub use machine::{bios_names_a_virtual_machine, is_virtual_machine};
 pub use memory::{LOW_MEMORY_HOLD, MemoryPressure, MemoryState, MemoryThresholds, physical_memory};
-pub use mode::{make_executable, mode, private_file, set_mode};
+pub use mode::{make_executable, mode, private_dir, private_file, private_new_dir, set_mode};
 pub use os::version as os_version;
-pub use path::{CanonPath, file_url_path, path_from_uri, path_key};
+pub use path::{CanonPath, file_url_path, is_remote_path, path_from_uri, path_key, path_to_uri};
 pub use process::{
     ConsoleSignal, NO_WINDOW, SUSPENDED_NO_WINDOW, allow_ctrl_c_in_children, resume_process,
     signal_console_of,
@@ -101,3 +113,6 @@ pub use waiter::ProcessWaiter;
 /// Bin test must not overlap.
 #[cfg(all(test, windows))]
 pub(crate) static WIN32_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+mod remote_path_tests;

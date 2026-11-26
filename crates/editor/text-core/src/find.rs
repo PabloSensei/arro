@@ -113,6 +113,55 @@ pub fn preserve_case(found: &str, replacement: &str) -> String {
     result
 }
 
+/// `replacement` with `$1` and `${name}` standing for groups, as IDEA writes it: a group
+/// number is the digits after `$` and the rest of the name stays literal, so `$1_old`
+/// is the first group and `_old`. `$$` is one dollar sign.
+fn expand_replacement(captures: &regex::Captures<'_>, replacement: &str, out: &mut String) {
+    let mut rest = replacement;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + 1..];
+        if let Some(after) = rest.strip_prefix('$') {
+            out.push('$');
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix('{') {
+            let Some(close) = after.find('}') else {
+                out.push('$');
+                rest = after;
+                continue;
+            };
+            push_group(captures, &after[..close], out);
+            rest = &after[close + 1..];
+        } else {
+            let end = if rest.starts_with(|c: char| c.is_ascii_digit()) {
+                rest.find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(rest.len())
+            } else {
+                rest.find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len())
+            };
+            if end == 0 {
+                out.push('$');
+            } else {
+                push_group(captures, &rest[..end], out);
+                rest = &rest[end..];
+            }
+        }
+    }
+    out.push_str(rest);
+}
+
+/// The text of one capture, by number or by name; a group that does not exist is empty.
+fn push_group(captures: &regex::Captures<'_>, name: &str, out: &mut String) {
+    let found = match name.parse::<usize>() {
+        Ok(index) => captures.get(index),
+        Err(_) => captures.name(name),
+    };
+    if let Some(found) = found {
+        out.push_str(found.as_str());
+    }
+}
+
 /// The edits that replace the matches in `only` (all when `None`) with `replacement`. With
 /// regular expressions `$1` and `${name}` in it stand for groups.
 pub fn replacements(
@@ -160,7 +209,7 @@ pub fn replacements_in(
         }
         let mut replaced = String::new();
         if options.regex {
-            captures.expand(replacement, &mut replaced);
+            expand_replacement(&captures, replacement, &mut replaced);
         } else {
             replaced.push_str(replacement);
         }

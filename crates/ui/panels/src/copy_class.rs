@@ -40,21 +40,23 @@ pub(crate) struct CopyClassDialog {
     submit: Submit,
 }
 
+/// The text of a file that is open with unsaved edits, as the window holds it. `None` for a
+/// file that is closed or clean: its text is on the disk, and the disk is read elsewhere.
+pub(crate) fn unsaved_text(workspace: &Workspace, path: &Path, cx: &App) -> Option<String> {
+    let open = workspace
+        .view_of(path)
+        .and_then(|view| view.downcast::<EditorView>().ok())?;
+    let view = open.read(cx);
+    if view.is_dirty() {
+        return view.text();
+    }
+    None
+}
+
 /// The text of a file of the window: the buffer when it is open and has unsaved edits,
 /// and the disk otherwise.
 pub(crate) fn source_text(workspace: &Workspace, path: &Path, cx: &App) -> Option<String> {
-    let open = workspace
-        .view_of(path)
-        .and_then(|view| view.downcast::<EditorView>().ok());
-    if let Some(view) = open {
-        let view = view.read(cx);
-        if view.is_dirty()
-            && let Some(text) = view.text()
-        {
-            return Some(text);
-        }
-    }
-    std::fs::read_to_string(path).ok()
+    unsaved_text(workspace, path, cx).or_else(|| std::fs::read_to_string(path).ok())
 }
 
 /// The name a copy of `stem` gets in `folder`: the same name when it is free, else

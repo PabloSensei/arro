@@ -17,7 +17,15 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_PIPE_BUSY,
-    ERROR_PIPE_CONNECTED, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_PIPE_CONNECTED, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
+};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows_sys::Win32::Security::{
+    GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+    TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
@@ -25,10 +33,12 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
-    PIPE_WAIT, WaitNamedPipeW,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, NAMED_PIPE_MODE, PIPE_READMODE_BYTE,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
 };
-use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, GetCurrentProcess, OpenProcessToken, WaitForSingleObject,
+};
 
 use super::{Request, read_ack, serve, write_request};
 
@@ -39,6 +49,9 @@ const REQUEST_WAIT: Duration = Duration::from_secs(2);
 /// How long a second start waits for a busy instance to take it.
 const CONNECT_WAIT: Duration = Duration::from_secs(10);
 const BUFFER: u32 = 4096;
+/// Bytes both ways, a client waited for, and no client from another machine.
+const PIPE_MODE: NAMED_PIPE_MODE =
+    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
 
 /// The listener of a state folder. Dropping it stops the thread and closes the pipe.
 pub struct Instance {
@@ -55,19 +68,27 @@ impl Instance {
         F: FnMut(Request) + Send + 'static,
     {
         std::fs::create_dir_all(state_dir)?;
-        let name = pipe_name(state_dir);
+        let name = pipe_name(state_dir)?;
+        // Only the account of this program may open the pipe. The descriptor is read when
+        // the pipe is made, so it lives until then.
+        let security = PipeSecurity::for_current_user()?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: security.0,
+            bInheritHandle: 0,
+        };
         // The first instance of the name belongs to this program; a second one of a
         // running program is refused, and the caller sends its request instead.
         let handle = unsafe {
             CreateNamedPipeW(
                 name.as_ptr(),
                 PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_MODE,
                 1,
                 BUFFER,
                 BUFFER,
                 0,
-                std::ptr::null(),
+                &attributes,
             )
         };
         if handle == INVALID_HANDLE_VALUE {
@@ -149,18 +170,126 @@ fn raw(pipe: &File) -> HANDLE {
 }
 
 /// The name of the pipe of a state folder: the folder itself is not a legal pipe name,
-/// so the name is a hash of its absolute path. Windows compares paths without case.
-fn pipe_name(state_dir: &Path) -> Vec<u16> {
+/// so the name is a hash of its absolute path. Windows compares paths without case. The
+/// name carries the SID of the account too, so the pipe of another account has another name.
+fn pipe_name(state_dir: &Path) -> io::Result<Vec<u16>> {
     let full = std::path::absolute(state_dir).unwrap_or_else(|_| PathBuf::from(state_dir));
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in full.to_string_lossy().to_lowercase().bytes() {
         hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
     }
-    let mut name: Vec<u16> = format!(r"\\.\pipe\arro-{hash:016x}")
+    let sid = current_user_sid()?;
+    let mut name: Vec<u16> = format!(r"\\.\pipe\arro-{sid}-{hash:016x}")
         .encode_utf16()
         .collect();
     name.push(0);
-    name
+    Ok(name)
+}
+
+/// The SID of the account that runs this program, as text, such as `S-1-5-21-...`.
+fn current_user_sid() -> io::Result<String> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: the pseudo handle of this process needs no closing; `token` is closed below.
+    let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+    if opened == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let user = token_user(token);
+    // SAFETY: the token was opened above and nothing uses it after this.
+    unsafe { CloseHandle(token) };
+    let user = user?;
+    // SAFETY: the buffer holds the `TOKEN_USER` the system wrote, and `user` lives while the
+    // SID is read from it.
+    let sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    let mut text = std::ptr::null_mut();
+    // SAFETY: `sid` points into `user`; the text the system allocates is freed below.
+    if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the system wrote a NUL-terminated string, which stays valid until freed.
+    let value = unsafe { wide_string(text) };
+    // SAFETY: `text` came from the conversion above and is freed once.
+    unsafe { LocalFree(text.cast()) };
+    Ok(value)
+}
+
+/// The `TOKEN_USER` of a token. The buffer is of 8-byte words, so the structure is aligned.
+fn token_user(token: HANDLE) -> io::Result<Vec<u64>> {
+    let mut needed = 0;
+    // SAFETY: a null buffer of length zero asks only for the size.
+    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+    let mut buffer = vec![0_u64; (needed as usize).div_ceil(std::mem::size_of::<u64>())];
+    // SAFETY: the buffer is as large as the system asked for.
+    let read = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    };
+    if read == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(buffer)
+}
+
+/// The text of a NUL-terminated UTF-16 string.
+///
+/// # Safety
+///
+/// `text` points to a NUL-terminated string that stays valid for the call.
+unsafe fn wide_string(text: *const u16) -> String {
+    let mut length = 0;
+    // SAFETY: the loop stops at the terminating NUL, which lies inside the string.
+    while unsafe { *text.add(length) } != 0 {
+        length += 1;
+    }
+    // SAFETY: `length` units up to the NUL are inside the string.
+    let units = unsafe { std::slice::from_raw_parts(text, length) };
+    String::from_utf16_lossy(units)
+}
+
+/// The security descriptor in SDDL: a protected access list (`P`, nothing inherited from
+/// the folder) with one entry that allows every access (`GA`) to `sid` and to no other.
+fn pipe_sddl(sid: &str) -> String {
+    format!("D:P(A;;GA;;;{sid})")
+}
+
+/// A security descriptor of the pipe, given by the system. Freed when dropped.
+struct PipeSecurity(PSECURITY_DESCRIPTOR);
+
+impl PipeSecurity {
+    /// The descriptor that lets only the account of this program open the pipe.
+    fn for_current_user() -> io::Result<Self> {
+        let text: Vec<u16> = pipe_sddl(&current_user_sid()?)
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: `text` is NUL-terminated and lives for the call; the system allocates the
+        // descriptor, which `Drop` frees.
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                text.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            )
+        };
+        if converted == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(descriptor))
+    }
+}
+
+impl Drop for PipeSecurity {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor came from the conversion in `for_current_user` and is freed once.
+        unsafe { LocalFree(self.0) };
+    }
 }
 
 /// One overlapped operation with the event that tells when it ends. The kernel may still
@@ -367,7 +496,7 @@ fn connect(name: &[u16]) -> io::Result<Option<File>> {
 /// Passes `request` to the program listening in `state_dir`. `Ok(true)` means the
 /// program took it and answered; `Ok(false)` means no program listens.
 pub fn send(state_dir: &Path, request: &Request) -> io::Result<bool> {
-    let name = pipe_name(state_dir);
+    let name = pipe_name(state_dir)?;
     let Some(pipe) = connect(&name)? else {
         return Ok(false);
     };
@@ -404,7 +533,7 @@ mod tests {
             sender.send(request).ok();
         })
         .unwrap();
-        let silent = connect(&pipe_name(folder.path()))
+        let silent = connect(&pipe_name(folder.path()).unwrap())
             .unwrap()
             .expect("the instance listens");
 
@@ -418,5 +547,33 @@ mod tests {
         );
         drop(silent);
         drop(instance);
+    }
+
+    /// The name of the pipe is the account's own: the SID of the running account is in it.
+    #[test]
+    fn the_pipe_name_carries_the_account_sid() {
+        let folder = TempDir::new("i-sid");
+        let sid = current_user_sid().unwrap();
+        assert!(sid.starts_with("S-1-"), "{sid}");
+        let name = String::from_utf16_lossy(&pipe_name(folder.path()).unwrap());
+        assert!(name.contains(&sid), "{name}");
+    }
+
+    /// The pipe refuses clients of other machines, on top of the access list.
+    #[test]
+    fn the_pipe_refuses_remote_clients() {
+        assert_eq!(
+            PIPE_MODE & PIPE_REJECT_REMOTE_CLIENTS,
+            PIPE_REJECT_REMOTE_CLIENTS
+        );
+    }
+
+    #[test]
+    fn the_access_list_names_the_account_alone() {
+        assert_eq!(
+            pipe_sddl("S-1-5-21-1-2-3-1001"),
+            "D:P(A;;GA;;;S-1-5-21-1-2-3-1001)"
+        );
+        assert!(PipeSecurity::for_current_user().is_ok());
     }
 }

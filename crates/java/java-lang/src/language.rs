@@ -239,6 +239,10 @@ impl LanguageSupport for JavaProject {
         self.status().borrow().state == sidecar::State::Ready
     }
 
+    fn stop_server(&self) -> bool {
+        self.request_stop()
+    }
+
     fn preferred_completion_names(&self) -> &'static [&'static str] {
         PREFERRED_COMPLETION_NAMES
     }

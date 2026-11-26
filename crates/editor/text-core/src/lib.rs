@@ -17,12 +17,13 @@ mod selection;
 mod store;
 
 pub use buffer::{Buffer, Change, Followed, apply_edits};
-pub use edit::{Edit, EditKind, EditSource, difference};
+pub use edit::{Edit, EditKind, EditSource, difference, non_overlapping_edits};
 pub use editorconfig::{
     Charset, EndOfLine, IndentSize, IndentStyle, Properties, apply_save, for_file,
 };
 pub use encoding::{
-    Decoded, Eol, EolStyle, FileFormat, TextEncoding, decode, encode, normalize_newlines,
+    Decoded, Eol, EolStyle, FileFormat, TextEncoding, decode, encode, encode_checked,
+    normalize_newlines, unmappable_encoding,
 };
 pub use file::{FileUpdate, MAX_EDITABLE_BYTES, read_file, write_file, write_files};
 pub use history::History;

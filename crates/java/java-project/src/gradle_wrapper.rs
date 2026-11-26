@@ -11,7 +11,8 @@ use base::Cancel;
 use project_model::ToolProgress;
 
 use crate::tool_download::{
-    Archive, Checksum, DownloadError, extract_tar_gz, extract_zip, stream_to, verify_expected,
+    Archive, Checksum, DownloadError, attempt_folder, extract_tar_gz, extract_zip, remove_work,
+    stream_to, verify_expected,
 };
 
 /// The properties file of the wrapper of a project.
@@ -29,8 +30,16 @@ const MARKER_SUFFIX: &str = ".ok";
 /// What the wrapper properties file says about the distribution.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WrapperDistribution {
+    /// The address Arro requests. An insecure file keeps its `http://` here and is never
+    /// requested; the button that offers https builds a copy with the same host.
     url: String,
+    /// The address that names the folder the wrapper reads. It stays the one of the file
+    /// when the transfer goes over https, so the wrapper finds the copy Arro seeded.
+    folder_url: String,
     sha256: Option<String>,
+    /// The address is https, so Arro may request it. An http address is read and named,
+    /// but never downloaded: the file may have been changed in the network.
+    secure: bool,
 }
 
 impl WrapperDistribution {
@@ -47,11 +56,35 @@ impl WrapperDistribution {
         let sha256 = property(&text, DISTRIBUTION_SHA256)
             .map(|sum| unescape(&sum))
             .filter(|sum| sum.chars().all(|character| character.is_ascii_hexdigit()));
-        Some(Self { url, sha256 })
+        let secure = url.starts_with("https://");
+        Some(Self {
+            folder_url: url.clone(),
+            url,
+            sha256,
+            secure,
+        })
     }
 
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// Whether the address is https. An http address is never requested.
+    pub fn is_secure(&self) -> bool {
+        self.secure
+    }
+
+    /// The same distribution with `https://` on the same host, for the button of the
+    /// notification. Nothing is written to the file of the project, and the folder the
+    /// wrapper reads stays the one of the file.
+    pub fn with_https(&self) -> Option<Self> {
+        let host = self.url.strip_prefix("http://")?;
+        Some(Self {
+            url: format!("https://{host}"),
+            folder_url: self.folder_url.clone(),
+            sha256: self.sha256.clone(),
+            secure: true,
+        })
     }
 
     /// The checksum the file names, when it names one.
@@ -61,7 +94,7 @@ impl WrapperDistribution {
 
     /// The name of the distribution folder: `gradle-9.5.1-bin`.
     pub fn name(&self) -> Option<String> {
-        distribution_name(&self.url)
+        distribution_name(&self.folder_url)
     }
 
     /// The version the distribution carries: `9.5.1`, which the messages of the window
@@ -81,7 +114,7 @@ impl WrapperDistribution {
         Some(distribution_folder(
             user_home,
             &self.name()?,
-            &dist_hash(&self.url),
+            &dist_hash(&self.folder_url),
         ))
     }
 
@@ -89,6 +122,28 @@ impl WrapperDistribution {
     pub fn installed(&self, user_home: &Path) -> bool {
         self.folder(user_home)
             .is_some_and(|folder| is_installed(&folder))
+    }
+}
+
+/// Whether the URL names this machine. Only a test uses it, because the stand-in server
+/// of the suite speaks plain HTTP.
+#[cfg(test)]
+fn is_loopback(url: &str) -> bool {
+    let rest = url.strip_prefix("http://").unwrap_or(url);
+    let host = rest.split('/').next().unwrap_or(rest);
+    let host = host.rsplit_once(':').map(|(host, _)| host).unwrap_or(host);
+    matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1")
+}
+
+/// A distribution of a test whose transfer goes to the local stand-in server. The flag is
+/// the https one, because the stand-in speaks plain HTTP and only a test reaches it.
+#[cfg(test)]
+pub(crate) fn testing_distribution(url: &str, sha256: Option<&str>) -> WrapperDistribution {
+    WrapperDistribution {
+        url: url.to_owned(),
+        folder_url: url.to_owned(),
+        sha256: sha256.map(str::to_owned),
+        secure: true,
     }
 }
 
@@ -139,100 +194,114 @@ pub(crate) fn is_installed(folder: &Path) -> bool {
 
 /// Downloads the distribution of `distribution` into `user_home`, where the wrapper
 /// finds it. A complete copy needs no request. A checksum the file names is checked, and
-/// a file that does not match never reaches the folder of the wrapper.
+/// a file that does not match never reaches the folder of the wrapper. The transfer of
+/// one window lives in a folder of its own and the folder the wrapper reads appears by a
+/// rename, so two windows that install one distribution leave one complete copy.
 pub(crate) fn install(
     distribution: &WrapperDistribution,
     user_home: &Path,
     progress: &ToolProgress,
     cancel: &Cancel,
 ) -> Result<PathBuf, DownloadError> {
+    if !distribution.is_secure() {
+        // The suite has no TLS stand-in server, so a loopback address may be fetched while
+        // the tests run. A build of the IDE never requests an http address.
+        #[cfg(not(test))]
+        {
+            return Err(DownloadError::Insecure);
+        }
+        #[cfg(test)]
+        if !is_loopback(distribution.url()) {
+            return Err(DownloadError::Insecure);
+        }
+    }
     let name = distribution
         .name()
         .ok_or_else(|| DownloadError::Archive("the distribution URL has no file name".into()))?;
-    let folder = distribution_folder(user_home, &name, &dist_hash(distribution.url()));
+    let folder = distribution_folder(user_home, &name, &dist_hash(&distribution.folder_url));
     if is_installed(&folder) {
         return Ok(folder);
     }
     if folder.exists() {
-        // A folder without the marker belongs to a transfer that is running or that
-        // stopped; the wrapper and its lock own it, so this download leaves it alone.
-        return Ok(folder);
+        if has_lock(&folder) {
+            // The wrapper of another window is writing this folder now: its lock owns it.
+            return Ok(folder);
+        }
+        // No marker and no lock: a transfer of an older run stopped in the middle. The
+        // folder is not a distribution the wrapper would read, so it is replaced. A copy
+        // that another window completed in the meantime is used as it is.
+        if is_installed(&folder) {
+            return Ok(folder);
+        }
+        fs::remove_dir_all(&folder).map_err(DownloadError::Files)?;
     }
     let archive = archive_of(distribution.url());
-    let work = user_home
-        .join(DISTS)
-        .join(WORK)
-        .join(dist_hash(distribution.url()));
-    let _ = fs::remove_dir_all(&work);
+    let work = attempt_folder(
+        &user_home.join(DISTS).join(WORK),
+        &dist_hash(&distribution.folder_url),
+    );
     fs::create_dir_all(&work).map_err(DownloadError::Files)?;
     let file = format!("{name}.{}", archive.extension());
     let part = work.join(&file);
-    if let Err(error) = stream_to(distribution.url(), &part, progress, cancel) {
-        remove_work(&work);
-        return Err(error);
-    }
-    if let Some(expected) = distribution.sha256()
-        && let Err(error) = verify_expected(expected, &part, Checksum::Sha256)
-    {
-        // A file that does not match the sum of the project is not the distribution:
-        // it never reaches a folder the wrapper reads.
-        remove_work(&work);
-        return Err(error);
-    }
     let unpacked = work.join("unpacked");
-    fs::create_dir_all(&unpacked).map_err(DownloadError::Files)?;
-    let extracted = match archive {
-        Archive::Zip => extract_zip(&part, &unpacked, "", cancel),
-        Archive::TarGz => extract_tar_gz(&part, &unpacked, "", cancel),
-    };
-    if let Err(error) = extracted {
-        remove_work(&work);
-        return Err(error);
-    }
-    let Some(home) = find_home(&unpacked) else {
-        remove_work(&work);
-        return Err(DownloadError::Archive(format!(
-            "no bin of Gradle in {file}"
-        )));
-    };
-    if let Some(parent) = folder.parent() {
-        fs::create_dir_all(parent).map_err(DownloadError::Files)?;
-    }
-    fs::create_dir_all(&folder).map_err(DownloadError::Files)?;
-    let top = if home == unpacked {
-        PathBuf::from(&name)
-    } else {
-        home.file_name()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(&name))
-    };
-    fs::rename(&home, folder.join(top)).map_err(|error| {
-        remove_work(&work);
-        DownloadError::Files(error)
-    })?;
-    fs::rename(&part, folder.join(&file)).map_err(|error| {
-        remove_work(&work);
-        DownloadError::Files(error)
-    })?;
-    fs::write(folder.join(format!("{file}{MARKER_SUFFIX}")), b"").map_err(|error| {
-        remove_work(&work);
-        DownloadError::Files(error)
-    })?;
+    let installed = (|| {
+        stream_to(distribution.url(), &part, progress, cancel)?;
+        if let Some(expected) = distribution.sha256() {
+            // A file that does not match the sum of the project is not the distribution:
+            // it never reaches a folder the wrapper reads.
+            verify_expected(expected, &part, Checksum::Sha256)?;
+        }
+        fs::create_dir_all(&unpacked).map_err(DownloadError::Files)?;
+        let extracted = match archive {
+            Archive::Zip => extract_zip(&part, &unpacked, "", cancel),
+            Archive::TarGz => extract_tar_gz(&part, &unpacked, "", cancel),
+        };
+        extracted?;
+        let home = find_home(&unpacked)
+            .ok_or_else(|| DownloadError::Archive(format!("no bin of Gradle in {file}")))?;
+        // The staging folder holds exactly what the wrapper reads, so the final name
+        // never exists without its marker.
+        let staging = work.join("staging");
+        fs::create_dir_all(&staging).map_err(DownloadError::Files)?;
+        let top = if home == unpacked {
+            PathBuf::from(&name)
+        } else {
+            home.file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(&name))
+        };
+        fs::rename(&home, staging.join(top)).map_err(DownloadError::Files)?;
+        fs::rename(&part, staging.join(&file)).map_err(DownloadError::Files)?;
+        fs::write(staging.join(format!("{file}{MARKER_SUFFIX}")), b"")
+            .map_err(DownloadError::Files)?;
+        if let Some(parent) = folder.parent() {
+            fs::create_dir_all(parent).map_err(DownloadError::Files)?;
+        }
+        match fs::rename(&staging, &folder) {
+            Ok(()) => Ok(folder.clone()),
+            Err(error) => {
+                // Another window installed the same distribution while this one was
+                // unpacking. Its folder is the copy both of them need.
+                if is_installed(&folder) {
+                    Ok(folder.clone())
+                } else {
+                    Err(DownloadError::Files(error))
+                }
+            }
+        }
+    })();
     remove_work(&work);
-    Ok(folder)
+    installed
 }
 
-/// Removes the work folder of a transfer and the folder it shares with the other
-/// transfers when it is empty. A failed transfer leaves nothing the wrapper could take
-/// for a distribution.
-fn remove_work(work: &Path) {
-    let _ = fs::remove_dir_all(work);
-    if let Some(parent) = work.parent()
-        && let Ok(mut entries) = fs::read_dir(parent)
-        && entries.next().is_none()
-    {
-        let _ = fs::remove_dir(parent);
-    }
+/// Whether a transfer of the wrapper holds `folder` now: it writes a `.lck` file beside
+/// the archive until it is done.
+fn has_lock(folder: &Path) -> bool {
+    fs::read_dir(folder).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".lck"))
+    })
 }
 
 /// The kind of archive the URL names.
@@ -405,10 +474,7 @@ mod tests {
     const VERSION: &str = "9.5.1";
 
     fn distribution(url: &str, sha256: Option<&str>) -> WrapperDistribution {
-        WrapperDistribution {
-            url: url.to_owned(),
-            sha256: sha256.map(str::to_owned),
-        }
+        super::testing_distribution(url, sha256)
     }
 
     fn archive() -> Vec<u8> {

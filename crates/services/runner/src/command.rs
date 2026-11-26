@@ -61,22 +61,34 @@ fn program_spec(program: &str, arguments: &[String], root: &std::path::Path) -> 
 /// The file a command names, trying the extensions of the programs and of the scripts.
 #[cfg(windows)]
 fn script_of(program: &str, root: &std::path::Path) -> Option<std::path::PathBuf> {
-    let path = std::path::Path::new(program);
-    if path.extension().is_some() {
-        return path.is_file().then(|| path.to_path_buf());
-    }
-    let mut bases = Vec::new();
-    if path.is_absolute() || program.contains(['\\', '/']) {
-        bases.push(if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            root.join(path)
-        });
+    script_in(program, root, std::env::var_os("PATH").as_deref())
+}
+
+/// [`script_of`] with the search path given. A name with a folder part is a file of the
+/// project, such as `./mvnw`, and is looked up from the root. A bare name is looked up in
+/// the search path only: a script that a repository brings does not run under the name of
+/// a program.
+#[cfg(windows)]
+fn script_in(
+    program: &str,
+    root: &std::path::Path,
+    search_path: Option<&std::ffi::OsStr>,
+) -> Option<std::path::PathBuf> {
+    let name = std::path::Path::new(program);
+    let bases: Vec<std::path::PathBuf> = if name.is_absolute() {
+        vec![name.to_path_buf()]
+    } else if program.contains(['\\', '/']) {
+        vec![root.join(name)]
     } else {
-        bases.push(root.join(path));
-        if let Some(paths) = std::env::var_os("PATH") {
-            bases.extend(std::env::split_paths(&paths).map(|folder| folder.join(path)));
-        }
+        search_path
+            .map(std::env::split_paths)
+            .into_iter()
+            .flatten()
+            .map(|folder| folder.join(name))
+            .collect()
+    };
+    if name.extension().is_some() {
+        return bases.into_iter().find(|base| base.is_file());
     }
     for base in bases {
         for extension in ["exe", "com", "cmd", "bat"] {
@@ -197,12 +209,44 @@ mod tests {
     }
 
     /// A command of a batch file is named without its extension in the prompt, as the
-    /// shell of Windows allows.
+    /// shell of Windows allows. The bare name finds the script on the search path.
     #[cfg(windows)]
     #[test]
-    fn a_bare_command_name_finds_its_script_in_the_project() {
+    fn a_bare_command_name_finds_its_script_on_the_search_path() {
         let root = test_support::scratch("runner-command-script");
-        std::fs::write(root.join("tool.cmd"), "@echo off\r\n").unwrap();
-        assert_eq!(super::script_of("tool", &root), Some(root.join("tool.cmd")));
+        let tools = root.join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::write(tools.join("tool.cmd"), "@echo off\r\n").unwrap();
+        let search_path = std::env::join_paths([&tools]).unwrap();
+        assert_eq!(
+            super::script_in("tool", &root, Some(search_path.as_os_str())),
+            Some(tools.join("tool.cmd"))
+        );
+    }
+
+    /// A script of the project does not run under the name of a program that the search
+    /// path does not have: `mvn.cmd` in the root is not `mvn`.
+    #[cfg(windows)]
+    #[test]
+    fn a_bare_name_does_not_find_a_script_of_the_project() {
+        let root = test_support::scratch("runner-command-bare");
+        std::fs::write(root.join("mvn.cmd"), "@echo off\r\n").unwrap();
+        assert_eq!(super::script_in("mvn", &root, None), None);
+    }
+
+    /// `./mvnw` and `.\mvnw.cmd` name the wrapper of the project, the file in the root.
+    #[cfg(windows)]
+    #[test]
+    fn a_name_with_a_folder_finds_the_wrapper_of_the_project() {
+        let root = test_support::scratch("runner-command-wrapper");
+        std::fs::write(root.join("mvnw.cmd"), "@echo off\r\n").unwrap();
+        assert_eq!(
+            super::script_in("./mvnw", &root, None),
+            Some(root.join("mvnw.cmd"))
+        );
+        assert_eq!(
+            super::script_in(r".\mvnw.cmd", &root, None),
+            Some(root.join("mvnw.cmd"))
+        );
     }
 }

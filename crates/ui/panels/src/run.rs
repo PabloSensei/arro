@@ -202,6 +202,9 @@ pub struct RunPanel {
     session: Option<ProjectSession>,
     sync: Option<workspace_core::Subscription<SyncEvent>>,
     loading: bool,
+    /// The project may run its build tool and its configurations. A project that opens in
+    /// Safe Mode keeps its tool and starts it once the user trusts the project.
+    trusted: bool,
     configs: Vec<RunConfig>,
     /// Configurations from `.arro/run.toml`, in the file order.
     saved: Vec<RunConfig>,
@@ -571,6 +574,7 @@ impl RunPanel {
         setup: ProjectSetup,
         state_dir: PathBuf,
         workspace: WeakEntity<Workspace>,
+        trusted: bool,
         cx: &mut App,
     ) -> Entity<Self> {
         cx.new(|cx| {
@@ -580,11 +584,11 @@ impl RunPanel {
                 .as_ref()
                 .map_or_else(BuildSelection::default, |tool| tool.selection(&root));
             let (session, sync) = match setup.tool.clone() {
-                Some(tool) => {
+                Some(tool) if trusted => {
                     let (session, sync) = open_project(tool, root, &setup.cache_root);
                     (Some(session), Some(sync))
                 }
-                None => (None, None),
+                _ => (None, None),
             };
             // The build tool window makes run configurations of its tasks on demand. The
             // provider writes none of them into the list by itself.
@@ -644,6 +648,7 @@ impl RunPanel {
                 loading: session.is_some(),
                 session,
                 sync,
+                trusted,
                 configs: Vec::new(),
                 saved: Vec::new(),
                 discovered: Vec::new(),
@@ -949,9 +954,58 @@ impl RunPanel {
         self.loading
     }
 
+    /// Whether the project may run its build tool and its configurations.
+    pub fn trusted(&self) -> bool {
+        self.trusted
+    }
+
+    /// The user trusted the project: the build tool that Safe Mode held back starts now,
+    /// without a restart of the window.
+    pub fn trust_project(&mut self, cx: &mut Context<Self>) {
+        self.trusted = true;
+        if self.session.is_none()
+            && let Some(tool) = self.tool.clone()
+        {
+            let (session, sync) = open_project(tool, self.root.clone(), &self.cache_root);
+            self.session = Some(session);
+            self.sync = Some(sync);
+            self.loading = true;
+        }
+        self.changed(cx);
+    }
+
+    /// The user forgot the trust of the project: the model stops and no build or
+    /// configuration runs until the project is trusted again.
+    pub fn forget_trust(&mut self, cx: &mut Context<Self>) {
+        self.trusted = false;
+        self.stop(cx);
+        self.stop_build(cx);
+        self.session = None;
+        self.sync = None;
+        self.loading = false;
+        self.changed(cx);
+    }
+
+    /// False when the project is in Safe Mode: nothing of the project may run, and the
+    /// status bar and the Build window say how to trust it.
+    fn may_run_project_code(&self, what: &str, cx: &mut Context<Self>) -> bool {
+        if self.trusted {
+            return true;
+        }
+        self.tell_warning(
+            "Safe Mode",
+            format!("{what} is off while the project is not trusted. Trust the project first."),
+            cx,
+        );
+        false
+    }
+
     /// Reads the model again and publishes it when the tool answers, the way a change of
     /// a build file does. An old model stays readable meanwhile.
     pub fn reload_project(&mut self, cx: &mut Context<Self>) {
+        if !self.may_run_project_code("Reading the project", cx) {
+            return;
+        }
         let Some(tool) = self.tool.clone() else {
             self.tell_warning("Reload", "The project has no build tool", cx);
             return;
@@ -967,7 +1021,7 @@ impl RunPanel {
     /// changed: the project model may name other modules now. A batch of changes, as a
     /// branch switch makes, settles into one import after [`MODEL_RELOAD_DELAY`].
     pub fn model_file_changed(&mut self, cx: &mut Context<Self>) {
-        if self.tool.is_none() {
+        if self.tool.is_none() || !self.trusted {
             return;
         }
         self.model_reload = self.model_reload.wrapping_add(1);
@@ -1645,6 +1699,9 @@ impl RunPanel {
         if self.starting {
             return;
         }
+        if !self.may_run_project_code("Run", cx) {
+            return;
+        }
         if self.busy() {
             let config = self
                 .selected
@@ -1687,6 +1744,9 @@ impl RunPanel {
 
     /// Plans the selected configuration in the background and starts its console.
     fn start(&mut self, cx: &mut Context<Self>) {
+        if !self.may_run_project_code("Run", cx) {
+            return;
+        }
         let Some(selected) = self
             .selected
             .and_then(|index| self.configs.get(index))
@@ -1965,6 +2025,9 @@ impl RunPanel {
     /// Runs the selected configuration with the coverage agent. The old data goes at
     /// once; the new report replaces it when the run ends.
     pub fn run_coverage(&mut self, cx: &mut Context<Self>) {
+        if !self.may_run_project_code("Coverage", cx) {
+            return;
+        }
         if self.starting {
             return;
         }
@@ -2061,6 +2124,9 @@ impl RunPanel {
 
     /// Runs the tests through the build tool with the coverage agent in their JVM.
     pub fn run_tests_coverage(&mut self, request: TestRequest, cx: &mut Context<Self>) {
+        if !self.may_run_project_code("Tests", cx) {
+            return;
+        }
         if self.starting {
             return;
         }
@@ -2134,6 +2200,9 @@ impl RunPanel {
     /// Runs the tests of the last run with their JVMs recorded. The recordings are read
     /// when the run ends.
     pub fn run_tests_profile(&mut self, request: TestRequest, cx: &mut Context<Self>) {
+        if !self.may_run_project_code("Profiling", cx) {
+            return;
+        }
         if self.starting {
             return;
         }
@@ -2318,6 +2387,9 @@ impl RunPanel {
     /// Runs the selected configuration with its samples recorded. The old snapshot goes
     /// at once; the new one replaces it when the run ends.
     pub fn run_profile(&mut self, cx: &mut Context<Self>) {
+        if !self.may_run_project_code("Profiling", cx) {
+            return;
+        }
         if self.starting {
             return;
         }
@@ -2854,6 +2926,9 @@ impl RunPanel {
     /// classes go into the running program. A build during a debug test run gets a
     /// console of its own: the test run keeps its console and its tree.
     pub fn build_project(&mut self, cx: &mut Context<Self>) {
+        if !self.may_run_project_code("Build", cx) {
+            return;
+        }
         if self.starting || (self.build_console.is_some() && self.build_running) {
             self.tell_warning("Busy", "Stop what is running first", cx);
             return;
@@ -2907,6 +2982,9 @@ impl RunPanel {
         command: &str,
         cx: &mut Context<Self>,
     ) {
+        if !self.may_run_project_code(command, cx) {
+            return;
+        }
         if self.starting || self.busy() {
             self.tell_warning("Busy", "Stop what is running first", cx);
             return;
@@ -2949,6 +3027,9 @@ impl RunPanel {
 
     /// Rebuild Project: builds the whole project again from scratch.
     pub fn rebuild_project(&mut self, cx: &mut Context<Self>) {
+        if !self.may_run_project_code("Rebuild", cx) {
+            return;
+        }
         if self.starting || self.busy() {
             self.tell_warning("Busy", "Stop what is running first", cx);
             return;
@@ -2980,6 +3061,9 @@ impl RunPanel {
 
     /// Generate Sources and Update Folders: runs the source generator of the build tool.
     pub fn generate_sources(&mut self, cx: &mut Context<Self>) {
+        if !self.may_run_project_code("Generating sources", cx) {
+            return;
+        }
         if self.starting || self.busy() {
             self.tell_warning("Busy", "Stop what is running first", cx);
             return;
@@ -4349,6 +4433,9 @@ impl RunPanel {
 
     /// Shift+F9: starts the selected configuration under the debugger.
     pub fn debug(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.may_run_project_code("Debug", cx) {
+            return;
+        }
         let handle = window.window_handle();
         self.start_debug(Some(handle), None, cx);
     }

@@ -19,7 +19,9 @@ use workspace::{COMMIT_TOOL, Settings, VcsQuickList, Workspace};
 
 use crate::conflict::ConflictView;
 use crate::project::ActiveProjectPanel;
+// The glob of `ui_kit` brings a `platform` name too, so the crate is named from the root.
 use crate::prompt::Prompt;
+use ::platform::path_key;
 
 /// The Git of the settings: the configured program, or the one on `PATH`.
 pub(crate) fn configured_git(settings: &Settings) -> Option<GitRunner> {
@@ -896,13 +898,12 @@ impl GitState {
         cx: &mut Context<Self>,
     ) {
         let history = crate::history::get(cx);
-        let skipped = crate::history::skipped_folders(cx);
         let root = self.repo.as_ref().map(|repo| repo.root().to_path_buf());
         self.run(
             what,
             move |repo| {
                 if let (Some(history), Some(root)) = (&history, &root) {
-                    crate::history::record_tree_blocking(history, root, cause, &skipped);
+                    crate::history::record_tree_blocking(history, root, cause);
                 }
                 work(repo)
             },
@@ -1080,6 +1081,21 @@ impl GitState {
         self.reload_all(true, cx);
     }
 
+    /// Reads the open files among `paths` from disk, even one that had edits. The other open
+    /// files keep their text, saved or not: a command that changed only `paths` must not take
+    /// the unsaved edits of the rest.
+    pub fn reload_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        let wanted: Vec<PathBuf> = paths.iter().map(|path| path_key(path)).collect();
+        for (path, view) in self.editors(cx) {
+            if wanted.contains(&path_key(&path)) {
+                view.update(cx, |view, cx| view.reload_from_disk(cx));
+            }
+        }
+        if let Some(panel) = cx.try_global::<ActiveProjectPanel>().map(|p| p.0.clone()) {
+            panel.update(cx, |panel, cx| panel.reload(cx));
+        }
+    }
+
     fn reload_all(&mut self, forced: bool, cx: &mut Context<Self>) {
         for (_, view) in self.editors(cx) {
             view.update(cx, |view, cx| {
@@ -1093,6 +1109,21 @@ impl GitState {
         if let Some(panel) = cx.try_global::<ActiveProjectPanel>().map(|p| p.0.clone()) {
             panel.update(cx, |panel, cx| panel.reload(cx));
         }
+    }
+
+    /// Writes the open files among `paths` before a git command that reads or rewrites them.
+    /// The other open files keep their unsaved text.
+    fn save_files(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) -> Result<(), String> {
+        let wanted: Vec<PathBuf> = paths.iter().map(|path| path_key(path)).collect();
+        for (path, _) in self.editors(cx) {
+            if !wanted.contains(&path_key(&path)) {
+                continue;
+            }
+            self.workspace
+                .update(cx, |workspace, cx| workspace.save_editor_now(&path, cx))
+                .unwrap_or_else(|_| Err("the window is gone".to_string()))?;
+        }
+        Ok(())
     }
 
     /// Writes the open files before a git command that reads the working tree.
@@ -2235,19 +2266,70 @@ impl GitState {
         self.update_with(UpdateMode::Merge, cx);
     }
 
-    /// Takes the named files back to the last commit, as Rollback does.
+    /// Takes the named files back to the last commit, as Rollback does. The open editors of
+    /// those files are saved first, and only they are read again afterwards.
     pub fn revert_paths(&mut self, paths: Vec<String>, cx: &mut Context<Self>) {
         if paths.is_empty() {
             return;
         }
         let count = paths.len();
+        let files: Vec<PathBuf> = paths
+            .iter()
+            .filter_map(|path| self.absolute(path))
+            .collect();
+        if let Err(message) = self.save_files(&files, cx) {
+            self.report("Rollback", message, cx);
+            return;
+        }
         self.run_snapshot(
             "Rollback",
             local_history::Cause::BeforeGitRevert,
             move |repo| repo.revert_paths(&paths),
             move |this, (), cx| {
-                this.reload_everything_from_disk(cx);
+                this.reload_paths(&files, cx);
                 this.tell("Rollback", format!("Rolled back {count} file(s)"), cx)
+            },
+            cx,
+        );
+    }
+
+    /// Takes back the changes `commit` made to `path`, as Revert of a file of a commit does.
+    /// The editor of the file is saved first and a snapshot of the project goes to Local
+    /// History. A clean result is read into the editor again; changes that meet later ones
+    /// leave the file as it is and open the Conflicts window.
+    pub fn revert_file_of_commit(&mut self, commit: String, path: String, cx: &mut Context<Self>) {
+        let Some(absolute) = self.absolute(&path) else {
+            return;
+        };
+        if let Err(message) = self.save_files(std::slice::from_ref(&absolute), cx) {
+            self.report("Revert", message, cx);
+            return;
+        }
+        let shown = path.clone();
+        let changed = absolute.clone();
+        self.run_snapshot(
+            "Revert",
+            local_history::Cause::BeforeGitRevert,
+            move |repo| repo.revert_file_of_commit(&commit, &path),
+            move |this, outcome, cx| match outcome {
+                vcs::FileRevert::Reverted => {
+                    this.reload_paths(std::slice::from_ref(&changed), cx);
+                    this.tell(
+                        "Revert",
+                        format!("Reverted the changes of the commit in {shown}"),
+                        cx,
+                    );
+                }
+                vcs::FileRevert::Conflict => {
+                    this.open_conflicts(cx);
+                    this.tell(
+                        "Revert",
+                        format!(
+                            "The changes meet later changes in {shown}; resolve them in Conflicts"
+                        ),
+                        cx,
+                    );
+                }
             },
             cx,
         );

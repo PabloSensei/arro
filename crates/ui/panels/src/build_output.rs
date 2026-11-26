@@ -494,6 +494,46 @@ impl BuildOutputPanel {
             )
     }
 
+    fn safe_mode_row(&self, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
+        let workspace = self.workspace.clone();
+        div()
+            .id("build-output-safe-mode")
+            .debug_selector(|| "build-output-safe-mode".to_owned())
+            .flex()
+            .items_center()
+            .flex_none()
+            .gap(px(SPACE_S))
+            .h(px(CONTROL_HEIGHT))
+            .px(px(SPACE_S))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .text_color(theme.warning_mark)
+                    .child("Safe mode: the build is off"),
+            )
+            .child(
+                div()
+                    .id("build-output-trust")
+                    .debug_selector(|| "build-output-trust".to_owned())
+                    .rounded(px(CONTROL_RADIUS))
+                    .px(px(SPACE_XS))
+                    .text_color(theme.link)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.hover))
+                    .tooltip(|_, cx| tooltip("Trust the project and turn the build on.", None, cx))
+                    .tooltip_show_delay(ui_kit::tooltip_show_delay())
+                    .child("Trust Project...")
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.run_command(workspace::TRUST_PROJECT_COMMAND, window, cx);
+                            })
+                            .ok();
+                    })),
+            )
+    }
+
     fn output_rows(&mut self, range: Range<usize>, theme: &Theme, cx: &App) -> Vec<AnyElement> {
         let view = self.run.read(cx).build_view();
         range
@@ -616,6 +656,7 @@ impl Render for BuildOutputPanel {
         };
         let tree = self.tree(&theme, window, cx);
         let output = self.output(&theme, window, cx);
+        let safe_mode = !self.run.read(cx).trusted();
         island(&theme)
             .id(BUILD_TOOL)
             .debug_selector(|| "build-output".to_owned())
@@ -628,6 +669,7 @@ impl Render for BuildOutputPanel {
                 "Build", GROUP, BUILD_TOOL, options, hide, &theme,
             ))
             .child(self.toolbar(&theme, cx))
+            .children(safe_mode.then(|| self.safe_mode_row(&theme, cx)))
             .child(
                 div()
                     .flex()

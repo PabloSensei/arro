@@ -28,23 +28,37 @@ impl CanonPath {
 
     /// `file:///home/user/a%20b.txt`.
     pub fn to_uri(&self) -> String {
-        let text = self.path.to_string_lossy();
-        let mut uri = String::from("file://");
-        for byte in text.bytes() {
-            match byte {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => uri.push(byte as char),
-                b'-' | b'_' | b'.' | b'~' | b'/' | b':' => uri.push(byte as char),
-                _ => uri.push_str(&format!("%{byte:02X}")),
-            }
-        }
-        uri
+        path_to_uri(&self.path)
     }
+}
+
+/// The `file:` URI of `path`, spelled the way [`CanonPath::to_uri`] spells it.
+/// Percent-encodes every byte outside the set RFC 3986 allows unencoded, so a path with
+/// spaces, parentheses, `+`, `@` or non-ASCII characters gives an ASCII URI.
+pub fn path_to_uri(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let mut uri = String::from("file://");
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => uri.push(byte as char),
+            b'-' | b'_' | b'.' | b'~' | b'/' | b':' => uri.push(byte as char),
+            _ => uri.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    uri
 }
 
 impl fmt::Display for CanonPath {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         self.path.display().fmt(f)
     }
+}
+
+/// Whether `path` names a share of another machine. Unix mounts a remote folder at a local
+/// path and hides the difference, so only the UNC spelling is known to be remote.
+pub fn is_remote_path(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    text.starts_with("//") || text.starts_with("\\\\")
 }
 
 /// The form two paths that name one file share on this system: macOS ignores case, the

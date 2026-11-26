@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -401,25 +401,23 @@ fn parse<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, ToolError> {
     serde_json::from_value(input.clone()).map_err(|error| ToolError::BadInput(error.to_string()))
 }
 
-/// A path of the agent inside the project, made absolute. `..` cannot leave the project, and
-/// nothing is read here: the path need not exist yet.
+/// A path of the agent inside the project. `..` cannot leave the project, and a link that
+/// points out of it is no path of the project. Nothing is read here: the path need not exist.
 fn resolve(scope: &SessionScope, path: &Path) -> Result<PathBuf, ToolError> {
-    let mut resolved = PathBuf::new();
-    for component in scope.project.join(path).components() {
-        match component {
-            Component::ParentDir => {
-                resolved.pop();
-            }
-            Component::CurDir => {}
-            other => resolved.push(other),
-        }
-    }
-    let lower = |path: &Path| PathBuf::from(path.to_string_lossy().to_lowercase());
-    if !lower(&resolved).starts_with(lower(&scope.project)) {
+    platform::inside_root(&scope.project, path).ok_or_else(|| {
         let shown = path.display();
-        return Err(ToolError::Denied(format!("{shown} is outside the project")));
+        ToolError::Denied(format!("{shown} is outside the project"))
+    })
+}
+
+/// The path a `file://` address of a read names, which is read as the file it points at.
+/// Any other path is kept as it is.
+fn local_path(path: PathBuf) -> Result<PathBuf, ToolError> {
+    match path.to_str() {
+        Some(text) if text.starts_with("file://") => platform::path_from_uri(text)
+            .ok_or_else(|| ToolError::BadInput(format!("{text} is not a file address"))),
+        _ => Ok(path),
     }
-    Ok(resolved)
 }
 
 /// An optional `projectPath` names the project the call belongs to. A different one is a
@@ -511,6 +509,21 @@ impl Drop for Working<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+/// The start of the session name of every connection of a client outside the window.
+const CLIENT_SESSION_PREFIX: &str = "mcp-";
+
+/// The session of one connection of a client outside the window. The name the client gave
+/// itself is only a part of it: `connection` is a random id that the server made for the
+/// connection, so an "Allow for this session" serves that connection and no other.
+pub fn client_session(client: &str, connection: &str) -> String {
+    let name: String = client
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .take(32)
+        .collect();
+    format!("{CLIENT_SESSION_PREFIX}{name}-{connection}")
 }
 
 pub struct ToolGateway {
@@ -609,6 +622,19 @@ impl ToolGateway {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .remove(session)
+    }
+
+    /// Takes back "Allow for this session" of every client outside the window, so the next
+    /// `Execute` call of any of them asks again. The sessions of the window's own agents keep
+    /// theirs. Returns how many were taken back.
+    pub fn revoke_client_sessions(&self) -> usize {
+        let mut allowed = self
+            .allowed_sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let before = allowed.len();
+        allowed.retain(|session| !session.starts_with(CLIENT_SESSION_PREFIX));
+        before - allowed.len()
     }
 
     /// The sessions the user allowed for their lifetime, by name.
@@ -981,7 +1007,10 @@ impl ToolGateway {
                 Ok(render::search(&query, &page))
             }
             READ_FILE => {
-                let input: IdeaReadInput = parse(input)?;
+                let mut input: IdeaReadInput = parse(input)?;
+                // A `file://` address is read as the file it names, under the same check as a path.
+                input.path = input.path.map(local_path).transpose()?;
+                input.file_path = input.file_path.map(local_path).transpose()?;
                 let path = input
                     .path
                     .clone()
@@ -2712,10 +2741,7 @@ fn parse_command(text: &str) -> Result<(String, Value), ToolError> {
 
 /// Whether a read path is an address of a class the language service can show.
 fn is_decompiled_address(path: &str) -> bool {
-    path.starts_with("jdt://")
-        || path.starts_with("jar://")
-        || path.starts_with("jrt://")
-        || path.starts_with("file://")
+    path.starts_with("jdt://") || path.starts_with("jar://") || path.starts_with("jrt://")
 }
 
 /// Keeps only the matches inside `paths`, and says how many were left.
@@ -4090,6 +4116,157 @@ mod tests {
         let client = scope_named("mcp");
         let visible = names(&gateway.visible_tools(&client));
         assert!(visible.contains(&"find_symbol"), "{visible:?}");
+    }
+
+    fn project_scope(project: &Path) -> SessionScope {
+        SessionScope {
+            session: "s1".to_string(),
+            project: project.to_path_buf(),
+            cwd: project.to_path_buf(),
+        }
+    }
+
+    /// A project folder under a test folder, next to a folder outside the project. Returns
+    /// `None` when the system makes no link, so the test that needs one skips.
+    fn project_with_link_out(name: &str) -> Option<(test_support::TempDir, PathBuf)> {
+        let temp = test_support::TempDir::new(name);
+        let project = temp.path().join("project");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(project.join("notes")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("key.txt"), "secret").unwrap();
+        test_support::link_dir(&outside, &project.join("docs")).ok()?;
+        test_support::link_dir(&project.join("notes"), &project.join("alias")).ok()?;
+        Some((temp, project))
+    }
+
+    #[test]
+    fn a_client_session_names_the_client_and_its_connection() {
+        assert_eq!(
+            client_session("Fixture Client", "0f"),
+            "mcp-FixtureClient-0f"
+        );
+        let long = client_session(&"x".repeat(100), "1");
+        assert_eq!(long.len(), "mcp-".len() + 32 + "-1".len(), "{long}");
+    }
+
+    #[test]
+    fn a_client_permission_serves_its_connection_and_no_other() {
+        let approval = Answering::new([ApprovalAnswer::Session, ApprovalAnswer::Deny]);
+        let gateway = asked_gateway(approval.clone());
+        let first = client_session("Fixture Client", "0a1b");
+        let second = client_session("Fixture Client", "2c3d");
+
+        assert!(was_allowed(gateway.call(
+            &scope_named(&first),
+            "build_project",
+            &json!({})
+        )));
+        assert!(was_allowed(gateway.call(
+            &scope_named(&first),
+            "run_tests",
+            &json!({})
+        )));
+        assert_eq!(
+            approval.asked(),
+            1,
+            "the connection that allowed it asks no more"
+        );
+        let other = gateway.call(&scope_named(&second), "build_project", &json!({}));
+        assert!(matches!(other, Err(ToolError::Denied(_))), "{other:?}");
+        assert_eq!(approval.asked(), 2, "the other connection asks on its own");
+    }
+
+    #[test]
+    fn revoking_the_client_sessions_leaves_the_agents_of_the_window_allowed() {
+        let approval = Answering::new([
+            ApprovalAnswer::Session,
+            ApprovalAnswer::Session,
+            ApprovalAnswer::Session,
+            ApprovalAnswer::Deny,
+        ]);
+        let gateway = asked_gateway(approval.clone());
+        let one = client_session("One", "1");
+        let two = client_session("Two", "2");
+        for session in [one.as_str(), two.as_str(), "claude-1"] {
+            assert!(was_allowed(gateway.call(
+                &scope_named(session),
+                "build_project",
+                &json!({})
+            )));
+        }
+        assert_eq!(approval.asked(), 3);
+
+        assert_eq!(gateway.revoke_client_sessions(), 2);
+        assert!(!gateway.session_allowed(&one));
+        assert!(gateway.session_allowed("claude-1"));
+        let asked_again = gateway.call(&scope_named(&one), "build_project", &json!({}));
+        assert!(
+            matches!(asked_again, Err(ToolError::Denied(_))),
+            "{asked_again:?}"
+        );
+        assert_eq!(approval.asked(), 4, "the client asks again");
+        assert!(was_allowed(gateway.call(
+            &scope_named("claude-1"),
+            "build_project",
+            &json!({})
+        )));
+        assert_eq!(approval.asked(), 4, "the agent of the window does not");
+        assert_eq!(
+            gateway.revoke_client_sessions(),
+            0,
+            "nothing is left to take back"
+        );
+    }
+
+    #[test]
+    fn a_link_out_of_the_project_is_refused_for_a_read_and_a_link_inside_is_read() {
+        let Some((_temp, project)) = project_with_link_out("gateway-link-read") else {
+            return;
+        };
+        let scope = project_scope(&project);
+
+        let refused =
+            allowing_gateway().call(&scope, "read_file", &json!({"path": "docs/key.txt"}));
+        assert!(
+            matches!(&refused, Err(ToolError::Denied(text)) if text.contains("outside the project")),
+            "{refused:?}"
+        );
+        let inside = allowing_gateway().call(&scope, "read_file", &json!({"path": "alias/a.txt"}));
+        assert!(inside.is_ok(), "{inside:?}");
+    }
+
+    #[test]
+    fn a_link_out_of_the_project_is_refused_for_a_patch() {
+        let Some((_temp, project)) = project_with_link_out("gateway-link-patch") else {
+            return;
+        };
+        let scope = project_scope(&project);
+        let patch =
+            "*** Begin Patch\n*** Update File: docs/key.txt\n@@\n-secret\n+public\n*** End Patch\n";
+
+        let refused = allowing_gateway().call(&scope, "apply_patch", &json!({"input": patch}));
+        assert!(
+            matches!(&refused, Err(ToolError::Denied(text)) if text.contains("outside the project")),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_address_is_read_under_the_same_check_as_a_path() {
+        let temp = test_support::TempDir::new("gateway-file-address");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let scope = project_scope(&project);
+
+        let outside =
+            allowing_gateway().call(&scope, "read_file", &json!({"path": "file:///etc/passwd"}));
+        assert!(matches!(outside, Err(ToolError::Denied(_))), "{outside:?}");
+        let inside = platform::CanonPath::new(project.join("a.txt"))
+            .unwrap()
+            .to_uri();
+        let read = allowing_gateway().call(&scope, "read_file", &json!({"path": inside}));
+        assert!(read.is_ok(), "{read:?}");
     }
 
     #[test]

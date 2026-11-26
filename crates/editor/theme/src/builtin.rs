@@ -20,6 +20,7 @@ pub(crate) const FILES: &[(&str, &str)] = &[
     ("nord", include_str!("../themes/nord.theme.json")),
     ("mocha", include_str!("../themes/mocha.theme.json")),
     ("paper", include_str!("../themes/paper.theme.json")),
+    ("nightfall", include_str!("../themes/nightfall.theme.json")),
 ];
 
 /// The tokens of a built-in theme. The tests check every file, so a broken one stops the

@@ -16,7 +16,9 @@ use platform::NO_WINDOW;
 use crate::console::{CommandRecord, command_console};
 
 /// Before the subcommand on every call. Reads must not take `index.lock`, or a harness
-/// that runs `git add` at the same moment fails. Paths come unquoted and in UTF-8.
+/// that runs `git add` at the same moment fails. Paths come unquoted and in UTF-8. A
+/// file-system monitor of `.git/config` is a program of the project, so it stays off for
+/// every call of Arro; hooks stay on, a commit needs them.
 const GLOBAL_ARGS: &[&str] = &[
     "--no-optional-locks",
     "-c",
@@ -25,6 +27,8 @@ const GLOBAL_ARGS: &[&str] = &[
     "core.quotepath=false",
     "-c",
     "color.ui=false",
+    "-c",
+    "core.fsmonitor=false",
 ];
 /// Another git holds the lock for the length of one command, a short wait is enough.
 const LOCK_RETRIES: u32 = 40;
@@ -289,6 +293,7 @@ fn is_lock_text(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn a_lock_held_by_another_git_is_recognized() {
@@ -355,5 +360,88 @@ mod tests {
         let version = git.run(Path::new("."), ["--version"]).unwrap();
 
         assert!(String::from_utf8_lossy(&version).starts_with("git version"));
+    }
+
+    #[test]
+    fn every_call_disables_the_file_system_monitor_of_the_repository() {
+        let git = GitRunner::new(PathBuf::from("git"));
+
+        let command = git.command(Path::new("."));
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-c", "core.fsmonitor=false"]),
+            "git runs without the monitor of the repository: {args:?}"
+        );
+    }
+
+    /// The monitor of a repository is a program that `.git/config` names. A status of the
+    /// window must not start it: the control run proves that the monitor works at all, so
+    /// the missing marker after the status is the answer of the guard.
+    #[test]
+    fn a_status_does_not_run_the_monitor_of_the_repository() {
+        let Some(git) = GitRunner::from_env() else {
+            return;
+        };
+        let folder = test_support::TempDir::new("git-fsmonitor");
+        let root = folder.path();
+        git.run(root, ["init", "-q"]).unwrap();
+        let marker = root.join("fsmonitor-ran.txt");
+        let marker_path = marker.to_string_lossy().replace('\\', "/");
+        #[cfg(windows)]
+        let (script, text) = (
+            root.join("monitor.bat"),
+            format!("@echo off\r\necho ran> \"{marker_path}\"\r\n"),
+        );
+        #[cfg(not(windows))]
+        let (script, text) = (
+            root.join("monitor.sh"),
+            format!("#!/bin/sh\necho ran > '{marker_path}'\n"),
+        );
+        fs::write(&script, text).unwrap();
+        #[cfg(unix)]
+        {
+            let status = Command::new("chmod")
+                .arg("+x")
+                .arg(&script)
+                .status()
+                .unwrap();
+            assert!(status.success(), "the monitor script is not executable");
+        }
+        let script_path = script.to_string_lossy().replace('\\', "/");
+        git.run(root, ["config", "core.fsmonitor", &script_path])
+            .unwrap();
+
+        // The control run: the repository really does run the monitor.
+        let control = Command::new(&git.program)
+            .current_dir(root)
+            .args([
+                "-c",
+                &format!("core.fsmonitor={script_path}"),
+                "status",
+                "--porcelain",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            control.status.success(),
+            "the control status failed: {}",
+            String::from_utf8_lossy(&control.stderr)
+        );
+        let ran = marker.exists();
+        let _ = fs::remove_file(&marker);
+        assert!(ran, "the control run did not start the monitor");
+
+        let repository = crate::Repository::open(git, root).unwrap();
+        let _ = repository.status().unwrap();
+
+        assert!(
+            !marker.exists(),
+            "git status started a program named by .git/config"
+        );
     }
 }

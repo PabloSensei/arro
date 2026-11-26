@@ -465,8 +465,10 @@ where
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 let body = message.get("body").cloned().unwrap_or(Value::Null);
+                // Nobody takes the events any more: the connection ends here, so that the
+                // requests still waiting end too.
                 if events.send(Event::parse(name, body)).is_err() {
-                    return;
+                    break;
                 }
             }
             Some("request") => {
@@ -627,6 +629,33 @@ mod tests {
         let (_client, mut events) = Client::start(output, input);
         drop(ours);
         assert_eq!(events.recv().await, Some(Event::Closed));
+    }
+
+    #[tokio::test]
+    async fn a_closed_event_receiver_ends_the_requests_that_wait() {
+        let (ours, theirs) = tokio::io::duplex(4096);
+        let (output, input) = tokio::io::split(theirs);
+        let (client, events) = Client::start(output, input);
+        drop(events);
+        let far = tokio::spawn(async move {
+            let mut far = BufReader::new(ours);
+            // The request is pending once the far side has read it.
+            let request = read_message(&mut far).await;
+            assert_eq!(request["command"], "threads");
+            // An event nobody receives ends the reader, and the request with it.
+            write_message(
+                &mut far,
+                json!({"seq": 1, "type": "event", "event": "output", "body": {}}),
+            )
+            .await;
+            far
+        });
+        let answer =
+            tokio::time::timeout(Duration::from_secs(5), client.request("threads", json!({})))
+                .await
+                .expect("the request waited for the adapter's own limit");
+        assert!(matches!(answer, Err(Error::Closed)), "{answer:?}");
+        drop(far.await.unwrap());
     }
 
     #[test]

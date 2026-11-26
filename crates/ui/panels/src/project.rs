@@ -243,12 +243,17 @@ struct TreeClipboard {
 
 impl Global for TreeClipboard {}
 
-/// Copies a file or a folder with everything in it. Blocks.
+/// Copies a file or a folder with everything in it. Blocks. A symbolic link or a junction
+/// inside the folder is left out rather than entered: a junction that leads back into the copy
+/// would never end, and one that leads elsewhere would copy another folder into this one.
 fn copy_path(from: &Path, to: &Path) -> std::io::Result<()> {
     if from.is_dir() {
         std::fs::create_dir_all(to)?;
         for entry in std::fs::read_dir(from)? {
             let entry = entry?;
+            if entry.file_type()?.is_symlink() {
+                continue;
+            }
             copy_path(&entry.path(), &to.join(entry.file_name()))?;
         }
         Ok(())
@@ -1073,10 +1078,43 @@ impl ProjectPanel {
         if let [source] = paths.as_slice()
             && source.is_file()
             && !(cut && source.parent() == Some(target.as_path()))
-            && let Some(stem) = self.class_stem(source, cx)
+            && self.may_be_class(source, cx)
         {
-            self.ask_copy_class(source.clone(), target.clone(), stem, cut, window, cx);
+            // The text is read in the background; the window follows once it is known.
+            let stem = self.class_stem(source, cx);
+            let source = source.clone();
+            cx.spawn_in(window, async move |this, cx| {
+                let stem = stem.await;
+                this.update_in(cx, |this, window, cx| match stem {
+                    Some(stem) => this.ask_copy_class(source, target, stem, cut, window, cx),
+                    None => this.paste_plain(paths, target, cut, window, cx),
+                })
+                .ok();
+            })
+            .detach();
             return;
+        }
+        self.paste_plain(paths, target, cut, window, cx);
+    }
+
+    /// Ctrl+V of items that are not a class: they are copied or moved into `target`. A cut
+    /// takes the tabs and buffers of the items along, after their unsaved text is written to
+    /// the old places, so the tabs that follow the move hold that text.
+    fn paste_plain(
+        &mut self,
+        paths: Vec<PathBuf>,
+        target: PathBuf,
+        cut: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if cut {
+            let save = |workspace: &mut Workspace, cx: &mut Context<Workspace>| {
+                for from in &paths {
+                    workspace.save_tabs_under(from, cx);
+                }
+            };
+            self.workspace.update(cx, save).ok();
         }
         // A cut beside the source does nothing: the clipboard is kept as it is.
         let acts = paths
@@ -1138,19 +1176,47 @@ impl ProjectPanel {
         .detach();
     }
 
-    /// The stem of `source` for the Copy Class window, when its language names the
-    /// declaration. The buffer is the text when it is open and has unsaved edits.
-    fn class_stem(&self, source: &Path, cx: &mut Context<Self>) -> Option<String> {
-        let stem = source.file_stem()?.to_str()?.to_owned();
-        let support = cx.try_global::<Semantic>()?;
-        let text = self
+    /// Whether the language of `source` may name its declaration. Only such a file is read for
+    /// the Copy Class window.
+    fn may_be_class(&self, source: &Path, cx: &App) -> bool {
+        cx.try_global::<Semantic>()
+            .is_some_and(|support| support.0.matches(source))
+    }
+
+    /// The stem of `source` for the Copy Class window, when its language names the declaration.
+    /// The text is read on the background executor, unless the file is open with unsaved edits:
+    /// then the window holds the text.
+    fn class_stem(&self, source: &Path, cx: &mut Context<Self>) -> Task<Option<String>> {
+        let Some(stem) = source
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_owned)
+        else {
+            return Task::ready(None);
+        };
+        let Some(support) = cx
+            .try_global::<Semantic>()
+            .map(|semantic| semantic.0.clone())
+        else {
+            return Task::ready(None);
+        };
+        let open = self
             .workspace
             .read_with(cx, |workspace, app| {
-                crate::copy_class::source_text(workspace, source, app)
+                crate::copy_class::unsaved_text(workspace, source, app)
             })
             .ok()
-            .flatten()?;
-        crate::copy_class::knows_declaration(Some(support), source, &text, &stem).then_some(stem)
+            .flatten();
+        let source = source.to_path_buf();
+        cx.background_executor().spawn(async move {
+            let text = match open {
+                Some(text) => text,
+                None => std::fs::read_to_string(&source).ok()?,
+            };
+            let semantic = Semantic(support);
+            crate::copy_class::knows_declaration(Some(&semantic), &source, &text, &stem)
+                .then_some(stem)
+        })
     }
 
     /// The Copy Class window is done: a copy is written, a cut goes to the language to
@@ -2010,12 +2076,32 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !folder
-            && from.is_file()
-            && let Some(stem) = self.class_stem(&from, cx)
-        {
-            return self.ask_copy_class(from, target_folder, stem, false, window, cx);
+        if !folder && self.may_be_class(&from, cx) && from.is_file() {
+            // The text is read in the background; the window follows once it is known.
+            let stem = self.class_stem(&from, cx);
+            cx.spawn_in(window, async move |this, cx| {
+                let stem = stem.await;
+                this.update_in(cx, |this, window, cx| match stem {
+                    Some(stem) => this.ask_copy_class(from, target_folder, stem, false, window, cx),
+                    None => this.copy_dropped_plain(from, folder, target_folder, window, cx),
+                })
+                .ok();
+            })
+            .detach();
+            return;
         }
+        self.copy_dropped_plain(from, folder, target_folder, window, cx);
+    }
+
+    /// Ctrl+drop of an item that is not a class: the copy is written in the background.
+    fn copy_dropped_plain(
+        &mut self,
+        from: PathBuf,
+        folder: bool,
+        target_folder: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let task = cx.background_executor().spawn(async move {
             let to = plan_drop_copy(&from, &target_folder, folder)?;
             copy_path(&from, &to).map_err(|error| error.to_string())?;
@@ -2272,37 +2358,42 @@ impl ProjectPanel {
     fn delete_paths(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         let history = crate::history::get(cx);
         let targets = paths.clone();
+        // The files deleted before a failure come back with its error, so that their tabs still
+        // close: a tab left open would write the file back.
         let task = cx.background_executor().spawn(async move {
+            let mut deleted = Vec::new();
             for target in &targets {
                 if let Some(history) = &history {
                     let _ = history.record_tree(target, local_history::Cause::BeforeDelete);
                 }
-                delete_on_disk(target)?;
+                if let Err(error) = delete_on_disk(target) {
+                    return (deleted, Err(error));
+                }
                 if let Some(history) = &history {
                     let _ = history.record_removed(target);
                 }
+                deleted.push(target.clone());
             }
-            Ok::<(), std::io::Error>(())
+            (deleted, Ok(()))
         });
         cx.spawn_in(window, async move |this, cx| {
-            let result = task.await;
-            this.update_in(cx, |this, window, cx| match result {
-                Ok(()) => {
-                    for path in &paths {
-                        let close = |workspace: &mut Workspace, cx: &mut Context<Workspace>| {
-                            workspace.discard_tabs_under(path, window, cx)
-                        };
-                        this.workspace.update(cx, close).ok();
-                        this.tree.forget(path);
-                    }
+            let (deleted, result) = task.await;
+            this.update_in(cx, |this, window, cx| {
+                for path in &deleted {
+                    let close = |workspace: &mut Workspace, cx: &mut Context<Workspace>| {
+                        workspace.discard_tabs_under(path, window, cx)
+                    };
+                    this.workspace.update(cx, close).ok();
+                    this.tree.forget(path);
+                }
+                if !deleted.is_empty() {
                     this.selection.clear();
                     this.anchor = None;
-                    this.state_changed(cx);
-                    this.reload(cx);
                 }
-                Err(error) => {
-                    let text = error.to_string();
-                    this.report("Cannot delete", text, cx);
+                this.state_changed(cx);
+                this.reload(cx);
+                if let Err(error) = result {
+                    this.report("Cannot delete", error.to_string(), cx);
                 }
             })
             .ok();
@@ -2338,17 +2429,38 @@ impl ProjectPanel {
     /// Alt+Delete: opens the file and lets the editor check its usages before the
     /// type alone in it is deleted. A file without a language keeps the prompt.
     fn safe_delete(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let offset = cx
+        // The file is read on the background executor: a big file must not stall the window.
+        let support = cx
             .try_global::<Semantic>()
-            .and_then(|semantic| {
-                std::fs::read_to_string(&path)
-                    .ok()
-                    .map(|text| (text, semantic))
+            .map(|semantic| semantic.0.clone());
+        let task = cx.background_executor().spawn({
+            let path = path.clone();
+            async move {
+                let support = support?;
+                let text = std::fs::read_to_string(&path).ok()?;
+                support.syntax().first_type_offset(&text)
+            }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let offset = task.await;
+            this.update_in(cx, |this, window, cx| match offset {
+                Some(offset) => this.safe_delete_at(path, offset, window, cx),
+                None => this.ask_delete(path, window, cx),
             })
-            .and_then(|(text, semantic)| semantic.0.syntax().first_type_offset(&text));
-        let Some(offset) = offset else {
-            return self.ask_delete(path, window, cx);
-        };
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Safe Delete once the offset of the first type of the file is known: the file opens and
+    /// the editor checks its usages.
+    fn safe_delete_at(
+        &mut self,
+        path: PathBuf,
+        offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         cx.default_global::<crate::editor_tab::PendingSafeDelete>()
             .0 = Some((path.clone(), offset));
         let view = self.workspace.update(cx, |workspace, cx| {
@@ -3081,5 +3193,31 @@ impl Render for ProjectPanel {
                 .flex_1()
                 .min_h_0(),
             )
+    }
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use std::fs;
+
+    use super::copy_path;
+
+    /// A folder with a junction back into itself is copied, and the junction is left out: the
+    /// copy ends, and the copy holds the files and no link.
+    #[test]
+    fn a_copy_leaves_out_a_link_back_into_the_folder() {
+        let root = test_support::scratch("project-copy-link");
+        let source = root.join("src");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("Main.txt"), "main").unwrap();
+        test_support::link_dir(&source, &source.join("again")).expect("a link to the folder");
+
+        copy_path(&source, &root.join("copy")).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("copy").join("Main.txt")).unwrap(),
+            "main"
+        );
+        assert!(!root.join("copy").join("again").exists());
     }
 }

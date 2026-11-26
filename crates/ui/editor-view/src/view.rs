@@ -38,7 +38,7 @@ use crate::semantic::{
     CompletionMode, Lsp, Reveals, completion_doc_rows, completion_kind_icon, location_label,
     signature_segments,
 };
-use crate::state::{Conflict, EditorState, LoadError, Saved};
+use crate::state::{Conflict, EditorState, LoadError, SaveResult, Saved};
 use crate::style::EditorStyle;
 
 const BLINK: Duration = Duration::from_millis(530);
@@ -641,6 +641,9 @@ pub enum EditorEvent {
     Dirty(bool),
     Saved,
     Failed(SharedString),
+    /// The save met characters the encoding of the file cannot store, so nothing was
+    /// written. The window offers Save as UTF-8.
+    Unmappable(SharedString),
     /// A message about a language answer that the status bar shows, such as a name the
     /// language refuses to rename.
     Status(SharedString),
@@ -1201,6 +1204,9 @@ pub struct EditorView {
     /// a blocking save may write while a background one is on its way; the task that
     /// writes lowers it, also when it panics, so the view never stays saving.
     saving: Arc<AtomicUsize>,
+    /// A save asked for while another one is writing: it starts when the write ends, with
+    /// the text as it is then, so an older snapshot never lands after a newer one.
+    save_again: bool,
     /// The text and the format of the last save of this view that reached the disk.
     last_saved: Option<(String, FileFormat)>,
     pending_caret: Option<(usize, usize)>,
@@ -1799,6 +1805,7 @@ impl EditorView {
             drag: None,
             was_dirty: false,
             saving: Arc::new(AtomicUsize::new(0)),
+            save_again: false,
             last_saved: None,
             pending_caret: None,
             failed: None,
@@ -3442,6 +3449,12 @@ impl EditorView {
     /// The save without the language: the rules of `.editorconfig` and the settings go
     /// into the buffer, then its text is written.
     fn write_save(&mut self, cx: &mut Context<Self>) {
+        // One write of this view at a time: a second ask waits for the first and then
+        // writes the text as it is at that moment.
+        if self.is_saving() {
+            self.save_again = true;
+            return;
+        }
         self.prepare_save(cx);
         let Some(state) = &self.state else {
             return;
@@ -3457,7 +3470,14 @@ impl EditorView {
         cx.spawn(async move |this, cx| {
             let saved = task.await;
             guard.finish();
-            this.update(cx, |this, cx| this.saved(&saved, cx)).ok();
+            this.update(cx, |this, cx| {
+                this.saved(&saved, cx);
+                if this.save_again {
+                    this.save_again = false;
+                    this.save(cx);
+                }
+            })
+            .ok();
         })
         .detach();
     }
@@ -3561,9 +3581,16 @@ impl EditorView {
             return Some("the file is read-only".into());
         }
         let saved = EditorState::save_snapshot(&self.path, state.snapshot_for_save());
-        let result = saved.result.clone();
+        let result = match &saved.result {
+            SaveResult::Saved => None,
+            SaveResult::Unmappable(encoding) => Some(format!(
+                "{} contains characters that {encoding} cannot store",
+                self.path.display()
+            )),
+            SaveResult::Failed(message) => Some(message.clone()),
+        };
         self.saved(&saved, cx);
-        result.err()
+        result
     }
 
     fn saved(&mut self, saved: &Saved, cx: &mut Context<Self>) {
@@ -3574,11 +3601,18 @@ impl EditorView {
             self.last_saved = Some((saved.text.clone(), saved.format.clone()));
         }
         match &saved.result {
-            Ok(()) => {
+            SaveResult::Saved => {
                 self.saved_on_disk();
                 cx.emit(EditorEvent::Saved);
             }
-            Err(message) => cx.emit(EditorEvent::Failed(message.clone().into())),
+            SaveResult::Unmappable(encoding) => {
+                let message = format!(
+                    "{} contains characters that {encoding} cannot store",
+                    self.path.display()
+                );
+                cx.emit(EditorEvent::Unmappable(message.into()));
+            }
+            SaveResult::Failed(message) => cx.emit(EditorEvent::Failed(message.clone().into())),
         }
         self.notify_dirty(cx);
         cx.notify();

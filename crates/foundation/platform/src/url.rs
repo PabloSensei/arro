@@ -1,12 +1,17 @@
 //! The parts of a URL the platform layer reads: the path of a `file://` URL.
 
 /// The part of a `file:` URI after the scheme and a `localhost` authority, still
-/// percent-encoded. `None` for any other scheme.
+/// percent-encoded. Accepts both `file:///C:/dir` and the `file:/C:/dir` spelling of
+/// `File.toURI`. `None` for any other scheme.
 pub(crate) fn file_rest(uri: &str) -> Option<&str> {
-    let rest = uri.strip_prefix("file://")?;
-    match rest.strip_prefix("localhost") {
+    let rest = uri.strip_prefix("file:")?;
+    let Some(after) = rest.strip_prefix("//") else {
+        // `File.toURI` writes one slash before the path.
+        return Some(rest);
+    };
+    match after.strip_prefix("localhost") {
         Some(local) if local.is_empty() || local.starts_with('/') => Some(local),
-        _ => Some(rest),
+        _ => Some(after),
     }
 }
 

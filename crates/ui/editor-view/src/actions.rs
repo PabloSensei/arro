@@ -331,6 +331,8 @@ pub(crate) fn server_edits(store: &RopeStore, edits: Vec<DocumentEdit>) -> Optio
         })
         .collect();
     edits.sort_by_key(|(range, _)| (range.start, range.end));
+    // Two identical places in one answer are one replacement, not an overlap.
+    edits.dedup_by(|later, earlier| later.0 == earlier.0 && later.1 == earlier.1);
     let overlap = edits.windows(2).any(|pair| pair[1].0.start < pair[0].0.end);
     if overlap {
         return None;

@@ -1,7 +1,7 @@
 # Where the colors come from
 
 The palette is Arro's own: the window chrome and the code highlighting of the `Dark`,
-`Light`, `High Contrast`, `Retro` and `Paper` themes. No values are taken from
+`Light`, `High Contrast`, `Retro`, `Paper` and `Nightfall` themes. No values are taken from
 `intellij-community` or from an installed IDE.
 
 Two themes follow published palettes:

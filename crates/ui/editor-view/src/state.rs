@@ -39,7 +39,22 @@ pub struct Saved {
     pub text: String,
     /// The encoding, BOM and line ends the text went out in.
     pub format: text_core::FileFormat,
-    pub result: Result<(), String>,
+    pub result: SaveResult,
+}
+
+/// How a write ended. A text with characters the encoding of the file cannot store is
+/// refused before anything reaches the disk; the caller offers Save as UTF-8.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SaveResult {
+    Saved,
+    Unmappable(&'static str),
+    Failed(String),
+}
+
+impl SaveResult {
+    pub fn is_ok(&self) -> bool {
+        matches!(self, Self::Saved)
+    }
 }
 
 /// Which lines a save cleans of the spaces and tabs at their end.
@@ -177,7 +192,7 @@ pub struct EditorState {
     /// Insert replaces the character under the caret.
     overwrite: bool,
     /// The closing characters the editor inserted together with an opening one.
-    auto_closers: Vec<usize>,
+    auto_closers: Vec<AutoPair>,
     /// The `.editorconfig` properties of the file, for the text of a save.
     properties: text_core::Properties,
     /// The indentation of this file: its unit, the width of a tab and where it came from.
@@ -195,6 +210,13 @@ pub struct EditorState {
     block: Option<Block>,
     /// The query of the units Move Statement moves, compiled from the language.
     move_units: Option<Query>,
+}
+
+/// An opening character and the closing one the editor inserted after it, by offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AutoPair {
+    open: usize,
+    close: usize,
 }
 
 /// Edit places kept.
@@ -486,7 +508,13 @@ impl EditorState {
     /// Writes the text as it was at `snapshot`. Blocks: not for the UI thread.
     pub fn save_snapshot(path: &Path, snapshot: (String, text_core::FileFormat, u64)) -> Saved {
         let (text, format, version) = snapshot;
-        let result = write_file(path, &text, &format).map_err(|error| error.to_string());
+        let result = match text_core::unmappable_encoding(&text, &format) {
+            Some(encoding) => SaveResult::Unmappable(encoding),
+            None => match write_file(path, &text, &format) {
+                Ok(()) => SaveResult::Saved,
+                Err(error) => SaveResult::Failed(error.to_string()),
+            },
+        };
         Saved {
             version,
             text,
@@ -644,7 +672,7 @@ impl EditorState {
     /// The buffer is clean when its text is the saved text again. The history cannot say
     /// so after an edit that brings the text back, so this asks the text itself.
     pub(crate) fn settle_saved_text(&mut self) {
-        if self.buffer.text() == self.saved_text {
+        if self.buffer.text() == self.saved_text && self.buffer.is_saved_format() {
             self.buffer.mark_saved();
         }
     }
@@ -672,14 +700,18 @@ impl EditorState {
 
     fn take_disk_text(&mut self, decoded: Decoded) -> Option<Change> {
         self.catch_up();
-        let edit = difference(&self.buffer.text(), &decoded.text)?;
-        let change = self
-            .buffer
-            .apply(vec![edit], None, EditSource::External, EditKind::Command);
+        let edit = difference(&self.buffer.text(), &decoded.text);
+        let change = edit.map(|edit| {
+            self.buffer
+                .apply(vec![edit], None, EditSource::External, EditKind::Command)
+        });
+        // The file on disk may have changed its line ends or encoding; that is not an
+        // edit of the text, so it comes in outside the undo history with the saved mark.
+        self.buffer.set_format(decoded.format);
         self.buffer.mark_saved();
         self.saved_text = self.buffer.text();
         self.read_only = !decoded.lossless;
-        self.finish_with(change, false)
+        change.and_then(|change| self.finish_with(change, false))
     }
 
     /// Takes a new text for a read-only document, as one external edit: undo brings the
@@ -834,6 +866,7 @@ impl EditorState {
         self.buffer
             .set_selections(SelectionSet::single(Selection::caret(offset)));
         self.goal = None;
+        self.prune_auto_closers();
     }
 
     /// How many characters the primary selection covers.
@@ -918,10 +951,14 @@ impl EditorState {
                     *at = shift_annotation(*at, step);
                 }
             }
-            self.auto_closers
-                .retain(|at| !step.iter().any(|edit| edit.range.contains(at)));
-            for at in &mut self.auto_closers {
-                *at = transform_offset(*at, step);
+            self.auto_closers.retain(|pair| {
+                !step
+                    .iter()
+                    .any(|edit| edit.range.contains(&pair.open) || edit.range.contains(&pair.close))
+            });
+            for pair in &mut self.auto_closers {
+                pair.open = transform_offset(pair.open, step);
+                pair.close = transform_offset(pair.close, step);
             }
         }
         normalize_spans(&mut self.spans, self.buffer.store().len());
@@ -938,7 +975,31 @@ impl EditorState {
         // The text changed under the rectangle: its columns point at the text no more.
         self.block = None;
         self.reveal();
+        self.prune_auto_closers();
         Some(change)
+    }
+
+    /// Keeps an auto-inserted closer only while an empty caret stands on its line, after
+    /// the opening character and at or before the closer. A caret that left the pair or
+    /// its line makes the closer the text's own, so Tab no longer steps over it.
+    fn prune_auto_closers(&mut self) {
+        if self.auto_closers.is_empty() {
+            return;
+        }
+        let store = self.buffer.store();
+        let heads: Vec<usize> = self
+            .buffer
+            .selections()
+            .iter()
+            .filter(|selection| selection.is_empty())
+            .map(|selection| selection.head)
+            .collect();
+        self.auto_closers.retain(|pair| {
+            let line = store.offset_to_line(pair.close);
+            heads.iter().any(|&head| {
+                pair.open < head && head <= pair.close && store.offset_to_line(head) == line
+            })
+        });
     }
 
     fn remember_place(&mut self) {
@@ -1003,10 +1064,17 @@ impl EditorState {
         self.block = None;
         self.buffer.set_selections(selections);
         self.reveal();
+        self.prune_auto_closers();
     }
 
     /// Runs an action by its keymap name. Returns the change to hand to the parser.
     pub fn perform(&mut self, action: &str, page_rows: usize) -> Option<Change> {
+        let change = self.run_action(action, page_rows);
+        self.prune_auto_closers();
+        change
+    }
+
+    fn run_action(&mut self, action: &str, page_rows: usize) -> Option<Change> {
         self.catch_up();
         // Only the keys that stretch the rectangle and Tab, which pads a short line up to
         // its column, read the block; anything else starts from the carets alone.
@@ -1784,10 +1852,30 @@ impl EditorState {
             if unit.starts_with('\t') {
                 return self.type_text("\t");
             }
-            let head = selections.primary().head;
-            let column = head - store.line_to_offset(store.offset_to_line(head));
-            let spaces = unit.len() - column % unit.len();
-            return self.type_text(&" ".repeat(spaces));
+            let tab_width = self.tab_width();
+            if self.block.is_some() {
+                // A column selection pads all its lines alike, by the padding of the primary.
+                let primary = [selections.primary().head];
+                let spaces = tab_spaces(&store, &primary, tab_width, unit.len());
+                return self.type_text(&" ".repeat(spaces[0]));
+            }
+            let heads: Vec<usize> = selections.iter().map(|selection| selection.head).collect();
+            let spaces = tab_spaces(&store, &heads, tab_width, unit.len());
+            let mut inserted = 0;
+            let mut edits = Vec::with_capacity(heads.len());
+            let mut after = Vec::with_capacity(heads.len());
+            for (head, pad) in heads.iter().zip(&spaces) {
+                edits.push(Edit::insert(*head, " ".repeat(*pad)));
+                inserted += *pad;
+                after.push(Selection::caret(*head + inserted));
+            }
+            let kind = if spaces.iter().any(|pad| *pad > 1) {
+                EditKind::Command
+            } else {
+                EditKind::Typing
+            };
+            let after = SelectionSet::from_vec(after);
+            return self.edit(|buffer| buffer.apply(edits, Some(after), EditSource::User, kind));
         }
         let mut lines: Vec<usize> = Vec::new();
         for selection in selections.iter() {
@@ -2335,7 +2423,7 @@ impl EditorState {
             let Some(next) = store.char_at(head).filter(|c| is_closer(*c)) else {
                 return false;
             };
-            let inserted = self.auto_closers.contains(&head);
+            let inserted = self.auto_closers.iter().any(|pair| pair.close == head);
             let paired = store
                 .char_at(store.prev_boundary(head))
                 .is_some_and(|open| closing_of(open) == Some(next));
@@ -2345,7 +2433,7 @@ impl EditorState {
             after.push(Selection::caret(store.next_boundary(head)));
         }
         self.auto_closers
-            .retain(|at| !after.iter().any(|s| s.head > *at));
+            .retain(|pair| !after.iter().any(|s| s.head > pair.close));
         self.buffer.set_selections(SelectionSet::from_vec(after));
         true
     }
@@ -2494,6 +2582,7 @@ impl EditorState {
         } else {
             self.buffer.set_selections(SelectionSet::single(selection));
         }
+        self.prune_auto_closers();
     }
 
     /// Alt+drag: a block of the text between two offsets, one selection per line, next to
@@ -2517,6 +2606,7 @@ impl EditorState {
         }
         self.buffer
             .set_selections(SelectionSet::from_vec(selections));
+        self.prune_auto_closers();
     }
 
     /// The carets as they are, to start a block drag from.
@@ -2534,6 +2624,7 @@ impl EditorState {
             }
         });
         self.buffer.set_selections(moved);
+        self.prune_auto_closers();
     }
 
     /// A drag that began with a double click: the whole words between the word of
@@ -2549,6 +2640,7 @@ impl EditorState {
         };
         self.buffer
             .set_selections(SelectionSet::single(Selection::new(range.start, range.end)));
+        self.prune_auto_closers();
     }
 
     /// A drag that began with a triple click: the whole lines between the line of
@@ -2566,6 +2658,7 @@ impl EditorState {
         };
         self.buffer
             .set_selections(SelectionSet::single(Selection::new(start, end)));
+        self.prune_auto_closers();
     }
 
     /// IME: replaces `range`, or the marked text, or the selection.
@@ -2581,6 +2674,14 @@ impl EditorState {
         }
         let target = self.marked.take().or(range);
         let text = normalize_newlines(text);
+        // A composition starts at the primary caret alone and stays there: its updates and
+        // its commit reach the marked text of that caret only, so the other carets would
+        // keep the first part of it.
+        if mark && target.is_none() {
+            self.block = None;
+            let primary = self.buffer.selections().primary();
+            self.buffer.set_selections(SelectionSet::single(primary));
+        }
         let single = text.chars().count() == 1 && !mark;
         let typed = single.then(|| text.chars().next()).flatten();
         let in_block = target.is_none() && self.block.is_some();
@@ -2589,6 +2690,22 @@ impl EditorState {
             && single
             && self.buffer.selections().iter().all(Selection::is_empty);
         let start = lone.then(|| self.buffer.selections().primary().head);
+        // Typing a closing character over the same one moves the caret past it: the closer
+        // the editor inserted there is the user's now.
+        if lone
+            && let Some(character) = typed
+            && is_closer(character)
+        {
+            let store = self.buffer.store();
+            let over: Vec<usize> = self
+                .buffer
+                .selections()
+                .iter()
+                .map(|selection| selection.head)
+                .filter(|head| store.char_at(*head) == Some(character))
+                .collect();
+            self.auto_closers.retain(|pair| !over.contains(&pair.close));
+        }
         let change = match target {
             Some(range) => {
                 let caret = range.start + text.len();
@@ -2621,13 +2738,17 @@ impl EditorState {
         {
             let at = head + text.len();
             if self.buffer.store().char_at(at) == Some(close) {
-                self.auto_closers.push(at);
+                self.auto_closers.push(AutoPair {
+                    open: head,
+                    close: at,
+                });
             }
         }
         if mark && !text.is_empty() {
             let end = self.buffer.selections().primary().head;
             self.marked = Some(end - text.len()..end);
         }
+        self.prune_auto_closers();
         changed
     }
 
@@ -2674,6 +2795,7 @@ impl EditorState {
         self.buffer
             .set_selections(SelectionSet::single(Selection::new(range.start, range.end)));
         self.reveal();
+        self.prune_auto_closers();
     }
 
     /// Puts the primary caret at `offset`; with `extend` the selection keeps its anchor.
@@ -2934,11 +3056,58 @@ fn offset_of_column(store: &RopeStore, line: usize, column: usize) -> usize {
     start + within
 }
 
+/// The spaces a Tab inserts at each caret: the padding up to the next multiple of the
+/// unit, counted in the columns the text shows. A tab reaches the next stop, every other
+/// character takes one column. Carets on one line count the padding of the carets before
+/// them, since that padding is part of the text by the time the later caret is reached.
+fn tab_spaces(store: &RopeStore, heads: &[usize], tab_width: usize, step: usize) -> Vec<usize> {
+    let tab_width = tab_width.max(1);
+    let step = step.max(1);
+    let mut spaces = Vec::with_capacity(heads.len());
+    let mut line = None;
+    let mut from = 0;
+    let mut column = 0;
+    for &head in heads {
+        let current = store.offset_to_line(head);
+        if line != Some(current) {
+            line = Some(current);
+            from = store.line_to_offset(current);
+            column = 0;
+        }
+        for character in store.slice(from..head).chars() {
+            column = if character == '\t' {
+                column + tab_width - column % tab_width
+            } else {
+                column + 1
+            };
+        }
+        let pad = step - column % step;
+        spaces.push(pad);
+        column += pad;
+        from = head;
+    }
+    spaces
+}
+
 /// The lines of a pasted text after the first take `base`, and the piece of indentation
-/// that all its lines share is dropped first, so a block keeps its own shape.
+/// that all of them share is dropped first, so a block keeps its own shape. A block
+/// copied from the first character of `if (x) {` to its `}` has a first line with no
+/// indentation of its own: when the first line is not indented and the last one closes a
+/// bracket, the first line does not count for the shared indentation. A block copied from
+/// the start of its line, as `one` and `  two`, keeps its shape.
 fn reindent_paste(text: &str, base: &str) -> String {
     let lines: Vec<&str> = text.split('\n').collect();
-    let common = common_indent(&lines);
+    let closes = lines
+        .iter()
+        .rev()
+        .map(|line| line.trim_start_matches([' ', '\t']))
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| line.starts_with(['}', ')', ']']));
+    let common = if lines.len() > 1 && !lines[0].starts_with([' ', '\t']) && closes {
+        common_indent(&lines[1..])
+    } else {
+        common_indent(&lines)
+    };
     let mut out = String::with_capacity(text.len() + base.len() * lines.len());
     for (index, line) in lines.iter().enumerate() {
         if index > 0 {

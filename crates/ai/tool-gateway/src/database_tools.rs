@@ -34,6 +34,10 @@ pub struct DatabaseConnection {
     pub driver: Option<String>,
     /// The address with every password hidden.
     pub url: String,
+    /// What the window did besides the edit, such as forgetting a password of another
+    /// address. It stays out of an answer that has nothing to say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
 }
 
 /// What a test of a connection found.

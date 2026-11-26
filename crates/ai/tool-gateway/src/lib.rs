@@ -51,7 +51,9 @@ pub use database_tools::{
 pub use edit::apply_replacements;
 pub use exposure::{RouterScope, ToolExposure, ToolState, default_state, is_debug_tool};
 pub use filters::{matches_glob, path_allowed};
-pub use gateway::{Approval, ApprovalAnswer, ApprovalRequest, Decision, Policy, ToolGateway};
+pub use gateway::{
+    Approval, ApprovalAnswer, ApprovalRequest, Decision, Policy, ToolGateway, client_session,
+};
 pub use hint::{agents_md_section, with_agents_md_section};
 pub use language::LanguageTools;
 pub use render::build_problems;

@@ -1,6 +1,11 @@
 use std::fmt;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
+
+use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+
+/// The value `GetDriveTypeW` returns for a drive of another machine.
+const DRIVE_REMOTE: u32 = 4;
 
 /// One spelling for one file: absolute, as the disk spells it when the file exists, with
 /// an upper-case drive letter and without the `\\?\` prefix. Two equal paths are one file
@@ -29,21 +34,28 @@ impl CanonPath {
 
     /// `file:///C:/dir/a%20b.txt` or `file://server/share/a.txt`.
     pub fn to_uri(&self) -> String {
-        let text = self.path.to_string_lossy().replace('\\', "/");
-        let (prefix, rest) = match text.strip_prefix("//") {
-            Some(rest) => ("file://", rest),
-            None => ("file:///", text.as_str()),
-        };
-        let mut uri = String::from(prefix);
-        for byte in rest.bytes() {
-            match byte {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => uri.push(byte as char),
-                b'-' | b'_' | b'.' | b'~' | b'/' | b':' => uri.push(byte as char),
-                _ => uri.push_str(&format!("%{byte:02X}")),
-            }
-        }
-        uri
+        path_to_uri(&self.path)
     }
+}
+
+/// The `file:` URI of `path`, spelled the way [`CanonPath::to_uri`] spells it.
+/// Percent-encodes every byte outside the set RFC 3986 allows unencoded, so a path with
+/// spaces, parentheses, `+`, `@` or non-ASCII characters gives an ASCII URI.
+pub fn path_to_uri(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let (prefix, rest) = match text.strip_prefix("//") {
+        Some(rest) => ("file://", rest),
+        None => ("file:///", text.as_str()),
+    };
+    let mut uri = String::from(prefix);
+    for byte in rest.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => uri.push(byte as char),
+            b'-' | b'_' | b'.' | b'~' | b'/' | b':' => uri.push(byte as char),
+            _ => uri.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    uri
 }
 
 impl fmt::Display for CanonPath {
@@ -56,6 +68,29 @@ impl fmt::Display for CanonPath {
 /// `README.md` and `readme.md` of one folder give one key.
 pub fn path_key(path: &Path) -> PathBuf {
     PathBuf::from(normal_form(&path.to_string_lossy()).to_lowercase())
+}
+
+/// Whether `path` lives on another machine: a UNC path, or a drive that Windows reports as
+/// `DRIVE_REMOTE`. Such a path is never read or started by the IDE: a folder named by a
+/// project must not make it talk to a share of somebody else.
+pub fn is_remote_path(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    if text.starts_with("\\\\") || text.starts_with("//") {
+        return true;
+    }
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return false;
+    };
+    let Prefix::Disk(letter) = prefix.kind() else {
+        return false;
+    };
+    let root: Vec<u16> = format!("{}:\\", letter as char)
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: the string ends with a null and lives for the call, as `GetDriveTypeW`
+    // requires.
+    unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_REMOTE }
 }
 
 /// The path a `file:` URI names, the reverse of [`CanonPath::to_uri`]:

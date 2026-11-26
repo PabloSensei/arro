@@ -644,6 +644,17 @@ pub fn register(
     workspace.register_command("app.report_problem", "Report a Problem", |_, _, _| {
         ::platform::open_url("https://github.com/PabloSensei/arro/issues/new");
     });
+    workspace.register_hidden_command(
+        "editor.save_as_utf8",
+        "Save as UTF-8",
+        |workspace, _, cx| {
+            workspace.set_active_format("UTF-8", cx);
+            workspace.save_all(cx);
+        },
+    );
+    workspace.register_hidden_command("editor.save_cancel", "Cancel Save", |workspace, _, cx| {
+        workspace.close_notification(cx);
+    });
     register_tool_commands(workspace);
 }
 

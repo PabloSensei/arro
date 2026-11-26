@@ -32,6 +32,27 @@ impl Edit {
     }
 }
 
+/// Sorts `edits` by place, keeps one of every identical replacement and drops the ones
+/// that overlap an earlier edit or repeat its insertion. The result is the ordered list
+/// one change needs; pieces of a language server answer may arrive out of order or twice.
+pub fn non_overlapping_edits(mut edits: Vec<Edit>) -> Vec<Edit> {
+    edits.sort_by_key(|edit| (edit.range.start, edit.range.end));
+    let mut kept: Vec<Edit> = Vec::with_capacity(edits.len());
+    for edit in edits {
+        let repeats = kept.last().is_some_and(|last| {
+            (edit.range == last.range && edit.text == last.text)
+                || edit.range.start < last.range.end
+                || (edit.range.start == last.range.start
+                    && edit.range.is_empty()
+                    && last.range.is_empty())
+        });
+        if !repeats {
+            kept.push(edit);
+        }
+    }
+    kept
+}
+
 /// Who made a change. Reviewing what an agent did depends on this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditSource {

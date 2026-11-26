@@ -5,15 +5,24 @@ use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
 
+/// The flags of a delete to the Recycle Bin. `FOF_WANTNUKEWARNING` makes the system warn before it
+/// deletes for good what it cannot put into the bin (a network or subst drive, a folder too big,
+/// a bin that is off); without it that happens with no word. The SDK header says the warning
+/// still shows next to `FOF_NOCONFIRMATION`, which keeps the other questions away.
+#[cfg(windows)]
+const RECYCLE_BIN_FLAGS: u32 = {
+    use windows_sys::Win32::UI::Shell::{
+        FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING,
+    };
+    FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING | FOF_NOERRORUI | FOF_SILENT
+};
+
 /// Moves a file or a whole folder to the Recycle Bin. Blocks: call it off the UI thread.
 #[cfg(windows)]
 pub fn move_to_trash(path: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
-    use windows_sys::Win32::UI::Shell::{
-        FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, SHFILEOPSTRUCTW,
-        SHFileOperationW,
-    };
+    use windows_sys::Win32::UI::Shell::{FO_DELETE, SHFILEOPSTRUCTW, SHFileOperationW};
 
     let mut from: Vec<u16> = path.as_os_str().encode_wide().collect();
     from.push(0);
@@ -21,16 +30,23 @@ pub fn move_to_trash(path: &Path) -> io::Result<()> {
     let mut operation = SHFILEOPSTRUCTW {
         wFunc: FO_DELETE,
         pFrom: from.as_ptr(),
-        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT) as u16,
+        fFlags: RECYCLE_BIN_FLAGS as u16,
         ..Default::default()
     };
     // The call copies the path before it returns, so `from` stays alive for the whole call.
     let result = unsafe { SHFileOperationW(&mut operation) };
-    if result == 0 && operation.fAnyOperationsAborted == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::from_raw_os_error(result as i32))
+    // A failure sets the aborted flag as well when the error UI is off, so the code comes first.
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result as i32));
     }
+    if operation.fAnyOperationsAborted != 0 {
+        // The user answered no to the question about a permanent delete: nothing went.
+        return Err(io::Error::other(format!(
+            "{} stays: the delete was cancelled",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Moves a file or a whole folder to the trash of the desktop: the `files` folder keeps
@@ -226,6 +242,18 @@ mod tests {
         move_to_trash(&file).unwrap();
 
         assert!(!file.exists(), "the file left the folder");
+    }
+
+    /// The flags of a delete to the Recycle Bin ask before a permanent delete, and keep the
+    /// bin's undo. Only the constant is checked: no file goes to the bin.
+    #[cfg(windows)]
+    #[test]
+    fn the_recycle_bin_flags_ask_before_a_permanent_delete() {
+        use windows_sys::Win32::UI::Shell::{FOF_ALLOWUNDO, FOF_WANTNUKEWARNING};
+
+        use super::RECYCLE_BIN_FLAGS;
+        assert_ne!(RECYCLE_BIN_FLAGS & FOF_WANTNUKEWARNING, 0);
+        assert_ne!(RECYCLE_BIN_FLAGS & FOF_ALLOWUNDO, 0);
     }
 
     /// A trash folder of its own keeps the test away from the real trash of the user.

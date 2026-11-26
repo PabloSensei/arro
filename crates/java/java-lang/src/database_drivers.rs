@@ -10,7 +10,6 @@ use std::cmp::Ordering;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use base::Cancel;
 use database::{DownloadProgress, DriverKind, DriverPackage};
@@ -25,8 +24,6 @@ const USER_AGENT: &str = "Arro";
 const DRIVERS: &str = "drivers";
 /// The most a metadata or checksum file may be; a larger answer is not one of them.
 const SMALL_LIMIT: usize = 1024 * 1024;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The artifact of one driver and the license the user reads next to its button.
 struct Package {
@@ -356,20 +353,10 @@ fn is_jar(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
 }
 
+/// The agent of the repository: the same limits as every other download of the IDE, so a
+/// body has no total limit and only a silent server fails.
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .timeout_global(None)
-        .timeout_connect(Some(CONNECT_TIMEOUT))
-        .timeout_recv_response(Some(RESPONSE_TIMEOUT))
-        .timeout_recv_body(Some(RESPONSE_TIMEOUT))
-        .http_status_as_error(false)
-        .tls_config(
-            ureq::tls::TlsConfig::builder()
-                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-                .build(),
-        )
-        .build()
-        .into()
+    java_project::download_agent()
 }
 
 fn get(url: &str) -> Result<ureq::http::Response<ureq::Body>, Error> {

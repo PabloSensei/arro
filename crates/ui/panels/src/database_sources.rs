@@ -436,18 +436,28 @@ impl Draft {
         }
     }
 
-    /// The connection the window saves, with the id it has in the panel.
+    /// The connection the window saves, with the id it has in the panel. An address that
+    /// carries a password leaves it out: the password goes to the store, not to the file.
     fn source(&self, id: SourceId) -> Source {
         let driver = self.driver.text.trim();
         Source {
             id,
             name: self.name.text.trim().to_owned(),
             kind: self.kind,
-            url: self.url.text.trim().to_owned(),
+            url: database::split_password(self.url.text.trim()).0,
             user: self.user.text.trim().to_owned(),
             module: self.module.clone(),
             driver_jar: (!driver.is_empty()).then(|| PathBuf::from(driver)),
         }
+    }
+
+    /// The password of the connection: what the user typed in its field, or the one the
+    /// address carries. An empty typed password clears the stored one.
+    fn password(&self) -> Option<Secret> {
+        if self.password_edited {
+            return Some(Secret::new(self.password.text.clone()));
+        }
+        database::split_password(self.url.text.trim()).1
     }
 
     fn edit(&self) -> SourceEdit {
@@ -456,9 +466,7 @@ impl Draft {
         SourceEdit {
             id,
             source,
-            password: self
-                .password_edited
-                .then(|| Secret::new(self.password.text.clone())),
+            password: self.password(),
             save_password: self.save_password,
             save_changed: self.save_changed,
             account: self.account.clone(),
@@ -904,11 +912,14 @@ impl DataSourcesDialog {
             cx.notify();
             return;
         }
+        if let Some(reason) = database::running_parameter(draft.url.text.trim()) {
+            self.test = TestState::Done(Err(reason));
+            cx.notify();
+            return;
+        }
         let id = draft.id.clone().unwrap_or_else(|| SourceId::new(""));
         let source = draft.source(id);
-        let password = draft
-            .password_edited
-            .then(|| Secret::new(draft.password.text.clone()));
+        let password = draft.password();
         self.test_serial += 1;
         let serial = self.test_serial;
         self.test = TestState::Running;
@@ -1033,6 +1044,14 @@ impl DataSourcesDialog {
         {
             self.select(index, cx);
             self.error = Some(NO_SOURCE.to_owned());
+            cx.notify();
+            return;
+        }
+        if let Some((index, reason)) = self.drafts.iter().enumerate().find_map(|(index, draft)| {
+            database::running_parameter(draft.url.text.trim()).map(|reason| (index, reason))
+        }) {
+            self.select(index, cx);
+            self.error = Some(reason);
             cx.notify();
             return;
         }
@@ -1764,6 +1783,12 @@ impl DataSourcesDialog {
     /// The Save password flag of the selected connection, for the window tests.
     pub(crate) fn save_password_for_test(&self) -> Option<bool> {
         self.selected_draft().map(|draft| draft.save_password)
+    }
+
+    /// The connection the selected draft would save, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn edit_for_test(&self) -> Option<SourceEdit> {
+        self.selected_draft().map(Draft::edit)
     }
 
     /// The version of the driver the form shows, for the window tests.

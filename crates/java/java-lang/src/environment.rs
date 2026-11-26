@@ -101,6 +101,9 @@ fn build_file_of(dir: &Path) -> Option<PathBuf> {
 
 /// The folder is not an SDK unless it holds the launcher and the version file.
 fn check_folder(home: &Path) -> Result<Jdk, String> {
+    if platform::is_remote_path(home) {
+        return Err(format!("Network paths are not used: {}", home.display()));
+    }
     let launcher = home.join("bin").join(executable("java"));
     if !launcher.is_file() {
         return Err(format!(

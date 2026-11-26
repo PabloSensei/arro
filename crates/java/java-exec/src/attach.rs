@@ -2,9 +2,10 @@
 //! `jps -lv` of a found JDK names the processes and their agent arguments.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
+use base::Cancel;
 use base::program::executable;
+use proc_sup::ProcessSpec;
 
 /// The part of `-agentlib:jdwp=...` and `-Xrunjdwp:...` that opens the options.
 const JDWP: [&str; 2] = ["jdwp=", "jdwp:"];
@@ -34,14 +35,16 @@ pub fn debug_attach_processes_in(homes: &[PathBuf]) -> Vec<DebuggableProcess> {
         if !jps.is_file() {
             continue;
         }
-        let Ok(output) = Command::new(&jps).arg("-lv").output() else {
+        // Through the process supervisor: no console window for the tool, and the tool
+        // ends with the IDE.
+        let spec = ProcessSpec::new(&jps).arg("-lv");
+        let Ok(output) = proc_sup::capture(&spec, &Cancel::new()) else {
             continue;
         };
         if !output.status.success() {
             continue;
         }
-        let text = String::from_utf8_lossy(&output.stdout);
-        return parse_jps(&text);
+        return parse_jps(&output.stdout);
     }
     Vec::new()
 }

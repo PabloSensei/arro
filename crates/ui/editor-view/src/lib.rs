@@ -12,6 +12,8 @@ mod completion_usage;
 mod declaration;
 mod decor;
 mod delete;
+#[cfg(test)]
+mod edit_tests;
 mod element;
 mod find_history;
 mod generate;
@@ -64,7 +66,7 @@ pub use semantic::{
 };
 pub use spelling::SpellingMark;
 pub use state::{
-    ActionsOnSave, Conflict, EditorState, LoadError, SaveOptions, Saved, TrimTrailing,
+    ActionsOnSave, Conflict, EditorState, LoadError, SaveOptions, SaveResult, Saved, TrimTrailing,
 };
 pub use style::{EditorStyle, SemanticLook};
 // The language data a caller needs to describe its files to the editor, and to build

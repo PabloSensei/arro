@@ -1662,7 +1662,20 @@ impl KubeSection {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| match result {
-                Ok(value) => cx.write_to_clipboard(ClipboardItem::new_string(value)),
+                // A secret goes where the system keeps it out of the clipboard history and the
+                // cloud clipboard. Where the system has no such formats, the usual copy follows;
+                // a failure on Windows is shown and never copied the usual way.
+                Ok(value) => match ::platform::copy_secret(&value) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                        cx.write_to_clipboard(ClipboardItem::new_string(value));
+                    }
+                    Err(error) => this.kube.tell(
+                        "Copy Value".to_owned(),
+                        format!("The value was not copied: {error}"),
+                        cx,
+                    ),
+                },
                 Err(error) => this.kube.tell("Copy Value".to_owned(), error, cx),
             })
             .ok();
@@ -1675,8 +1688,11 @@ impl KubeSection {
             self.missing_cli(cx);
             return;
         };
-        let line = cli.exec_command_line(pod, SHELL);
-        self.in_terminal(line, cx);
+        let dialect = crate::terminal_panel::active_dialect(cx);
+        match cli.exec_command_line(pod, SHELL, dialect) {
+            Ok(line) => self.in_terminal(line, cx),
+            Err(error) => self.tell("Exec".to_owned(), error.to_string(), cx),
+        }
     }
 
     fn in_terminal(&self, line: String, cx: &mut Context<DockerPanel>) {

@@ -15,6 +15,7 @@ mod repo;
 mod shelve;
 mod status;
 mod submodule;
+mod temp;
 
 pub mod graph;
 
@@ -23,7 +24,7 @@ pub use blame::BlameLine;
 pub use blob::BlobReader;
 pub use console::{
     COMMAND_LIMIT, CommandConsole, CommandRecord, HIDDEN, command_console, hidden_argument,
-    is_background,
+    is_background, url_without_credentials,
 };
 pub use diff::{
     Hunk, LineChange, LineChangeKind, TextEdit, WordChanges, gutter, line_hunks, revert_hunk,
@@ -35,9 +36,9 @@ pub use merge::{Segment, SegmentKind, ThreeWay, merge};
 pub use rebase::{RebaseAction, RebasePlan, RebaseReport, RebaseStep};
 pub use repo::{
     Branch, Commit, CommitChange, CommitDetails, CommitOptions, CommitRequest, Compare,
-    ConflictSide, ConflictVersions, FileDiff, Operation, PartialFile, PushRequest, RefKind,
-    RefLabel, Repository, ResetMode, Stash, UpdateMode, UpdateReport,
+    ConflictSide, ConflictVersions, FileDiff, FileRevert, Operation, PartialFile, PushRequest,
+    RefKind, RefLabel, Repository, ResetMode, Stash, UpdateMode, UpdateReport,
 };
-pub use shelve::{ShelfDiff, patch_files, patched_text};
+pub use shelve::{ShelfDiff, patch_files, patch_without, patched_text};
 pub use status::{Change, FileStatus, Status, parse_status};
 pub use submodule::{RootsUpdate, Submodule, SubmoduleState, parse_submodule_status};

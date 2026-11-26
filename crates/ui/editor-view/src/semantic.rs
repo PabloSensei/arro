@@ -25,7 +25,9 @@ use lang_api::{
 use lsp_client::lsp_types::Uri;
 use lsp_client::uri::file_path;
 use templates::{Expansion, snippet_expansion};
-use text_core::{Edit, EditKind, RopeStore, Selection, SelectionSet, TextStore};
+use text_core::{
+    Edit, EditKind, RopeStore, Selection, SelectionSet, TextStore, non_overlapping_edits,
+};
 use ui_kit::prelude::*;
 use ui_kit::*;
 
@@ -3659,7 +3661,7 @@ impl EditorView {
         let end = end.max(start).min(state.store().len());
         let store = state.store();
         let mut shift = 0isize;
-        let mut edits: Vec<Edit> = Vec::new();
+        let mut extras: Vec<Edit> = Vec::new();
         for edit in additional {
             let from = offset_at(&store, edit.span.start);
             let to = offset_at(&store, edit.span.end).max(from);
@@ -3671,8 +3673,11 @@ impl EditorView {
             if to <= start {
                 shift += edit.text.len() as isize - (to - from) as isize;
             }
-            edits.push(Edit::new(from..to, edit.text.clone()));
+            extras.push(Edit::new(from..to, edit.text.clone()));
         }
+        // An answer may repeat a place or overlap itself: the first edit of a place wins,
+        // so the change keeps the order the buffer needs.
+        let mut edits = non_overlapping_edits(extras);
         edits.push(Edit::new(start..end, text.clone()));
         edits.sort_by_key(|edit| (edit.range.start, edit.range.end));
         let at = (start as isize + shift).max(0) as usize;
@@ -3784,6 +3789,7 @@ impl EditorView {
         } = late;
         let current = state.text();
         let delta = inserted as isize - (end - start) as isize;
+        let unchanged = state.version() == version;
         let mut edits = Vec::new();
         for edit in additional {
             let from = offset_in(before, edit.span.start);
@@ -3794,6 +3800,12 @@ impl EditorView {
                 from
             };
             let new_to = new_from + (to - from);
+            // An insertion has no text of its own to compare with, so it may land at a
+            // changed place; only the version tells whether the place is still the one
+            // the answer was asked about.
+            if from == to && !unchanged {
+                continue;
+            }
             if new_to > current.len()
                 || !current.is_char_boundary(new_from)
                 || !current.is_char_boundary(new_to)
@@ -3805,10 +3817,10 @@ impl EditorView {
             }
             edits.push(Edit::new(new_from..new_to, edit.text.clone()));
         }
+        let edits = non_overlapping_edits(edits);
         if edits.is_empty() {
             return;
         }
-        edits.sort_by_key(|edit| (edit.range.start, edit.range.end));
         let head = state.head();
         let shift: isize = edits
             .iter()
@@ -3816,7 +3828,6 @@ impl EditorView {
             .map(|edit| edit.text.len() as isize - edit.range.len() as isize)
             .sum();
         let after = SelectionSet::single(Selection::caret((head as isize + shift).max(0) as usize));
-        let unchanged = state.version() == version;
         let change = state.apply_template_edits(edits, after, EditKind::Command);
         // A late answer with no typing in between belongs to the insertion, even when it
         // came after the window of the typing group.

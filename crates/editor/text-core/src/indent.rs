@@ -98,13 +98,17 @@ impl IndentSettings {
 }
 
 /// The indentation of the lines of a text: `(tabs, size)`. `None` when no line is
-/// indented. Tabs win only when more lines start with a tab than with spaces.
+/// indented or no line tells the step. Tabs win only when more lines start with a tab
+/// than with spaces. The lines of a block comment, ` * text`, say nothing about the step.
 pub fn detect(text: &str) -> Option<(bool, usize)> {
     let mut tab_lines = 0usize;
     let mut space_lines = 0usize;
     let mut widths: Vec<usize> = Vec::new();
     for line in text.lines() {
         let trimmed = line.trim_start_matches([' ', '\t']);
+        if trimmed.starts_with('*') {
+            continue;
+        }
         let indent = &line[..line.len() - trimmed.len()];
         if indent.is_empty() {
             continue;
@@ -122,16 +126,13 @@ pub fn detect(text: &str) -> Option<(bool, usize)> {
     if tab_lines >= space_lines {
         return Some((true, 4));
     }
-    // A file of nested blocks has widths 4, 8 and 12: the step is their greatest
-    // common divisor, not the most frequent width.
-    let mut size = widths.iter().copied().find(|width| *width > 0)?;
-    for width in &widths {
-        size = gcd(size, *width);
-    }
-    if size < 2 {
-        size = most_common(&widths).unwrap_or(4);
-    }
-    Some((false, size.max(1)))
+    // The step is the smallest of the usual steps 2, 4 and 8 that some line is indented
+    // by. Lines aligned to a bracket have any width, so neither the most frequent width
+    // nor the greatest common divisor is a safe guess; the fallback is the divisor only
+    // when none of the usual steps occurs, such as in a file indented by three.
+    let step = [2, 4, 8].into_iter().find(|step| widths.contains(step));
+    let size = step.or_else(|| widths.iter().copied().reduce(gcd).filter(|size| *size >= 2))?;
+    Some((false, size))
 }
 
 fn gcd(mut left: usize, mut right: usize) -> usize {
@@ -141,17 +142,6 @@ fn gcd(mut left: usize, mut right: usize) -> usize {
         right = next;
     }
     left.max(1)
-}
-
-fn most_common(values: &[usize]) -> Option<usize> {
-    let mut best: Option<(usize, usize)> = None;
-    for value in values {
-        let count = values.iter().filter(|other| *other == value).count();
-        if best.is_none_or(|(_, seen)| count > seen) {
-            best = Some((*value, count));
-        }
-    }
-    best.map(|(value, _)| value)
 }
 
 #[cfg(test)]
@@ -199,10 +189,49 @@ mod tests {
     }
 
     #[test]
-    fn the_step_of_nested_spaces_is_their_divisor() {
+    fn the_step_of_nested_spaces_is_the_smallest_usual_width() {
         assert_eq!(detect("a\n    b\n        c\n"), Some((false, 4)));
         assert_eq!(detect("a\n  b\n    c\n      d\n"), Some((false, 2)));
         assert_eq!(detect("a\n\tb\n"), Some((true, 4)));
         assert_eq!(detect("a\nb\n"), None);
+    }
+
+    #[test]
+    fn comment_continuation_lines_do_not_change_the_step() {
+        let mut text = String::from("class A {\n");
+        for _ in 0..6 {
+            text.push_str("     * Documented.\n");
+        }
+        for _ in 0..10 {
+            text.push_str("        step();\n");
+        }
+        for _ in 0..5 {
+            text.push_str("    field;\n");
+        }
+        assert_eq!(detect(&text), Some((false, 4)));
+    }
+
+    #[test]
+    fn a_line_aligned_to_a_bracket_keeps_the_step_of_the_blocks() {
+        let mut text = String::from("a\n");
+        for _ in 0..6 {
+            text.push_str("        block();\n");
+        }
+        text.push_str("    field;\n    field;\n");
+        text.push_str("       aligned(\n");
+        assert_eq!(detect(&text), Some((false, 4)));
+    }
+
+    #[test]
+    fn a_step_that_no_usual_width_shows_is_the_divisor() {
+        assert_eq!(detect("a\n   b\n      c\n"), Some((false, 3)));
+    }
+
+    #[test]
+    fn a_single_space_names_no_step() {
+        let settings = IndentSettings::resolve(&Properties::default(), "a\n b\n", "    ");
+        assert_eq!(detect("a\n b\n"), None);
+        assert_eq!(settings.source, IndentSource::Language);
+        assert_eq!(settings.unit, "    ");
     }
 }

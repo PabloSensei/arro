@@ -16,6 +16,27 @@ pub fn file_path(uri: &Uri) -> Option<PathBuf> {
     path_from_uri(uri.as_str())
 }
 
+/// A `file:` URI a server sent, in the spelling Arro uses. A server writes the path the
+/// way `File.toURI` spells it: raw non-ASCII characters, parentheses and `+` stay as they
+/// are, which a URI parser refuses. The text therefore goes through the path and back.
+/// `None` for a URI that is neither a file path nor valid URI text.
+pub fn server_uri(text: &str) -> Option<Uri> {
+    if let Some(path) = path_from_uri(text) {
+        return Uri::from_str(&platform::path_to_uri(&path)).ok();
+    }
+    Uri::from_str(text).ok()
+}
+
+/// The key two spellings of one document URI share. A `file:` URI is reduced to the
+/// normalized path of the file, so `file:/C:/Dir/A.txt` from a server and
+/// `file:///C:/Dir/A.txt` from Arro are one document; any other URI is its text.
+pub fn server_uri_key(text: &str) -> String {
+    match path_from_uri(text) {
+        Some(path) => platform::path_key(&path).to_string_lossy().into_owned(),
+        None => text.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;

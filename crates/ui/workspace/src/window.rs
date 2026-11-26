@@ -37,6 +37,7 @@ use crate::layout::{
 use crate::pane::{Pane, Tab, active_after_removal, next_tab, previous_tab, remember_closed};
 use crate::run::{DebugControls, DebugRunState, RunControls, RunState};
 use crate::settings::{DefaultLayout, SETTINGS_FILE, Settings};
+use crate::settings_file;
 use crate::split::{SplitLayout, SplitTree};
 
 /// Where the README that explains the setup of a language server lives.
@@ -44,6 +45,10 @@ const README_URL: &str = "https://github.com/PabloSensei/arro";
 
 /// The command of a second search for a tool that a language server needs.
 pub const CHECK_LANGUAGE_SETUP: &str = "language.check_setup";
+
+/// The command that opens the dialog of a project that is not trusted yet. The panels
+/// register it; the status bar and the Build window show it as a link.
+pub const TRUST_PROJECT_COMMAND: &str = "trust.project";
 
 /// A long task the status bar shows while it runs: what it does and, when it can stop,
 /// the callback of its Cancel button.
@@ -767,6 +772,9 @@ pub struct Workspace {
     tool_activator: Option<ToolActivator>,
     /// The state of the language server, shown in the status bar.
     pub(crate) language_status: Option<SharedString>,
+    /// The project is not trusted: the build and the language server stay off until the
+    /// user trusts it. The status bar says so and offers the trust dialog.
+    pub(crate) safe_mode: bool,
     /// The MCP clients that are connected now, and whether one of them runs an `Execute`
     /// tool, for the indicator of the status bar.
     pub(crate) agent_clients: usize,
@@ -913,6 +921,18 @@ fn readme_path(root: &Path) -> Option<PathBuf> {
             })
             .cloned()
     })
+}
+
+/// The place of `path` once `from` has moved to `to`; `None` when `path` is not under `from`.
+/// The moved item itself goes to `to` as it is: joining an empty rest would add a separator,
+/// and a file named with a trailing separator does not open.
+fn moved_to(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    let inside = path.strip_prefix(from).ok()?;
+    if inside.as_os_str().is_empty() {
+        Some(to.to_path_buf())
+    } else {
+        Some(to.join(inside))
+    }
 }
 
 /// The path with its file name as the disk spells it, so that a tab carries the name the
@@ -1167,6 +1187,7 @@ impl Workspace {
             config_choose: None,
             tool_activator: None,
             language_status: None,
+            safe_mode: false,
             agent_clients: 0,
             agent_busy: false,
             language_details: None,
@@ -2807,6 +2828,22 @@ impl Workspace {
         self.language_status.as_ref()
     }
 
+    /// Whether the project is in Safe Mode: the window opened it without trusting it, so
+    /// nothing of the project runs yet.
+    pub fn safe_mode(&self) -> bool {
+        self.safe_mode
+    }
+
+    /// Tells the status bar and the Build window whether the project is in Safe Mode. The
+    /// panels call it when the window opens and again when the user trusts the project.
+    pub fn set_safe_mode(&mut self, safe: bool, cx: &mut Context<Self>) {
+        if self.safe_mode == safe {
+            return;
+        }
+        self.safe_mode = safe;
+        cx.notify();
+    }
+
     /// The command a click on the language status line runs, such as the notification
     /// of a failed import. Without one, the click opens the help balloon.
     pub fn language_action(&self) -> Option<&'static str> {
@@ -3645,6 +3682,7 @@ impl Workspace {
     /// Puts the settings in force and writes the file in the background.
     fn store_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
         let before = cx.try_global::<Settings>().cloned().unwrap_or_default();
+        let changes = settings_file::changes(&before, &settings);
         let scale_changed = (before.ui_scale - settings.ui_scale).abs() > f32::EPSILON;
         let icon_set_changed = before.icon_set != settings.icon_set;
         let follow_system = settings.theme_sync_with_os
@@ -3686,24 +3724,23 @@ impl Workspace {
         }
         // The checks of View | Appearance and its labels follow the switch that ran.
         self.refresh_platform_menus(cx);
+        // Only the keys that changed are written, over a fresh read of the file.
         let path = self.settings_dir.join(SETTINGS_FILE);
-        let write = cx
-            .background_executor()
-            .spawn(async move { settings.save(&path) });
-        cx.spawn(async move |_, _| {
-            if let Err(error) = write.await {
-                eprintln!("settings are not saved: {error}");
-            }
-        })
-        .detach();
+        settings_file::queue(cx, path, changes, settings_file::named_keys(&settings));
         cx.notify();
     }
 
-    /// Writes the files of tabs under `path` before it returns: a rename comes next.
+    /// Writes the files of tabs and buffers under `path` before it returns: a rename comes next,
+    /// and the editors that follow it load the text from the new place.
     pub fn save_tabs_under(&self, path: &Path, cx: &mut App) {
         let tabs = self.panes.iter().flat_map(|pane| &pane.tabs);
         for tab in tabs.filter(|tab| tab.path.starts_with(path)) {
             (tab.editor.save_now)(cx);
+        }
+        for (buffer, editor) in &self.buffers {
+            if buffer.starts_with(path) {
+                (editor.save_now)(cx);
+            }
         }
     }
 
@@ -4386,8 +4423,8 @@ impl Workspace {
         self.tab_removed(window, cx);
     }
 
-    /// A file or a folder was renamed: its tabs show the new place, with carets and pins.
-    /// Write the unsaved text first, see [`Workspace::save_tabs_under`].
+    /// A file or a folder was renamed: its tabs and buffers show the new place, with carets
+    /// and pins. Write the unsaved text first, see [`Workspace::save_tabs_under`].
     pub fn paths_moved(
         &mut self,
         from: &Path,
@@ -4398,16 +4435,31 @@ impl Workspace {
         for pane in 0..self.panes.len() {
             for index in 0..self.panes[pane].tabs.len() {
                 let old = &self.panes[pane].tabs[index];
-                let Ok(inside) = old.path.strip_prefix(from) else {
+                let Some(new) = moved_to(&old.path, from, to) else {
                     continue;
                 };
-                let new = to.join(inside);
                 let (caret, pinned) = ((old.editor.caret)(cx), old.pinned);
                 let mut tab = self.tab_for(new, window, cx);
                 tab.pinned = pinned;
                 (tab.editor.restore_caret)(caret, cx);
                 self.panes[pane].tabs[index] = tab;
             }
+        }
+        // The buffers of the moved files follow them. Their text was written before the move
+        // (see `save_tabs_under`), so a buffer at the new place loads the same text.
+        let moved: Vec<PathBuf> = self
+            .buffers
+            .keys()
+            .filter(|buffer| buffer.starts_with(from))
+            .cloned()
+            .collect();
+        for old in moved {
+            let Some(new) = moved_to(&old, from, to) else {
+                continue;
+            };
+            self.buffers.remove(&old);
+            let tab = self.tab_for(new.clone(), window, cx);
+            self.buffers.insert(new, tab.editor);
         }
         self.tab_serial += 1;
         self.focus_active(window, cx);

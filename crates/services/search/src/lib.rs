@@ -18,5 +18,5 @@ pub use source::{
 pub use symbols::{ProviderFor, SymbolIndex, SymbolMatch, file_symbols, index_files, pool_size};
 pub use text::{
     FileHits, LineHit, SearchError, TextMatcher, TextQuery, find_in_files, find_in_selection,
-    replace_edits,
+    replace_edits, replace_found,
 };

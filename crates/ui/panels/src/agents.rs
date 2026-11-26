@@ -158,9 +158,11 @@ impl Mcp {
         if published.is_some() {
             return Ok(());
         }
+        // The token of the clients outside the window: each of their connections gets a
+        // session of its own when it initializes.
         let token = self
             .server
-            .issue_token(SessionScope {
+            .issue_client_token(SessionScope {
                 session: "mcp".to_string(),
                 project: self.root.clone(),
                 cwd: self.root.clone(),
@@ -184,11 +186,13 @@ impl Mcp {
         }
     }
 
-    /// Takes the entry point away and stops the token behind it. The sessions of the tool
-    /// window keep their own tokens and go on working.
+    /// Takes the entry point away, stops the token behind it and takes back the permissions
+    /// of the clients that came in through it. The sessions of the tool window keep their own
+    /// tokens and go on working.
     fn unpublish(&self) {
         if let Some(published) = self.published().take() {
             self.server.revoke(&published.entry.token);
+            self.gateway.revoke_client_sessions();
             drop(published.file);
         }
     }
@@ -848,6 +852,25 @@ impl AgentsPanel {
             mcp.gateway.set_exposure(exposure);
         }
         cx.notify();
+    }
+
+    /// The answer of a window script: the question of an IDE tool when one waits, else the
+    /// permission the chat asks.
+    pub(crate) fn answer_script(
+        &mut self,
+        reply: agent_core::PermissionReply,
+        cx: &mut Context<Self>,
+    ) {
+        if self.approvals.pending().is_none() {
+            self.answer(reply, cx);
+            return;
+        }
+        let reply = match reply {
+            agent_core::PermissionReply::AllowOnce => Reply::Once,
+            agent_core::PermissionReply::AllowAlways => Reply::Session,
+            agent_core::PermissionReply::Deny => Reply::Deny,
+        };
+        self.answer_mcp_question(reply, cx);
     }
 
     /// The buttons of the notification of an `Execute` tool: the answer reaches the
@@ -1775,6 +1798,15 @@ impl AgentsPanel {
     }
 
     /// The active chat stopped: its turn ended, or it asks something, or it is gone.
+    /// Whether a question waits for an answer: the permission the chat asks or the
+    /// question of an IDE tool.
+    pub(crate) fn asks(&self) -> bool {
+        self.approvals.pending().is_some()
+            || self
+                .active_entry()
+                .is_some_and(|entry| entry.transcript.pending_permission().is_some())
+    }
+
     pub fn agent_settled(&self) -> bool {
         let Some(entry) = self.active_entry() else {
             return true;

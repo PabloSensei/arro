@@ -1253,6 +1253,7 @@ dependencies = [
  "runner",
  "serde",
  "serde_json",
+ "terminal",
  "test-support",
 ]
 
@@ -1788,6 +1789,7 @@ dependencies = [
  "platform",
  "syntax",
  "templates",
+ "test-support",
  "text-core",
  "ui-kit",
  "ureq",
@@ -4207,6 +4209,7 @@ dependencies = [
  "proc-sup",
  "serde",
  "serde_json",
+ "terminal",
  "test-support",
 ]
 
@@ -8735,6 +8738,7 @@ version = "0.1.31"
 dependencies = [
  "flate2",
  "platform",
+ "ring",
  "semver",
  "serde",
  "serde_json",

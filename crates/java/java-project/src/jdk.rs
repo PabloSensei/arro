@@ -182,8 +182,17 @@ impl Jdk {
     /// a project, and a folder left by a partial removal has neither the one nor the
     /// other, so such a record is never offered.
     pub fn at(home: &Path) -> Option<Self> {
+        Self::at_with(home, |path| path.is_file())
+    }
+
+    /// The same, with the check of a file that a test replaces. A folder of another
+    /// machine is never asked about: not even the existence of its launcher is checked.
+    pub fn at_with(home: &Path, is_file: impl Fn(&Path) -> bool) -> Option<Self> {
+        if platform::is_remote_path(home) {
+            return None;
+        }
         let bin = home.join("bin");
-        if !bin.join(executable("javac")).is_file() || !bin.join(executable("java")).is_file() {
+        if !is_file(&bin.join(executable("javac"))) || !is_file(&bin.join(executable("java"))) {
             return None;
         }
         let release = fs::read_to_string(home.join("release")).ok()?;
@@ -218,6 +227,9 @@ pub fn feature_of(version: &str) -> Option<u32> {
 pub fn find_jdks() -> Vec<Jdk> {
     let mut seen = HashSet::new();
     let found = candidates().into_iter().filter_map(|home| {
+        if platform::is_remote_path(&home) {
+            return None;
+        }
         let real = fs::canonicalize(&home).ok()?;
         seen.insert(real).then(|| Jdk::at(&home))?
     });
@@ -232,7 +244,8 @@ fn candidates() -> Vec<PathBuf> {
     let compiler = executable("javac");
     if let Some(path) = env::var_os("PATH") {
         for directory in env::split_paths(&path) {
-            if directory.join(&compiler).is_file()
+            if !platform::is_remote_path(&directory)
+                && directory.join(&compiler).is_file()
                 && let Some(home) = directory.parent()
             {
                 homes.push(home.to_owned());
@@ -241,7 +254,9 @@ fn candidates() -> Vec<PathBuf> {
     }
     let family = Family::current();
     for root in roots_for(family, &Places::from_env()) {
-        homes.extend(homes_under(family, &root));
+        if !platform::is_remote_path(&root) {
+            homes.extend(homes_under(family, &root));
+        }
     }
     homes
 }
@@ -315,6 +330,9 @@ fn property(file: &Path, key: &str) -> Option<String> {
 pub fn choose_jdk(requested: &Requested, jdks: &[Jdk], default_home: Option<&Path>) -> Result<Jdk> {
     let found = match requested {
         Requested::Home(home) => {
+            if platform::is_remote_path(home) {
+                return Err(format!("Network paths are not used: {}", home.display()).into());
+            }
             let jdk = jdks.iter().find(|jdk| jdk.home == *home).cloned();
             let reason = || format!("no JDK at {}", home.display());
             return jdk.or_else(|| Jdk::at(home)).ok_or_else(|| reason().into());

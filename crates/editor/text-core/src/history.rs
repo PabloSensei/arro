@@ -55,7 +55,10 @@ impl History {
         source: EditSource,
         kind: EditKind,
     ) {
-        self.redo.clear();
+        // A new change takes the redo away, so its bytes leave the limit with it.
+        for transaction in self.redo.drain(..) {
+            self.bytes -= transaction.bytes;
+        }
         let now = Instant::now();
         let bytes = cost(&step);
         self.bytes += bytes;

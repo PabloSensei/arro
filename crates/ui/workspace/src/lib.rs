@@ -15,6 +15,7 @@ mod native_menu;
 mod pane;
 mod run;
 mod settings;
+mod settings_file;
 mod split;
 mod window;
 
@@ -42,14 +43,14 @@ pub use inspections::{inspections_file, load_inspections, save_inspections};
 pub use invalidate::{apply_pending_invalidation, pending_invalidation, schedule_invalidation};
 pub use keys::KeyRow;
 pub use launch::{
-    AppInfo, Launch, StartContext, choose_platform_keymap, run, spawn_path, spawn_path_taking_over,
-    spawn_project, start_context,
+    AppInfo, Launch, STATE_DATABASE, StartContext, choose_platform_keymap, run, spawn_path,
+    spawn_path_taking_over, spawn_project, start_context,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use layout::load_layout;
 pub use layout::{
     BookmarkGroupState, BookmarkLayout, BookmarkState, DockState, Layout, Location, LocationLog,
-    PaneState, WindowPlacement,
+    PaneState, WindowPlacement, load_recent, remember_project,
 };
 pub use native_menu::ScreenMenus;
 pub use run::{DebugControls, DebugRunState, RunControls, RunState};
@@ -64,6 +65,7 @@ pub use settings::{
     McpExecutePermission, McpRouterScope, McpToolChoice, RIGHT_MARGIN_STEP, ReformatScope,
     SETTINGS_FILE, Settings, SqlKeywordCase, TrimTrailingWhitespace, UI_SCALE_STEP,
 };
+pub use settings_file::{resume_settings_writes, stop_settings_writes};
 pub use split::SplitLayout;
 pub use window::{
     AI_CLIENTS, AI_TOOL, BEANS_TOOL, BOOKMARKS_POPUP, BOOKMARKS_TOOL, BUILD_TOOL,
@@ -76,12 +78,12 @@ pub use window::{
     RevertChange, Run, SELECTION_HISTORY_TOOL, SERVICES_TOOL, STACK_TRACE_TOOL, STRUCTURE_TOOL,
     SelectIn, SelectInProject, ShowBranches, ShowCommit, ShowSearch, ShowSettings, SplitRight,
     StatusProgress, StepInto, StepOut, StepOver, Stop, TASKS_TOOL, TERMINAL_TOOL, TODO_TOOL,
-    TYPE_HIERARCHY_TOOL, TabListener, ToggleAi, ToggleBookmarks, ToggleBreakpoint, ToggleCommit,
-    ToggleDatabase, ToggleDebug, ToggleEndpoints, ToggleFullScreen, ToggleHttp, ToggleLog,
-    ToggleProject, ToggleRun, ToggleServices, ToggleStructure, ToggleTerminal, ToggleTheme,
-    ToggleUsages, USAGES_TOOL, UpdateProject, VcsQuickList, ViewBreakpoints, WINDOW_KEYS,
-    WindowKey, Workspace, bind_keys, bind_keys_for, build_date, build_version, forward_dismiss,
-    window_key, window_step,
+    TRUST_PROJECT_COMMAND, TYPE_HIERARCHY_TOOL, TabListener, ToggleAi, ToggleBookmarks,
+    ToggleBreakpoint, ToggleCommit, ToggleDatabase, ToggleDebug, ToggleEndpoints, ToggleFullScreen,
+    ToggleHttp, ToggleLog, ToggleProject, ToggleRun, ToggleServices, ToggleStructure,
+    ToggleTerminal, ToggleTheme, ToggleUsages, USAGES_TOOL, UpdateProject, VcsQuickList,
+    ViewBreakpoints, WINDOW_KEYS, WindowKey, Workspace, bind_keys, bind_keys_for, build_date,
+    build_version, forward_dismiss, window_key, window_step,
 };
 
 #[cfg(any(test, feature = "test-support"))]

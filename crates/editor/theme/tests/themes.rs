@@ -107,6 +107,7 @@ fn every_built_in_theme_names_every_token() {
         "nord",
         "mocha",
         "paper",
+        "nightfall",
     ] {
         let theme = library
             .get(id)
@@ -131,7 +132,7 @@ fn the_built_in_themes_cover_both_looks() {
     assert!(library.get("dark").is_some_and(|theme| theme.dark));
     assert!(library.get("light").is_some_and(|theme| !theme.dark));
     assert!(library.get("paper").is_some_and(|theme| !theme.dark));
-    for id in ["high-contrast", "retro", "nord", "mocha"] {
+    for id in ["high-contrast", "retro", "nord", "mocha", "nightfall"] {
         assert!(library.get(id).is_some_and(|theme| theme.dark), "{id}");
     }
     assert_eq!(library.fallback(true), "dark");

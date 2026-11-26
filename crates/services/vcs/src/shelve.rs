@@ -4,9 +4,8 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::temp::TempFolder;
 use crate::{Hunk, Repository, line_hunks};
 
 /// The id git gives the tree of no files.
@@ -20,15 +19,13 @@ pub struct ShelfDiff {
     pub hunks: Vec<Hunk>,
 }
 
-static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-
 impl Repository {
     /// The chosen files, new and deleted ones too, as a binary patch against `HEAD`.
     pub fn shelve(&self, paths: &[String]) -> io::Result<Vec<u8>> {
         let paths = self.shelve_paths(paths)?;
         let head = self.status()?.head.is_some();
-        let index = temp_path("index");
-        let _ = std::fs::remove_file(&index);
+        let folder = TempFolder::create("shelf")?;
+        let index = folder.join("index");
         let env = [("GIT_INDEX_FILE", index.as_os_str())];
         let base = if head {
             self.run_with_env(&["read-tree", "HEAD"], &env)?;
@@ -40,13 +37,21 @@ impl Repository {
         let mut add = vec!["add", "-A", "--"];
         add.extend(paths.iter().map(String::as_str));
         self.run_with_env(&add, &env)?;
-        let mut diff = vec!["diff", "--cached", "--binary", "--full-index", &base];
+        let mut diff = vec![
+            "diff",
+            "--cached",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            &base,
+        ];
         if !paths.is_empty() {
             diff.push("--");
             diff.extend(paths.iter().map(String::as_str));
         }
         let patch = self.run_with_env(&diff, &env);
-        let _ = std::fs::remove_file(&index);
+        drop(folder);
         patch
     }
 
@@ -258,15 +263,78 @@ pub fn patch_files(patch: &[u8]) -> Vec<String> {
     files
 }
 
-/// A file name of the temporary folder that no other call of this process holds.
-fn temp_path(kind: &str) -> PathBuf {
-    let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("ide-shelf-{}-{serial}.{kind}", std::process::id()))
+/// The patch without the sections of `paths`: what an Unshelve of those files leaves in a
+/// shelf. The patch is cut on its bytes, so a binary section keeps every byte. A section
+/// that names none of `paths`, or that cannot be attributed to one, stays.
+pub fn patch_without(patch: &[u8], paths: &[String]) -> Vec<u8> {
+    let mut kept = Vec::with_capacity(patch.len());
+    for section in sections(patch) {
+        if !section_belongs_to(section, paths) {
+            kept.extend_from_slice(section);
+        }
+    }
+    kept
+}
+
+/// The sections of a git patch: each runs from a `diff --git` line that starts a line to
+/// the next one. Bytes before the first such line form a section of their own.
+fn sections(patch: &[u8]) -> Vec<&[u8]> {
+    const HEADER: &[u8] = b"diff --git ";
+    let mut cuts = vec![0];
+    cuts.extend(
+        (1..patch.len()).filter(|&at| patch[at - 1] == b'\n' && patch[at..].starts_with(HEADER)),
+    );
+    cuts.push(patch.len());
+    cuts.windows(2)
+        .map(|pair| &patch[pair[0]..pair[1]])
+        .filter(|section| !section.is_empty())
+        .collect()
+}
+
+/// Whether a section describes one of `paths`: by its `---` and `+++` names, or by its
+/// `diff --git` line, which is all a binary section has.
+fn section_belongs_to(section: &[u8], paths: &[String]) -> bool {
+    if patch_files(section).iter().any(|file| paths.contains(file)) {
+        return true;
+    }
+    let header_end = section
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(section.len());
+    let header = String::from_utf8_lossy(&section[..header_end]);
+    paths.iter().any(|path| {
+        header.contains(&format!("a/{path} ")) || header.ends_with(&format!("b/{path}"))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{patch_files, patched_text};
+
+    #[test]
+    fn safety_a_patch_without_some_files_keeps_the_rest_byte_for_byte() {
+        let text =
+            b"diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+ONE\n";
+        let binary =
+            b"diff --git a/img.bin b/img.bin\nnew file mode 100644\nGIT binary patch\nliteral 2\n\xff\x00\n";
+        let patch: Vec<u8> = [&text[..], &binary[..]].concat();
+
+        assert_eq!(
+            super::patch_without(&patch, &["a.txt".to_owned()]),
+            binary.to_vec()
+        );
+        assert_eq!(
+            super::patch_without(&patch, &["img.bin".to_owned()]),
+            text.to_vec()
+        );
+        assert_eq!(
+            super::patch_without(&patch, &["other.txt".to_owned()]),
+            patch
+        );
+        assert!(
+            super::patch_without(&patch, &["a.txt".to_owned(), "img.bin".to_owned()]).is_empty()
+        );
+    }
 
     #[test]
     fn the_files_of_a_patch_are_named_once() {

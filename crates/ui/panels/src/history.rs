@@ -12,10 +12,6 @@ use ui_kit::*;
 /// process that rewrites the file loses no more than this much work.
 pub const AUTO_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(2 * 60);
 
-/// The largest file a snapshot of a whole project reads: the same cap the history applies
-/// to a version, so a large binary is not read only to be dropped.
-const MAX_TREE_FILE_BYTES: u64 = 4 * 1024 * 1024;
-
 /// The interval the automatic snapshots of the window use. A test sets a short one.
 #[derive(Clone, Copy, Debug)]
 pub struct AutoSnapshotInterval(pub Duration);
@@ -43,13 +39,16 @@ pub struct History(pub Option<Arc<LocalHistory>>);
 
 impl Global for History {}
 
-/// Opens the history in `state_dir/history` without blocking the window.
-pub fn open(state_dir: &Path, cx: &mut App) {
+/// Opens the history in `state_dir/history` without blocking the window. The folders named in
+/// `skipped` are left out of it, as the TODO scan leaves them out: the output of the build tool
+/// and the like.
+pub fn open(state_dir: &Path, skipped: Vec<String>, cx: &mut App) {
     cx.set_global(History::default());
     let dir = state_dir.join("history");
-    let task = cx
-        .background_executor()
-        .spawn(async move { LocalHistory::open(&dir, Limits::default()) });
+    let task = cx.background_executor().spawn(async move {
+        let skip = move |name: &str| crate::todo::skipped(name, &skipped);
+        LocalHistory::open_skipping(&dir, Limits::default(), Box::new(skip))
+    });
     cx.spawn(async move |cx| match task.await {
         Ok(history) => {
             cx.update(|cx| cx.set_global(History(Some(Arc::new(history)))));
@@ -109,45 +108,19 @@ pub fn snapshot_now(path: &Path, cause: Cause, cx: &App) {
 }
 
 /// Records every file under `root` from the thread that calls this, for a command that is
-/// about to rewrite a lot of files: the command runs after the bytes are read.
-pub fn record_tree_blocking(history: &LocalHistory, root: &Path, cause: Cause, skipped: &[String]) {
-    let mut folders = vec![root.to_path_buf()];
-    while let Some(folder) = folders.pop() {
-        let Ok(entries) = std::fs::read_dir(&folder) else {
-            continue;
-        };
-        let mut entries: Vec<_> = entries.flatten().collect();
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            if kind.is_dir() {
-                if !crate::todo::skipped(&name, skipped) {
-                    folders.push(entry.path());
-                }
-                continue;
-            }
-            if kind.is_file() {
-                let small = entry
-                    .metadata()
-                    .is_ok_and(|meta| meta.len() <= MAX_TREE_FILE_BYTES);
-                if !small {
-                    continue;
-                }
-                if let Err(error) = history.record_file(&entry.path(), cause) {
-                    eprintln!("local history: {error}");
-                }
-            }
+/// about to rewrite a lot of files: the command runs after the bytes are read. The root is
+/// recorded whatever its name; the folders inside it that the history skips are left out.
+pub fn record_tree_blocking(history: &LocalHistory, root: &Path, cause: Cause) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    paths.sort();
+    for path in paths {
+        if let Err(error) = history.record_tree(&path, cause) {
+            eprintln!("local history: {error}");
         }
     }
-}
-
-/// The folders a snapshot of a whole project leaves out, as the TODO scan does.
-pub fn skipped_folders(cx: &App) -> Vec<String> {
-    cx.try_global::<crate::todo::SkippedFolders>()
-        .map_or_else(Vec::new, |skipped| skipped.0.clone())
 }
 
 pub fn put_label(folder: &Path, label: String, cx: &App) {
@@ -155,4 +128,64 @@ pub fn put_label(folder: &Path, label: String, cx: &App) {
     later(cx, move |history| {
         history.put_label(&folder, &label).map(drop)
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use local_history::{Cause, Limits, LocalHistory};
+    use window_language::skipped_folders;
+
+    /// A snapshot of a project whose build output has a thousand files records none of them,
+    /// and the sources next to it are recorded.
+    #[test]
+    fn a_snapshot_leaves_out_the_build_output_of_the_project() {
+        let root = test_support::scratch("history-output");
+        let project = root.join("project");
+        let output = project.join(&skipped_folders()[0]);
+        fs::create_dir_all(output.join("classes")).unwrap();
+        for number in 0..1000u32 {
+            fs::write(
+                output.join("classes").join(format!("C{number}.class")),
+                [1u8; 32],
+            )
+            .unwrap();
+        }
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(project.join("src").join("Main.txt"), "class Main {}").unwrap();
+        let skip = skipped_folders();
+        let history = LocalHistory::open_skipping(
+            &root.join("history"),
+            Limits::default(),
+            Box::new(move |name: &str| crate::todo::skipped(name, &skip)),
+        )
+        .unwrap();
+
+        super::record_tree_blocking(&history, &project, Cause::BeforeDelete);
+
+        assert!(history.folder_history(&output).is_empty());
+        assert_eq!(history.folder_history(&project).len(), 1);
+    }
+
+    /// A snapshot of a root named like a skipped folder still records what is in it: the root
+    /// is a repository, not output.
+    #[test]
+    fn a_snapshot_of_a_root_named_like_a_skipped_folder_records_its_files() {
+        let root = test_support::scratch("history-root-name");
+        let project = root.join(&skipped_folders()[0]);
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(project.join("src").join("Main.txt"), "class Main {}").unwrap();
+        let skip = skipped_folders();
+        let history = LocalHistory::open_skipping(
+            &root.join("history"),
+            Limits::default(),
+            Box::new(move |name: &str| crate::todo::skipped(name, &skip)),
+        )
+        .unwrap();
+
+        super::record_tree_blocking(&history, &project, Cause::BeforeDelete);
+
+        assert_eq!(history.folder_history(&project).len(), 1);
+    }
 }

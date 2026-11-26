@@ -2,14 +2,14 @@
 //! or damaged file gives the defaults, a new key an old file does not know gets its default.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 
 use project_model::BuildTools;
 use serde::{Deserialize, Serialize};
 use ui_kit::*;
 
 use crate::layout::DockState;
+use crate::settings_file;
 
 pub const SETTINGS_FILE: &str = "settings.json";
 pub const MIN_FONT_SIZE: f32 = 8.;
@@ -865,15 +865,7 @@ impl Settings {
     /// explicit value in an installation without a chosen theme follows the system, as a
     /// new one does.
     pub fn load_with_theme_choice(path: &Path, theme_chosen: bool) -> Self {
-        let text = std::fs::read_to_string(path).ok();
-        let parsed: Option<Self> = text
-            .as_deref()
-            .and_then(|text| serde_json::from_str(text).ok());
-        let mut settings = parsed.map_or_else(Self::default, Self::clamped);
-        if theme_chosen && text.as_deref().is_none_or(|text| !names_sync_with_os(text)) {
-            settings.theme_sync_with_os = false;
-        }
-        settings
+        settings_file::read(path, theme_chosen).settings
     }
 
     /// The saved name of the theme the system appearance asks for.
@@ -885,21 +877,12 @@ impl Settings {
         }
     }
 
-    /// Writes the file, creating its folder. The new text goes to a file beside the old
-    /// one and takes its place, so a stop in the middle leaves the old file whole.
-    /// Blocks: not for the UI thread.
+    /// Writes every key of these settings into the file and keeps the keys the file holds
+    /// that these settings do not name. The window writes only the keys it changed, see
+    /// `settings_file`. Blocks: not for the UI thread.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        let temp = temp_path(path);
-        std::fs::write(&temp, text)?;
-        if let Err(error) = std::fs::rename(&temp, path) {
-            let _ = std::fs::remove_file(&temp);
-            return Err(error);
-        }
-        Ok(())
+        settings_file::write(path, &settings_file::all_keys(self), &[])
+            .map_err(|error| std::io::Error::other(error.to_string()))
     }
 
     /// Takes over the leaves of `draft` that differ from `saved`. A field that another
@@ -919,7 +902,7 @@ impl Settings {
         }
     }
 
-    fn clamped(mut self) -> Self {
+    pub(crate) fn clamped(mut self) -> Self {
         if !self.font_size.is_finite() {
             self.font_size = DEFAULT_FONT_SIZE;
         }
@@ -1021,25 +1004,6 @@ impl Settings {
         }
         .clamped()
     }
-}
-
-/// Whether a settings file names the switch of Sync with OS. A file of an older release
-/// does not, and its theme choice has to stand.
-fn names_sync_with_os(text: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(text)
-        .ok()
-        .is_some_and(|value| value.get("theme_sync_with_os").is_some())
-}
-
-/// A name beside `path` that a save of this process has not taken yet.
-fn temp_path(path: &Path) -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
-    let mut name = path
-        .file_name()
-        .map_or_else(|| "settings".into(), |name| name.to_os_string());
-    name.push(format!(".{}.{sequence}.tmp", std::process::id()));
-    path.with_file_name(name)
 }
 
 /// Copies the changed leaves of `draft` over `target`, one key of an object at a time.

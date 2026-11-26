@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use database::{
     Column, DataModel, Dialect, PageQuery, Plan, RowKind, SourceId, Table, TableKind, TableRef,
-    Value, csv, insert_literal, tsv,
+    Value, csv, identifying_columns, insert_literal, tsv,
 };
 use ui_kit::gpui::{
     DispatchPhase, ListHorizontalSizingBehavior, Modifiers, MouseMoveEvent, MouseUpEvent,
@@ -32,18 +32,35 @@ const DATA_ROW_HEIGHT: f32 = 24.;
 const FIELD_HEIGHT: f32 = 26.;
 /// The group of a column header: its sort icon shows while the header is under the pointer.
 const HEADER_GROUP: &str = "database-data-head";
+/// What a table without a primary or unique key cannot do, in the hint above the grid.
+const NO_KEY_HINT: &str = "The table has no key, so a row cannot be told apart";
 
-/// A question that stands over the tab before it closes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A question that stands over the tab before it closes or before Submit takes the work of
+/// the console with it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Question {
     /// Submit, discard or keep editing before the tab or the window closes.
     Unsaved,
+    /// The console of the source has work that waits for a commit, and Submit would take it
+    /// with the changes of the table.
+    Console {
+        /// The source whose console waits, as the question names it.
+        source: String,
+        /// The tab closes itself once the transaction is committed.
+        closing: bool,
+        /// The console was in Manual before the submit and stays in it after.
+        console_manual: bool,
+    },
 }
 
 impl Question {
-    fn text(self) -> &'static str {
+    fn text(&self) -> String {
         match self {
-            Self::Unsaved => "Submit the changes of this table?",
+            Self::Unsaved => "Submit the changes of this table?".to_owned(),
+            Self::Console { source, .. } => format!(
+                "The console of {source} has an open transaction. \
+                 Commit it with the table changes?"
+            ),
         }
     }
 }
@@ -63,6 +80,9 @@ struct Submit {
     closing: bool,
     /// A statement failed and the transaction is rolling back.
     failed: bool,
+    /// The console of the source was in Manual before the submit; it is left in it after
+    /// the transaction ends, whatever its answer.
+    console_manual: bool,
 }
 
 /// The part of the table that a press picks: one cell, a row from its number, or a column
@@ -248,6 +268,8 @@ pub struct DatabaseDataView {
     page: usize,
     /// The columns of the last page, as the driver named them.
     columns: Vec<Column>,
+    /// The columns that tell a row apart, from the schema of the table.
+    key: Vec<usize>,
     model: DataModel,
     total: Option<u64>,
     filter: TextField,
@@ -292,6 +314,7 @@ impl DatabaseDataView {
         page_rows: usize,
         cx: &mut Context<Self>,
     ) -> Self {
+        let key = identifying_columns(&table);
         Self {
             workspace,
             panel,
@@ -299,7 +322,8 @@ impl DatabaseDataView {
             window,
             path,
             source,
-            model: DataModel::new(table.columns.clone()),
+            model: DataModel::with_key(table.columns.clone(), key.clone()),
+            key,
             table,
             dialect,
             page_rows: page_rows.max(1),
@@ -377,7 +401,19 @@ impl DatabaseDataView {
 
     #[cfg(test)]
     pub(crate) fn question_for_test(&self) -> Option<Question> {
-        self.question
+        self.question.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn editing_for_test(&self) -> bool {
+        self.editing.is_some()
+    }
+
+    /// The hint above the grid for a table whose rows cannot be told apart, for the window
+    /// tests.
+    #[cfg(test)]
+    pub(crate) fn hint_for_test(&self) -> Option<&'static str> {
+        (!self.model.has_key() && !self.model.columns().is_empty()).then_some(NO_KEY_HINT)
     }
 
     #[cfg(test)]
@@ -440,6 +476,12 @@ impl DatabaseDataView {
             filter: self.filter.text.clone(),
             sort: self.sort.as_ref().map(|(name, _)| name.clone()),
             ascending: self.sort.as_ref().is_none_or(|(_, ascending)| *ascending),
+            key: self
+                .key
+                .iter()
+                .filter_map(|index| self.table.columns.get(*index))
+                .map(|column| column.name.clone())
+                .collect(),
             offset: self.page * self.page_rows,
             limit: self.page_rows,
         }
@@ -519,7 +561,7 @@ impl DatabaseDataView {
                 if matches!(ticket.request, DataRequest::Page) {
                     self.columns = columns.clone();
                     if self.model.columns().is_empty() {
-                        self.model = DataModel::new(columns);
+                        self.model = DataModel::with_key(columns, self.key.clone());
                     }
                 }
             }
@@ -536,8 +578,16 @@ impl DatabaseDataView {
                     cx.notify();
                     return;
                 }
-                if let (Some(count), DataRequest::Statement(_)) = (update_count, ticket.request) {
-                    self.status = Some(format!("{count} row(s) changed."));
+                if let DataRequest::Statement(index) = ticket.request {
+                    if self.statement_wrote_one_row(index) && update_count != Some(1) {
+                        self.row_count_failed(index, update_count, cx);
+                        return;
+                    }
+                    if let Some(count) = update_count {
+                        self.status = Some(format!("{count} row(s) changed."));
+                    }
+                    self.advance_submit(cx);
+                    return;
                 }
                 match ticket.request {
                     DataRequest::Page => self.page_read(cx),
@@ -558,7 +608,7 @@ impl DatabaseDataView {
                             self.load(cx);
                         }
                     }
-                    DataRequest::Statement(_) => self.advance_submit(cx),
+                    DataRequest::Statement(_) => {}
                     DataRequest::Commit => self.committed(cx),
                     DataRequest::Rollback => self.rolled_back(cx),
                 }
@@ -567,10 +617,24 @@ impl DatabaseDataView {
                 self.in_flight = None;
                 match ticket.request {
                     DataRequest::Statement(index) => self.failed_submit(index, message, cx),
-                    DataRequest::AutoCommit | DataRequest::Commit | DataRequest::Rollback => {
-                        self.submit = None;
+                    DataRequest::Commit | DataRequest::Rollback => {
+                        // The transaction is still open, or the driver could not end it: the
+                        // console goes back to its own mode, so auto-commit does not stay off.
+                        self.reload_after_commit = false;
+                        self.status = None;
                         self.error = Some(message);
-                        cx.notify();
+                        self.restore_console(cx);
+                    }
+                    DataRequest::AutoCommit => {
+                        let restore = self.submit.is_some();
+                        self.reload_after_commit = false;
+                        self.status = None;
+                        self.error = Some(message);
+                        if restore {
+                            self.restore_console(cx);
+                        } else {
+                            cx.notify();
+                        }
                     }
                     _ => {
                         self.status = None;
@@ -647,23 +711,85 @@ impl DatabaseDataView {
             cx.notify();
             return;
         }
-        let missing_key = !self.model.has_key();
+        let (open, console_manual, source) = self.console_state(cx);
+        if open {
+            self.question = Some(Question::Console {
+                source,
+                closing,
+                console_manual,
+            });
+            cx.notify();
+            return;
+        }
+        self.start_submit(closing, console_manual, cx);
+    }
+
+    /// What the console of the source holds before the table writes: whether it has a
+    /// transaction to commit with the table, the mode it is in, and its name.
+    fn console_state(&self, cx: &App) -> (bool, bool, String) {
+        let Some(panel) = self.panel.upgrade() else {
+            return (false, false, self.source.to_string());
+        };
+        let panel = panel.read(cx);
+        (
+            panel.has_open_transaction(&self.source),
+            panel.console_manual(&self.source),
+            panel.source_title(&self.source),
+        )
+    }
+
+    /// Reads the plan and starts the transaction; the console is put back into
+    /// `console_manual` once the transaction ends.
+    fn start_submit(&mut self, closing: bool, console_manual: bool, cx: &mut Context<Self>) {
+        let plan: Plan = self.model.plan(self.dialect, &self.table_ref());
+        if let Some(error) = plan.error {
+            self.error = Some(error);
+            cx.notify();
+            return;
+        }
+        if plan.statements.is_empty() {
+            self.status = Some("There are no changes to submit.".to_owned());
+            cx.notify();
+            return;
+        }
         self.error = None;
-        self.status = Some(if missing_key {
-            format!(
-                "No primary key: each row is matched by all of its columns. {} statement(s)…",
-                plan.statements.len()
-            )
-        } else {
-            format!("Saving {} statement(s)…", plan.statements.len())
-        });
+        self.status = Some(format!("Saving {} statement(s)…", plan.statements.len()));
         self.submit = Some(Submit {
             steps: plan.statements,
             next: 0,
             closing,
             failed: false,
+            console_manual,
         });
         self.send_command(DataRequest::AutoCommit, DataCommand::AutoCommit(false), cx);
+    }
+
+    /// Whether the statement at `index` names one row, so the driver must report one.
+    fn statement_wrote_one_row(&self, index: usize) -> bool {
+        self.submit
+            .as_ref()
+            .and_then(|submit| submit.steps.get(index))
+            .is_some_and(|statement| statement.one_row)
+    }
+
+    /// A statement of the transaction reported another number of rows than the one it named:
+    /// the row went away, or the matching found several. The whole transaction rolls back,
+    /// because a part of it is not what the user saw.
+    fn row_count_failed(&mut self, index: usize, count: Option<u64>, cx: &mut Context<Self>) {
+        let Some(submit) = &mut self.submit else {
+            return;
+        };
+        let message = match count {
+            Some(count) if count > 1 => format!("{count} rows matched; nothing was saved."),
+            _ => "The row changed or was deleted; nothing was saved.".to_owned(),
+        };
+        submit.failed = true;
+        if let Some(row) = submit.steps.get(index).and_then(|statement| statement.row) {
+            self.model.set_error(row, Some(message.clone()));
+        }
+        self.status = None;
+        self.error = Some(message);
+        self.send_command(DataRequest::Rollback, DataCommand::Rollback, cx);
     }
 
     /// Auto-commit is off and the transaction is open: the next statement or the commit.
@@ -704,28 +830,43 @@ impl DatabaseDataView {
     }
 
     fn committed(&mut self, cx: &mut Context<Self>) {
-        let closing = self.submit.take().is_some_and(|submit| submit.closing);
+        let closing = self.submit.as_ref().is_some_and(|submit| submit.closing);
         self.status = Some("The changes are saved.".to_owned());
         // The rows are the table's now: the next page replaces them without a question.
         self.model.revert();
         self.error = None;
+        self.reload_after_commit = !closing;
+        // The console goes back to the mode it had, rather than to auto-commit: a user who
+        // worked in Manual stays there.
+        self.restore_console(cx);
         if closing {
             self.close(cx);
-            return;
         }
-        // The page is read again from the table, and the default of the driver comes
-        // back, so the next statement of the console commits.
-        self.reload_after_commit = true;
-        self.send_command(DataRequest::AutoCommit, DataCommand::AutoCommit(true), cx);
     }
 
     fn rolled_back(&mut self, cx: &mut Context<Self>) {
-        self.submit = None;
+        self.reload_after_commit = false;
         if self.error.is_none() {
             self.status = Some("The changes are rolled back.".to_owned());
         }
-        // The rows keep their edits: the user can fix the row and submit again.
-        cx.notify();
+        // The console goes back to its own mode, and the rows keep their edits: the user
+        // can fix the row and submit again.
+        self.restore_console(cx);
+    }
+
+    /// Ends the table transaction and puts the console into the mode it had before it: in
+    /// Manual it stays without auto-commit, and otherwise auto-commit comes back on, even
+    /// when the commit or the rollback failed.
+    fn restore_console(&mut self, cx: &mut Context<Self>) {
+        let Some(submit) = self.submit.take() else {
+            cx.notify();
+            return;
+        };
+        self.send_command(
+            DataRequest::AutoCommit,
+            DataCommand::AutoCommit(!submit.console_manual),
+            cx,
+        );
     }
 
     /// Asks whether the tab may close; the question stays over the tab until answered.
@@ -777,6 +918,15 @@ impl DatabaseDataView {
             cx.notify();
             return;
         }
+        let existing = self
+            .model
+            .row(row)
+            .is_some_and(|found| found.kind() == RowKind::Existing);
+        if existing && !self.model.has_key() {
+            self.status = Some(NO_KEY_HINT.to_owned());
+            cx.notify();
+            return;
+        }
         match self.model.set_null(row, column) {
             Ok(()) => self.error = None,
             Err(text) => self.error = Some(text),
@@ -811,6 +961,15 @@ impl DatabaseDataView {
         let Some((row, _)) = self.selected else {
             return;
         };
+        let existing = self
+            .model
+            .row(row)
+            .is_some_and(|found| found.kind() == RowKind::Existing);
+        if existing && !self.model.has_key() {
+            self.status = Some(NO_KEY_HINT.to_owned());
+            cx.notify();
+            return;
+        }
         self.model.delete_row(row);
         let rows = self.model.row_count();
         self.selected = (rows > 0).then(|| ((row).min(rows - 1), 0));
@@ -841,6 +1000,15 @@ impl DatabaseDataView {
             } else {
                 "A binary value has no text to edit.".to_owned()
             });
+            cx.notify();
+            return;
+        }
+        let existing = self
+            .model
+            .row(row)
+            .is_some_and(|found| found.kind() == RowKind::Existing);
+        if existing && !self.model.has_key() {
+            self.status = Some(NO_KEY_HINT.to_owned());
             cx.notify();
             return;
         }
@@ -1229,18 +1397,23 @@ impl DatabaseDataView {
             return;
         };
         let table = self.table_ref();
-        // A cell that the selection does not take is written as NULL, which an INSERT takes
-        // in any column.
+        // Each row writes only the cells the selection takes: a row whose cells are a
+        // different set of columns gets a statement of its own, and no column of it is
+        // filled with a NULL that the user did not select.
         let text = copied
             .rows
             .iter()
-            .map(|row| {
-                insert_literal(
-                    self.dialect,
-                    &table,
-                    &copied.columns,
-                    &filled(row, Value::Null),
-                )
+            .filter_map(|row| {
+                let mut columns = Vec::new();
+                let mut values = Vec::new();
+                for (column, cell) in copied.columns.iter().zip(row) {
+                    if let Some(value) = cell {
+                        columns.push(column.clone());
+                        values.push(value.clone());
+                    }
+                }
+                (!values.is_empty())
+                    .then(|| insert_literal(self.dialect, &table, &columns, &values))
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -1703,29 +1876,64 @@ impl DatabaseDataView {
     }
 
     fn question_band(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let Some(question) = self.question else {
+        let Some(question) = self.question.clone() else {
             return div().into_any_element();
         };
-        let submit = small_button("database-data-question-submit", "Submit", theme)
-            .debug_selector(|| "database-data-question-submit".to_owned())
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.question = None;
-                this.submit(true, cx);
-            }));
-        let discard = small_button("database-data-question-discard", "Discard", theme)
-            .debug_selector(|| "database-data-question-discard".to_owned())
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.question = None;
-                this.model.revert();
-                this.submit = None;
-                this.close(cx);
-            }));
-        let cancel = small_button("database-data-question-cancel", "Cancel", theme)
-            .debug_selector(|| "database-data-question-cancel".to_owned())
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.question = None;
-                cx.notify();
-            }));
+        let answers = match question {
+            Question::Unsaved => {
+                let submit = small_button("database-data-question-submit", "Submit", theme)
+                    .debug_selector(|| "database-data-question-submit".to_owned())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.question = None;
+                        this.submit(true, cx);
+                    }));
+                let discard = small_button("database-data-question-discard", "Discard", theme)
+                    .debug_selector(|| "database-data-question-discard".to_owned())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.question = None;
+                        this.model.revert();
+                        this.submit = None;
+                        this.close(cx);
+                    }));
+                let cancel = small_button("database-data-question-cancel", "Cancel", theme)
+                    .debug_selector(|| "database-data-question-cancel".to_owned())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.question = None;
+                        cx.notify();
+                    }));
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .child(submit)
+                    .child(discard)
+                    .child(cancel)
+            }
+            Question::Console {
+                closing,
+                console_manual,
+                ..
+            } => {
+                let commit = small_button("database-data-question-commit", "Commit", theme)
+                    .debug_selector(|| "database-data-question-commit".to_owned())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.question = None;
+                        this.start_submit(closing, console_manual, cx);
+                    }));
+                let cancel = small_button("database-data-question-cancel", "Cancel", theme)
+                    .debug_selector(|| "database-data-question-cancel".to_owned())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.question = None;
+                        cx.notify();
+                    }));
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_S))
+                    .child(commit)
+                    .child(cancel)
+            }
+        };
         div()
             .id("database-data-question")
             .debug_selector(|| "database-data-question".to_owned())
@@ -1738,15 +1946,7 @@ impl DatabaseDataView {
             .flex_none()
             .bg(theme.hover)
             .child(div().child(question.text()))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(SPACE_S))
-                    .child(submit)
-                    .child(discard)
-                    .child(cancel),
-            )
+            .child(answers)
             .into_any_element()
     }
 
@@ -1770,10 +1970,7 @@ impl DatabaseDataView {
                 div()
                     .debug_selector(|| "database-data-nokey".to_owned())
                     .text_color(theme.text_muted)
-                    .child(
-                        "No primary key: a row is found by all of its columns, so two equal \
-                         rows are written twice.",
-                    ),
+                    .child(NO_KEY_HINT),
             );
         }
         if let Some(error) = &self.error {

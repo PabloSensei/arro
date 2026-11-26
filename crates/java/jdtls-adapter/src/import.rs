@@ -7,12 +7,11 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::Mutex;
 
 use base::program::executable;
-use lsp_client::lsp_types::{Diagnostic, DiagnosticSeverity, Uri};
-use lsp_client::uri::file_path;
+use lsp_client::lsp_types::{Diagnostic, DiagnosticSeverity};
+use lsp_client::uri::{file_path, server_uri};
 use serde_json::Value;
 use tokio::sync::watch;
 
@@ -387,7 +386,7 @@ impl ImportState {
         let Some(uri) = params.get("uri").and_then(Value::as_str) else {
             return;
         };
-        let Some(file) = Uri::from_str(uri).ok().as_ref().and_then(file_path) else {
+        let Some(file) = server_uri(uri).and_then(|uri| file_path(&uri)) else {
             return;
         };
         if !is_build_file(&file) {

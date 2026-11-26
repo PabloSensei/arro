@@ -331,6 +331,280 @@ fn safe_name(id: &str) -> String {
     }
 }
 
+/// The password names a JDBC address may carry as a parameter or a property, as in
+/// `jdbc:postgresql://db/owners?password=s3cret` or `jdbc:sqlserver://db;password=s3cret`.
+const PASSWORD_NAMES: &[&str] = &["password", "passwd", "pwd"];
+
+/// The parameters of an address that make its driver run code or load a script as soon as
+/// it connects. Such an address is refused: a connection is a place to read a database, not
+/// a way to run what a project file or an agent wrote.
+///
+/// * `INIT`, `RUNSCRIPT` run a script of the product (H2).
+/// * `autoDeserialize` makes the product read a serialized object and build it (MySQL).
+/// * `socketFactory`, `socketFactoryArg`, `sslfactory` name a class the driver builds, which
+///   is code from outside the project (PostgreSQL, MySQL).
+/// * `allowLoadLocalInfile`, `allowLoadLocalInfileInPath`, `allowUrlInLocalInfile` read a
+///   file of this machine or a URL on the request of the server (MySQL).
+const RUNNING_PARAMETERS: &[&str] = &[
+    "INIT",
+    "RUNSCRIPT",
+    "autoDeserialize",
+    "socketFactory",
+    "socketFactoryArg",
+    "sslfactory",
+    "allowLoadLocalInfile",
+    "allowLoadLocalInfileInPath",
+    "allowUrlInLocalInfile",
+];
+
+/// The parameter of an address that runs code or loads a script, with the reason the window
+/// shows; `None` for an address that only names a database.
+pub fn running_parameter(url: &str) -> Option<String> {
+    let name = url
+        .split(['?', ';', '&'])
+        .skip(1)
+        .filter_map(|token| token.split(['=', ' ']).next())
+        .map(str::trim)
+        .find(|name| {
+            RUNNING_PARAMETERS
+                .iter()
+                .any(|known| name.eq_ignore_ascii_case(known))
+        })?;
+    Some(format!(
+        "The address sets {name}, which runs code or loads a script when the driver connects."
+    ))
+}
+
+/// The parameters of an address after its first `?` or `;`, as name and value.
+fn parameters(url: &str) -> impl Iterator<Item = (&str, &str)> {
+    url.split(['?', ';', '&'])
+        .skip(1)
+        .filter_map(|token| token.split_once('='))
+        .map(|(name, value)| (name.trim(), value.trim()))
+}
+
+/// Whether two addresses name another machine, port or database, so that a password kept
+/// for the first must not go to the second. An address that cannot be read counts as
+/// another one: asking for the password again is safe, sending it to a stranger is not.
+pub fn points_elsewhere(old: &str, new: &str) -> bool {
+    address_target(old) != address_target(new)
+}
+
+/// The product, host, port and database of an address, as two addresses compare.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AddressTarget {
+    product: String,
+    host: String,
+    port: String,
+    database: String,
+}
+
+fn address_target(url: &str) -> AddressTarget {
+    let text = url.trim();
+    let text = if text
+        .get(..5)
+        .is_some_and(|head| head.eq_ignore_ascii_case("jdbc:"))
+    {
+        &text[5..]
+    } else {
+        text
+    };
+    let (product, base) = match text.find(':') {
+        Some(at) => (text[..at].to_ascii_lowercase(), &text[at + 1..]),
+        None => (text.to_ascii_lowercase(), ""),
+    };
+    let base = strip_user_information(base);
+    let mut target = AddressTarget {
+        product,
+        ..AddressTarget::default()
+    };
+    // The part after `//` of an address, or after the `://` of a sub-protocol such as
+    // `jdbc:h2:tcp://host/db`.
+    let authority = base
+        .strip_prefix("//")
+        .or_else(|| base.find("://").map(|at| &base[at + 3..]));
+    let rest = if let Some(after) = authority {
+        let end = after.find(['/', '?', ';', '#']).unwrap_or(after.len());
+        let (host, port) = split_authority(&after[..end]);
+        target.host = host;
+        target.port = port;
+        after.get(end..).unwrap_or_default()
+    } else if let Some(after) = base.strip_prefix('@') {
+        // The thin form of Oracle: `@host:port:sid`.
+        let mut parts = after.splitn(3, ':');
+        target.host = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+        target.port = parts.next().unwrap_or_default().trim().to_owned();
+        target.database = parts.next().unwrap_or_default().trim().to_owned();
+        return target;
+    } else {
+        &base
+    };
+    target.database = database_of(rest);
+    if target.port.is_empty() {
+        target.port = default_port(&target.product).to_owned();
+    }
+    target
+}
+
+/// `user:password@` in front of the address, without the user information: a change of it is
+/// not a change of the machine.
+fn strip_user_information(base: &str) -> String {
+    let start = if base.starts_with("//") {
+        Some(2)
+    } else {
+        base.find("://").map(|at| at + 3)
+    };
+    let Some(start) = start else {
+        return base.to_owned();
+    };
+    let text = &base[start..];
+    let Some(at) = text.find('@') else {
+        return base.to_owned();
+    };
+    let end = text.find(['/', '?', ';', '#']).unwrap_or(text.len());
+    if at > end {
+        return base.to_owned();
+    }
+    format!("{}{}", &base[..start], &text[at + 1..])
+}
+
+/// The host and the port of an authority such as `db.local:5432` or `[::1]:5432`.
+fn split_authority(authority: &str) -> (String, String) {
+    if let Some(end) = authority.find(']') {
+        let host = authority[..=end].to_ascii_lowercase();
+        let port = authority[end + 1..]
+            .strip_prefix(':')
+            .unwrap_or_default()
+            .to_owned();
+        return (host, port);
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port))
+            if !port.is_empty() && port.chars().all(|digit| digit.is_ascii_digit()) =>
+        {
+            (host.to_ascii_lowercase(), port.to_owned())
+        }
+        _ => (authority.to_ascii_lowercase(), String::new()),
+    }
+}
+
+/// The database of the rest of an address: a `databaseName` or `database` property when one
+/// is there, and otherwise the first part of the path.
+fn database_of(rest: &str) -> String {
+    if let Some((_, value)) = parameters(rest).find(|(name, _)| {
+        name.eq_ignore_ascii_case("databaseName") || name.eq_ignore_ascii_case("database")
+    }) {
+        return value.to_owned();
+    }
+    rest.split(['?', ';'])
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches('/')
+        .to_owned()
+}
+
+/// The port a product uses when the address names none.
+fn default_port(product: &str) -> &'static str {
+    match product {
+        "postgresql" | "postgres" => "5432",
+        "mysql" | "mariadb" => "3306",
+        "sqlserver" => "1433",
+        "oracle" => "1521",
+        "h2" => "9092",
+        _ => "",
+    }
+}
+
+/// The address without its password, and the password it carried: in a `password`,
+/// `passwd` or `pwd` parameter or after the user of its user information. An address that
+/// keeps a password is never written to the state folder.
+pub fn split_password(url: &str) -> (String, Option<Secret>) {
+    let (text, user_information) = strip_user_password(url);
+    let (text, parameter) = strip_parameter_password(&text);
+    let password = parameter
+        .or(user_information)
+        .filter(|text| !text.is_empty());
+    (text, password.map(Secret::new))
+}
+
+/// `scheme://user:password@host` without the password of the user information.
+fn strip_user_password(text: &str) -> (String, Option<String>) {
+    let Some(scheme) = text.find("://") else {
+        return (text.to_owned(), None);
+    };
+    let rest = &text[scheme + 3..];
+    let Some(at) = rest.find('@') else {
+        return (text.to_owned(), None);
+    };
+    let host_end = rest.find(['/', '?', ';', '#']).unwrap_or(rest.len());
+    if at > host_end {
+        return (text.to_owned(), None);
+    }
+    let user_information = &rest[..at];
+    let Some(colon) = user_information.find(':') else {
+        return (text.to_owned(), None);
+    };
+    let password = user_information[colon + 1..].to_owned();
+    (
+        format!("{}{}{}", &text[..scheme + 3], &rest[..colon], &rest[at..]),
+        Some(password),
+    )
+}
+
+/// The address without its password parameters, and the first password they carried.
+fn strip_parameter_password(text: &str) -> (String, Option<String>) {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut password = None;
+    let mut at = 0;
+    while at < bytes.len() {
+        let starts_a_value = at == 0 || matches!(bytes[at - 1], b'?' | b'&' | b';');
+        if !starts_a_value {
+            at += 1;
+            continue;
+        }
+        let Some(name) = PASSWORD_NAMES.iter().find(|name| {
+            text.get(at..at + name.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(name))
+        }) else {
+            at += 1;
+            continue;
+        };
+        let mut cursor = at + name.len();
+        if bytes.get(cursor) != Some(&b'=') {
+            at = cursor;
+            continue;
+        }
+        cursor += 1;
+        let value_start = cursor;
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| !matches!(byte, b'&' | b';' | b'\n' | b'\r' | b' '))
+        {
+            cursor += 1;
+        }
+        if password.is_none() {
+            password = Some(text[value_start..cursor].to_owned());
+        }
+        // The chunk goes with the separator that opened it, so no `&&` or `;` is left; a `?`
+        // stays when another parameter follows it, and goes otherwise.
+        let (from, to) = match at.checked_sub(1).map(|index| bytes[index]) {
+            Some(b'?') => match bytes.get(cursor) {
+                Some(b'&' | b';') => (at, cursor + 1),
+                _ => (at - 1, cursor),
+            },
+            Some(b'&' | b';') => (at - 1, cursor),
+            _ => (at, cursor),
+        };
+        out.push_str(&text[copied..from]);
+        copied = to;
+        at = to;
+    }
+    out.push_str(&text[copied..]);
+    (out, password)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,6 +658,109 @@ mod tests {
         assert_eq!(
             path,
             Path::new("state/database/console/___old_h2/console.sql")
+        );
+    }
+
+    #[test]
+    fn another_host_port_or_database_is_another_target() {
+        assert!(!points_elsewhere(
+            "jdbc:postgresql://db.local:5432/owners",
+            "jdbc:postgresql://db.local:5432/owners"
+        ));
+        assert!(!points_elsewhere(
+            "jdbc:postgresql://DB.LOCAL/owners",
+            "jdbc:postgresql://db.local:5432/owners"
+        ));
+        assert!(!points_elsewhere(
+            "jdbc:postgresql://user:first@db.local/owners",
+            "jdbc:postgresql://user:second@db.local/owners?password=x"
+        ));
+        assert!(points_elsewhere(
+            "jdbc:postgresql://db.local:5432/owners",
+            "jdbc:postgresql://other.local:5432/owners"
+        ));
+        assert!(points_elsewhere(
+            "jdbc:postgresql://db.local:5432/owners",
+            "jdbc:postgresql://db.local:5433/owners"
+        ));
+        assert!(points_elsewhere(
+            "jdbc:postgresql://db.local:5432/owners",
+            "jdbc:postgresql://db.local:5432/neighbours"
+        ));
+        assert!(points_elsewhere(
+            "jdbc:sqlserver://db.local;databaseName=owners",
+            "jdbc:sqlserver://db.local;databaseName=neighbours"
+        ));
+        assert!(points_elsewhere(
+            "jdbc:h2:tcp://db.local/~/owners",
+            "jdbc:h2:tcp://other.local/~/owners"
+        ));
+        assert!(!points_elsewhere(
+            "jdbc:h2:mem:owners",
+            "jdbc:h2:mem:owners"
+        ));
+        assert!(points_elsewhere(
+            "jdbc:h2:mem:owners",
+            "jdbc:h2:mem:neighbours"
+        ));
+    }
+
+    #[test]
+    fn an_address_that_runs_code_or_a_script_is_named() {
+        for url in [
+            "jdbc:h2:mem:x;INIT=RUNSCRIPT FROM 'http://a'",
+            "jdbc:h2:mem:x;runscript from 'x.sql'",
+            "jdbc:mysql://db/x?autoDeserialize=true",
+            "jdbc:postgresql://db/x?socketFactory=com.example.Factory",
+            "jdbc:mysql://db/x?allowLoadLocalInfile=true",
+            "jdbc:mysql://db/x?allowUrlInLocalInfile=true&user=app",
+        ] {
+            assert!(running_parameter(url).is_some(), "{url}");
+        }
+        assert!(running_parameter("jdbc:h2:mem:x;DB_CLOSE_DELAY=-1").is_none());
+        assert!(running_parameter("jdbc:postgresql://db/x?user=app&ssl=true").is_none());
+    }
+
+    #[test]
+    fn a_password_of_the_address_goes_to_its_owner() {
+        assert_eq!(
+            split_password("jdbc:postgresql://db/owners?user=app&password=s3cret"),
+            (
+                "jdbc:postgresql://db/owners?user=app".to_owned(),
+                Some(Secret::new("s3cret"))
+            )
+        );
+        assert_eq!(
+            split_password("jdbc:postgresql://db/owners?password=s3cret&user=app"),
+            (
+                "jdbc:postgresql://db/owners?user=app".to_owned(),
+                Some(Secret::new("s3cret"))
+            )
+        );
+        assert_eq!(
+            split_password("jdbc:postgresql://db/owners?password=s3cret"),
+            (
+                "jdbc:postgresql://db/owners".to_owned(),
+                Some(Secret::new("s3cret"))
+            )
+        );
+        assert_eq!(
+            split_password("jdbc:sqlserver://db;user=app;password=s3cret;encrypt=true"),
+            (
+                "jdbc:sqlserver://db;user=app;encrypt=true".to_owned(),
+                Some(Secret::new("s3cret"))
+            )
+        );
+        assert_eq!(
+            split_password("jdbc:mysql://user:s3cret@db/owners"),
+            (
+                "jdbc:mysql://user@db/owners".to_owned(),
+                Some(Secret::new("s3cret"))
+            )
+        );
+        assert_eq!(
+            split_password("jdbc:h2:mem:test"),
+            ("jdbc:h2:mem:test".to_owned(), None)
         );
     }
 }

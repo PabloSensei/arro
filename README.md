@@ -45,11 +45,11 @@
 </p>
 
 <p align="center">
-  <img src=".github/readme/hero.png" alt="Arro in the Dark theme: an AI agent in the AI Sessions panel traces a Spring PetClinic bug through the IDE tools, its edit to the controller waits for review with Accept All and Reject All, and the Git log sits below" width="100%">
+  <img src=".github/readme/demo-ai.gif" alt="Arro in the Nightfall theme: a Claude agent in the AI Sessions panel is asked why owners with no pets show up on the Spring PetClinic search page; it calls the IDE's find_usages, get_type_hierarchy and get_diagnostics tools, asks before it runs the OwnerController tests, then its edit lands in the controller and waits for review with Accept All, Reject All and Review" width="100%">
 </p>
 
-> [!WARNING]
-> **Early preview.** Arro is young. Expect rough edges, missing features and breaking changes between versions. Bug reports are very welcome.
+> [!NOTE]
+> **Arro is young.** It is used for real work every day, but expect rough edges and changes between versions. Bug reports are very welcome.
 
 ## Why Arro
 
@@ -57,6 +57,7 @@
 - **Feels like home for IntelliJ users.** The same shortcuts (Shift Shift, Ctrl+N, Alt+Enter, Ctrl+Alt+L, Shift+F10…), the same menus and the same tool windows, so moving over takes minutes, not weeks.
 - **Light.** The IDE itself stays small; the heavy lifting goes to the Eclipse JDT Language Server, which Arro starts, watches and restarts for you.
 - **AI-native.** Claude Code, Codex and any MCP client work with Arro, not around it. They read diagnostics, usages and the project structure from the IDE, set breakpoints and step through a test in Arro's own debugger. Their edits come to you as hunks to accept or reject, they build and run tests only with your permission, and **Fix with AI** sends an error to an agent from where you see it.
+- **Safe with code you just cloned.** A project you have not trusted yet opens in Safe Mode: you can read, search and use Git, but no build script, Maven or Gradle wrapper, compiler plugin or language server runs until you press Trust Project.
 - **Never freezes on a tool.** Builds, Git, the language server and the debugger all run outside the UI thread. A slow Maven import does not stop typing.
 
 ## Features
@@ -105,7 +106,7 @@
     </td>
     <td width="50%" valign="top">
       <h3>Themes</h3>
-      Seven built-in themes: Dark, Light, High Contrast, Retro, Nord, Mocha and Paper. Pick one for the light and one for the dark system appearance and let Arro follow the OS, preview a theme with Quick Switch Scheme (Ctrl+`), write your own as a short JSON file, or import an IntelliJ IDEA <code>.icls</code> color scheme.
+      Eight built-in themes: Dark, Light, High Contrast, Retro, Nord, Mocha, Paper and Nightfall, the violet dark theme shared with Bowyer. Pick one for the light and one for the dark system appearance and let Arro follow the OS, preview a theme with Quick Switch Scheme (Ctrl+`), write your own as a short JSON file, or import an IntelliJ IDEA <code>.icls</code> color scheme.
     </td>
   </tr>
   <tr>
@@ -210,6 +211,14 @@ The Rust toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml). `c
 | macOS (Apple silicon; Intel where a runner builds it) | 🚧 Preview release |
 | AI agents over MCP (code, run, tests, debugger) and the AI Sessions panel (Claude Code, Codex, OpenCode) | 🚧 New |
 | More languages on the same core | 🗓️ Planned |
+
+## Bowyer, the sibling app
+
+[Bowyer](https://github.com/PabloSensei/bowyer) is one native window for every AI coding agent you run: Claude Code, Codex, OpenCode and DeepSeek sessions, on this computer and over SSH, with a mission control grid, full-text search over every session and permission questions answered on the spot. It is built on the same Rust crates as Arro, and a Claude Code session in Bowyer connects to the Arro window that has its folder open.
+
+<p align="center">
+  <a href="https://github.com/PabloSensei/bowyer"><img src="https://raw.githubusercontent.com/PabloSensei/bowyer/main/.github/readme/mission-control.gif" alt="Bowyer's mission control: several Claude Code and Codex agents stream their tool calls in a grid of cards, and a permission question is answered right on a card" width="100%"></a>
+</p>
 
 ## Support
 

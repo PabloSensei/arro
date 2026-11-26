@@ -4,6 +4,7 @@
 
 mod store;
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -121,8 +122,10 @@ impl Revision {
 pub struct Limits {
     /// Older revisions go at the next prune.
     pub max_age: Duration,
-    /// The compressed contents together; the oldest revisions go first, but the last
-    /// version with content of each file stays while the file is on disk.
+    /// The compressed contents together. Past it a prune takes, in this order: the versions in
+    /// skipped folders; then the labels, the tombstones and the older versions of files still on
+    /// disk, oldest first; then the contents of deleted files. The last version with content of
+    /// each file stays while the file is on disk, whatever the size.
     pub max_bytes: u64,
     /// A larger file is not recorded, and neither is one bigger than half of `max_bytes`:
     /// one build output must not push the history of every other file out.
@@ -138,6 +141,10 @@ impl Default for Limits {
         }
     }
 }
+
+/// Tells by a folder's name whether the history leaves the folder out. See
+/// [`LocalHistory::open_skipping`].
+pub type SkipFolders = dyn Fn(&str) -> bool + Send + Sync;
 
 /// Paths compare without case and with either slash, as on Windows.
 fn key_of(path: &Path) -> String {
@@ -155,48 +162,71 @@ fn millis(at: SystemTime) -> u64 {
         .map_or(0, |since| since.as_millis() as u64)
 }
 
+/// What the lock guards: the index, the log it is written to, and the bytes the blob files
+/// take on disk, the ones no entry refers to included.
 struct State {
     log: Log,
     entries: Vec<Entry>,
     next_id: u64,
+    stored: u64,
 }
 
 pub struct LocalHistory {
     blobs: BlobStore,
     limits: Limits,
+    skipped: Box<SkipFolders>,
     state: Mutex<State>,
 }
 
 impl LocalHistory {
-    /// Opens or creates the history in `dir` and drops what the limits no longer keep.
+    /// Opens or creates the history in `dir` and drops what the limits no longer keep. No
+    /// folder is skipped; see [`LocalHistory::open_skipping`].
     pub fn open(dir: &Path, limits: Limits) -> io::Result<Self> {
+        Self::open_skipping(dir, limits, Box::new(|_: &str| false))
+    }
+
+    /// Opens the history like [`LocalHistory::open`], and leaves out the folders that `skipped`
+    /// accepts by name. A tree command records nothing under a folder that is skipped, and the
+    /// folder itself is skipped when it is the one the command names. A size limit takes the
+    /// versions of the folders skipped first. The folders above a file are judged by the same
+    /// names, except the dot-folders: a project may live under one, and then all its files would
+    /// count as skipped.
+    pub fn open_skipping(
+        dir: &Path,
+        limits: Limits,
+        skipped: Box<SkipFolders>,
+    ) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
         let blobs = BlobStore::new(dir.join("blobs"))?;
+        let stored = blobs.total()?;
         let log = Log::new(dir.join("index.log"));
         let entries = log.read()?;
         let next_id = entries.iter().map(|entry| entry.id + 1).max().unwrap_or(1);
         let history = Self {
             blobs,
             limits,
+            skipped,
             state: Mutex::new(State {
                 log,
                 entries,
                 next_id,
+                stored,
             }),
         };
         history.prune()?;
         Ok(history)
     }
 
-    fn add(
+    /// Appends a revision to the log and to the index. The caller holds the lock.
+    fn add_locked(
         &self,
+        state: &mut State,
         path: &Path,
         cause: Cause,
         content: Option<String>,
         label: Option<String>,
         at: SystemTime,
     ) -> io::Result<Revision> {
-        let mut state = self.state.lock().unwrap();
         let entry = Entry {
             id: state.next_id,
             at: millis(at),
@@ -214,6 +244,25 @@ impl LocalHistory {
     /// The largest file a version is taken of.
     fn file_cap(&self) -> u64 {
         self.limits.max_file_bytes.min(self.limits.max_bytes / 2)
+    }
+
+    /// Whether the history leaves out the folder `folder`, by its name.
+    fn skips(&self, folder: &Path) -> bool {
+        folder
+            .file_name()
+            .is_some_and(|name| (self.skipped)(&name.to_string_lossy()))
+    }
+
+    /// Whether a folder above `path` is one the history skips. Dot-folders are not judged, see
+    /// [`LocalHistory::open_skipping`].
+    fn in_skipped_folder(&self, path: &Path) -> bool {
+        path.ancestors()
+            .skip(1)
+            .filter_map(Path::file_name)
+            .any(|name| {
+                let name = name.to_string_lossy();
+                !name.starts_with('.') && (self.skipped)(&name)
+            })
     }
 
     /// Takes `bytes` as the version of `path`; `None` means the file is not there. A save
@@ -239,37 +288,52 @@ impl LocalHistory {
         if bytes.is_some_and(|bytes| bytes.len() as u64 > self.file_cap()) {
             return Ok(None);
         }
+        let mut state = self.state.lock().unwrap();
+        // The blob is written under the lock, so a prune cannot take it away before the
+        // revision that refers to it is in the index.
         let content = match bytes {
-            Some(bytes) => Some(self.blobs.put(bytes)?),
+            Some(bytes) => {
+                let stored = self.blobs.put(bytes)?;
+                state.stored += stored.written;
+                Some(stored.id)
+            }
             None => None,
         };
         let key = key_of(path);
-        let last = {
-            let state = self.state.lock().unwrap();
-            let mut files = state
-                .entries
-                .iter()
-                .rev()
-                .filter(|entry| entry.cause != Cause::Label);
-            files
-                .find(|entry| key_of(&entry.path) == key)
-                .map(|entry| entry.content.clone())
-        };
+        let last = state
+            .entries
+            .iter()
+            .rev()
+            .filter(|entry| entry.cause != Cause::Label)
+            .find(|entry| key_of(&entry.path) == key)
+            .map(|entry| entry.content.clone());
         // A save of the text the history already holds adds nothing; the same bytes in
         // front of another cause still say what happened to the file.
         let repeats = matches!(cause, Cause::Saved | Cause::Auto);
         if repeats && (last == Some(content.clone()) || (last.is_none() && content.is_none())) {
             return Ok(None);
         }
-        let revision = self.add(path, cause, content, None, at)?;
-        if self.blobs.total()? > self.limits.max_bytes {
+        let revision = self.add_locked(&mut state, path, cause, content, None, at)?;
+        let over = state.stored > self.limits.max_bytes;
+        drop(state);
+        if over {
             self.prune()?;
         }
         Ok(Some(revision))
     }
 
-    /// Reads `path` from disk and records it.
+    /// Reads `path` from disk and records it. A file too big for the history is not read.
     pub fn record_file(&self, path: &Path, cause: Cause) -> io::Result<Option<Revision>> {
+        let len = match fs::metadata(path) {
+            Ok(meta) => meta.len(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return self.record(path, None, cause);
+            }
+            Err(error) => return Err(error),
+        };
+        if len > self.file_cap() {
+            return Ok(None);
+        }
         match fs::read(path) {
             Ok(bytes) => self.record(path, Some(&bytes), cause),
             Err(error) if error.kind() == io::ErrorKind::NotFound => self.record(path, None, cause),
@@ -277,13 +341,32 @@ impl LocalHistory {
         }
     }
 
-    /// Records every file under `path`, or the file itself.
+    /// Records every file under `path`, or the file itself. A folder the history skips is left
+    /// out with everything under it, `path` included. A symbolic link or a junction is not
+    /// entered, so a junction that leads back into its own folder cannot make the walk endless.
     pub fn record_tree(&self, path: &Path, cause: Cause) -> io::Result<()> {
-        if !path.is_dir() {
-            return self.record_file(path, cause).map(drop);
-        }
-        for entry in fs::read_dir(path)? {
-            self.record_tree(&entry?.path(), cause)?;
+        let mut pending = vec![path.to_path_buf()];
+        while let Some(next) = pending.pop() {
+            let kind = match fs::symlink_metadata(&next) {
+                Ok(meta) => meta.file_type(),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    self.record_file(&next, cause)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
+                if !self.skips(&next) {
+                    for entry in fs::read_dir(&next)? {
+                        pending.push(entry?.path());
+                    }
+                }
+            } else {
+                self.record_file(&next, cause)?;
+            }
         }
         Ok(())
     }
@@ -313,7 +396,15 @@ impl LocalHistory {
     /// A label over everything under `folder`.
     pub fn put_label(&self, folder: &Path, label: &str) -> io::Result<Revision> {
         let label = label.replace(['\t', '\n', '\r'], " ");
-        self.add(folder, Cause::Label, None, Some(label), SystemTime::now())
+        let mut state = self.state.lock().unwrap();
+        self.add_locked(
+            &mut state,
+            folder,
+            Cause::Label,
+            None,
+            Some(label),
+            SystemTime::now(),
+        )
     }
 
     /// An estimate of the bytes the index of versions keeps in memory, for the memory panel.
@@ -413,69 +504,99 @@ impl LocalHistory {
         self.prune_at(SystemTime::now())
     }
 
+    /// One pass over the index for each step: the time over the index is linear, and each
+    /// distinct path is looked at on disk once.
     fn prune_at(&self, now: SystemTime) -> io::Result<()> {
         let mut state = self.state.lock().unwrap();
         let oldest = millis(now).saturating_sub(self.limits.max_age.as_millis() as u64);
         let before = state.entries.len();
         state.entries.retain(|entry| entry.at >= oldest);
-        let mut sizes = self.blobs.sizes()?;
-        let referenced = |entries: &[Entry], id: &str| {
-            entries
-                .iter()
-                .any(|entry| entry.content.as_deref() == Some(id))
-        };
-        let total = |entries: &[Entry], sizes: &[(String, u64)]| -> u64 {
-            sizes
-                .iter()
-                .filter(|(id, _)| referenced(entries, id))
-                .map(|(_, size)| size)
-                .sum()
-        };
-        // The last version of a file is its last entry that has content: the tombstone
-        // written after a delete has none. That version of a file still on disk stays,
-        // whatever the size.
-        let mut last: Vec<(String, u64, bool)> = Vec::new();
-        for entry in state.entries.iter().filter(|entry| entry.content.is_some()) {
-            let key = key_of(&entry.path);
-            let live = entry.path.exists();
-            match last.iter_mut().find(|(known, _, _)| *known == key) {
-                Some((_, id, on_disk)) => {
-                    *id = entry.id;
-                    *on_disk = live;
+
+        let keys: Vec<String> = state
+            .entries
+            .iter()
+            .map(|entry| key_of(&entry.path))
+            .collect();
+        let mut on_disk: HashMap<&str, bool> = HashMap::new();
+        for (entry, key) in state.entries.iter().zip(&keys) {
+            on_disk
+                .entry(key.as_str())
+                .or_insert_with(|| entry.path.exists());
+        }
+        // The last version with content of each file: it stays while the file is on disk.
+        let mut last: HashMap<&str, u64> = HashMap::new();
+        for (entry, key) in state.entries.iter().zip(&keys) {
+            if entry.content.is_some() {
+                last.insert(key.as_str(), entry.id);
+            }
+        }
+        // The tier an entry goes in when the limit bites, from the first to go; `None` stays.
+        let mut tiers: Vec<Option<u8>> = Vec::with_capacity(state.entries.len());
+        for (entry, key) in state.entries.iter().zip(&keys) {
+            let tier = if entry.content.is_none() {
+                Some(1)
+            } else if on_disk[key.as_str()] && last.get(key.as_str()) == Some(&entry.id) {
+                None
+            } else if self.in_skipped_folder(&entry.path) {
+                Some(0)
+            } else if !on_disk[key.as_str()] {
+                Some(2)
+            } else {
+                Some(1)
+            };
+            tiers.push(tier);
+        }
+
+        let mut refs: HashMap<String, usize> = HashMap::new();
+        for entry in &state.entries {
+            if let Some(id) = &entry.content {
+                *refs.entry(id.clone()).or_insert(0) += 1;
+            }
+        }
+        let sizes: HashMap<String, u64> = self.blobs.sizes()?.into_iter().collect();
+        let size_of = |id: &str| sizes.get(id).copied().unwrap_or(0);
+        let mut used: u64 = refs.keys().map(|id| size_of(id)).sum();
+        let mut removed = vec![false; state.entries.len()];
+        'tiers: for tier in [0u8, 1, 2] {
+            for index in 0..state.entries.len() {
+                if used <= self.limits.max_bytes {
+                    break 'tiers;
                 }
-                None => last.push((key, entry.id, live)),
+                if tiers[index] != Some(tier) {
+                    continue;
+                }
+                removed[index] = true;
+                if let Some(id) = &state.entries[index].content
+                    && let Some(count) = refs.get_mut(id)
+                {
+                    *count -= 1;
+                    if *count == 0 {
+                        used -= size_of(id);
+                    }
+                }
             }
         }
-        let kept = |entry: &Entry| last.iter().any(|(_, id, live)| *live && *id == entry.id);
-        let over = |entries: &[Entry]| total(entries, &sizes) > self.limits.max_bytes;
-        let gone = |entry: &Entry| entry.content.is_some() && !entry.path.exists();
-        // Older versions of files still on disk, labels and tombstones go first, oldest
-        // first. The content of a deleted file can still be restored, so it goes only after
-        // them, its newest version last.
-        let mut at = 0;
-        while over(&state.entries) && at < state.entries.len() {
-            let entry = &state.entries[at];
-            if kept(entry) || gone(entry) {
-                at += 1;
-            } else {
-                state.entries.remove(at);
+        let mut index = 0;
+        state.entries.retain(|_| {
+            let keep = !removed[index];
+            index += 1;
+            keep
+        });
+
+        // A blob that no entry refers to any more goes from the disk.
+        let mut orphans: Vec<(&str, u64)> = Vec::new();
+        for (id, size) in &sizes {
+            if refs.get(id.as_str()).copied().unwrap_or(0) == 0 {
+                orphans.push((id.as_str(), *size));
             }
         }
-        let mut at = 0;
-        while over(&state.entries) && at < state.entries.len() {
-            if kept(&state.entries[at]) {
-                at += 1;
-            } else {
-                state.entries.remove(at);
-            }
-        }
-        sizes.retain(|(id, _)| !referenced(&state.entries, id));
-        for (id, _) in &sizes {
+        for &(id, size) in &orphans {
             self.blobs.remove(id)?;
+            state.stored = state.stored.saturating_sub(size);
         }
-        if state.entries.len() != before || !sizes.is_empty() {
-            let entries = state.entries.clone();
-            state.log.rewrite(&entries)?;
+        let State { log, entries, .. } = &mut *state;
+        if entries.len() != before || !orphans.is_empty() {
+            log.rewrite(entries.as_slice())?;
         }
         Ok(())
     }

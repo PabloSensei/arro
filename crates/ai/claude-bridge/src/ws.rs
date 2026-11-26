@@ -4,6 +4,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use sha1_smol::Sha1;
@@ -11,6 +12,9 @@ use sha1_smol::Sha1;
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const MAX_HEADERS: usize = 16 * 1024;
 const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+/// How long a connection may take to send its request headers. The deadline covers the whole
+/// request, not each byte of it, so a client that trickles its headers is closed too.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Opcode {
@@ -43,10 +47,17 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
-fn read_until_headers(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+fn read_until_headers(stream: &mut TcpStream, deadline: Instant) -> io::Result<Vec<u8>> {
     let mut raw = Vec::new();
     let mut byte = [0u8; 1];
     while raw.len() < MAX_HEADERS {
+        let left = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::TimedOut, "the request headers came too late")
+            })?;
+        stream.set_read_timeout(Some(left))?;
         let read = stream.read(&mut byte)?;
         if read == 0 {
             return Err(io::Error::new(
@@ -68,7 +79,8 @@ fn read_until_headers(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
 /// Answers the upgrade. `Ok(false)` means the request was refused for a reason the
 /// client can read; the caller only closes the socket.
 pub(crate) fn handshake(stream: &mut TcpStream, token: &str) -> io::Result<bool> {
-    let raw = read_until_headers(stream)?;
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    let raw = read_until_headers(stream, deadline)?;
     let text = String::from_utf8_lossy(&raw);
     let mut lines = text.lines();
     let request = lines.next().unwrap_or_default();
@@ -87,7 +99,7 @@ pub(crate) fn handshake(stream: &mut TcpStream, token: &str) -> io::Result<bool>
 
     let upgrades = upgrade.eq_ignore_ascii_case("websocket") && connection.contains("Upgrade");
     let speaks_mcp = protocols.split(',').any(|name| name.trim() == "mcp");
-    let allowed = given.is_some_and(|given| given == token);
+    let allowed = given.is_some_and(|given| same_secret(given, token));
     if method != "GET" || !upgrades || !speaks_mcp || version != "13" || !allowed {
         stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")?;
         return Ok(false);
@@ -103,7 +115,21 @@ pub(crate) fn handshake(stream: &mut TcpStream, token: &str) -> io::Result<bool>
     );
     stream.write_all(answer.as_bytes())?;
     stream.flush()?;
+    // The frames that follow may come after any silence: the deadline covered the headers only.
+    stream.set_read_timeout(None)?;
     Ok(true)
+}
+
+/// Whether two secrets are the same. Every byte of both is read, so the time the comparison
+/// takes does not tell how many leading bytes of a guess were right.
+pub(crate) fn same_secret(given: &str, expected: &str) -> bool {
+    let given = given.as_bytes();
+    let expected = expected.as_bytes();
+    let mut difference = given.len() ^ expected.len();
+    for (index, byte) in expected.iter().enumerate() {
+        difference |= usize::from(byte ^ given.get(index).copied().unwrap_or(0));
+    }
+    difference == 0
 }
 
 fn opcode_of(byte: u8) -> io::Result<Opcode> {
@@ -270,6 +296,15 @@ mod tests {
         let mut wire = Cursor::new(vec![0x81, 0x02, b'h', b'i']);
 
         assert!(read_frame(&mut wire).is_err());
+    }
+
+    #[test]
+    fn a_secret_is_the_same_only_when_every_byte_is() {
+        assert!(same_secret("0a1b", "0a1b"));
+        assert!(!same_secret("0a1c", "0a1b"));
+        assert!(!same_secret("0a1", "0a1b"));
+        assert!(!same_secret("0a1bb", "0a1b"));
+        assert!(!same_secret("", "0a1b"));
     }
 
     #[test]

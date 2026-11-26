@@ -338,15 +338,15 @@ pub fn plan_paste(from: &Path, target_folder: &Path, cut: bool) -> Result<Option
     Ok(Some(to))
 }
 
-/// Renames on disk. A name that is taken is an error, also when only the case differs
-/// from another file. Blocks.
+/// Renames on disk. A name that is taken is an error, also when only the case differs from
+/// another file. A name that is taken by the file itself is no clash: that is a rename of the
+/// case alone on a file system that ignores case. Blocks.
 pub fn rename_on_disk(from: &Path, to: &Path) -> std::io::Result<()> {
-    let same_file_new_case = from != to
-        && from
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&to.to_string_lossy());
-    if to.exists() && !same_file_new_case {
-        return Err(std::io::ErrorKind::AlreadyExists.into());
+    if to.exists() {
+        let same_file = from != to && platform::same_file(from, to).unwrap_or(false);
+        if !same_file {
+            return Err(std::io::ErrorKind::AlreadyExists.into());
+        }
     }
     std::fs::rename(from, to)
 }
@@ -594,5 +594,65 @@ mod tests {
         delete_on_disk(&moved).unwrap();
         delete_on_disk(&root.join("x")).unwrap();
         assert!(!moved.exists() && !root.join("x").exists());
+    }
+
+    /// A rename that changes only the case of the file's own name is a rename of that file,
+    /// on any file system.
+    #[test]
+    fn a_rename_that_changes_only_the_case_keeps_the_file() {
+        // Non-ASCII letters: a comparison that ignores only ASCII case refuses this rename.
+        let root = test_support::scratch("tree-ops-case");
+        std::fs::write(root.join("Äpfel.txt"), "first").unwrap();
+
+        rename_on_disk(&root.join("Äpfel.txt"), &root.join("äpfel.txt")).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("äpfel.txt")).unwrap(),
+            "first"
+        );
+    }
+
+    /// Another file under a taken name is never overwritten, whatever the case.
+    #[test]
+    fn a_rename_onto_another_file_is_refused_and_overwrites_nothing() {
+        let root = test_support::scratch("tree-ops-clash");
+        std::fs::write(root.join("c.txt"), "lower").unwrap();
+        std::fs::write(root.join("d.txt"), "other").unwrap();
+
+        assert!(rename_on_disk(&root.join("d.txt"), &root.join("c.txt")).is_err());
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("c.txt")).unwrap(),
+            "lower"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("d.txt")).unwrap(),
+            "other"
+        );
+    }
+
+    /// Where the system ignores case, `C.txt` is `c.txt` and a rename onto it is refused; where
+    /// it does not, `C.txt` is a name of its own and the rename takes it.
+    #[test]
+    fn a_name_that_differs_only_in_case_is_taken_only_where_case_is_ignored() {
+        let root = test_support::scratch("tree-ops-case-clash");
+        std::fs::write(root.join("c.txt"), "lower").unwrap();
+        std::fs::write(root.join("d.txt"), "other").unwrap();
+        let upper = root.join("C.txt");
+
+        if upper.exists() {
+            assert!(rename_on_disk(&root.join("d.txt"), &upper).is_err());
+            assert_eq!(
+                std::fs::read_to_string(root.join("c.txt")).unwrap(),
+                "lower"
+            );
+        } else {
+            rename_on_disk(&root.join("d.txt"), &upper).unwrap();
+            assert_eq!(std::fs::read_to_string(&upper).unwrap(), "other");
+            assert_eq!(
+                std::fs::read_to_string(root.join("c.txt")).unwrap(),
+                "lower"
+            );
+        }
     }
 }
