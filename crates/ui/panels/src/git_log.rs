@@ -2675,31 +2675,43 @@ impl GitLogPanel {
         }
     }
 
-    /// Revert of the chosen file of the commit: the file goes back to the state of the
-    /// parent of the commit, in the index and the working tree.
-    fn revert_selected_file(&mut self, cx: &mut Context<Self>) {
+    /// Revert of the chosen file of the commit, after a question: the changes of the commit in
+    /// the file are taken back and the changes made later stay.
+    fn revert_selected_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(commit) = self.selected_commit() else {
             return;
         };
-        let Some(parent) = commit.parents.first().cloned() else {
+        if commit.parents.is_empty() {
             self.report_log("Revert", "The first commit has no parent to go back to", cx);
             return;
-        };
+        }
         let Some(file) = self
             .selected_file
             .and_then(|index| self.files.get(index).cloned())
         else {
             return;
         };
-        let shown = file.clone();
-        self.git.update(cx, |git, cx| {
-            git.run(
-                "Revert",
-                move |repo| repo.restore_paths_from(&parent, std::slice::from_ref(&file)),
-                move |git, (), cx| git.tell("Revert", format!("Reverted {shown}"), cx),
-                cx,
-            )
-        });
+        let question = format!(
+            "Revert the changes of {} in {file}?",
+            short_commit(&commit.id)
+        );
+        let git = self.git.clone();
+        let id = commit.id.clone();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                Prompt::ask(
+                    "Revert",
+                    &question,
+                    move |cx| {
+                        let (id, file) = (id.clone(), file.clone());
+                        git.update(cx, |git, cx| git.revert_file_of_commit(id, file, cx));
+                    },
+                    workspace,
+                    window,
+                    cx,
+                );
+            })
+            .ok();
     }
 
     fn report_log(&mut self, title: &str, message: &str, cx: &mut Context<Self>) {
@@ -2785,9 +2797,9 @@ impl GitLogPanel {
                                     has_file,
                                     theme,
                                 )
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.revert_selected_file(cx)),
-                                ),
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| this.revert_selected_file(window, cx),
+                                )),
                             )
                             .child(
                                 button(
@@ -3999,7 +4011,8 @@ fn message_parts(line: &str) -> Vec<(String, Option<String>)> {
         if !candidate.is_empty() {
             parts.push((candidate.to_owned(), Some(candidate.to_owned())));
         }
-        push_words(&mut parts, &tail[candidate.len()..]);
+        // The text after the address is pushed once: the rest of the line goes on below.
+        push_words(&mut parts, &tail[candidate.len()..end]);
         rest = &tail[end..];
     }
     push_words(&mut parts, rest);
@@ -5238,7 +5251,37 @@ pub fn show_commit(
 
 #[cfg(test)]
 mod tests {
-    use super::date_of;
+    use super::{date_of, message_parts};
+
+    #[test]
+    fn safety_the_text_after_an_address_is_shown_once() {
+        let line = "see https://x.y/z for details";
+
+        let parts = message_parts(line);
+
+        let text: String = parts.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(text, line, "every word of the line once");
+        let links: Vec<&str> = parts
+            .iter()
+            .filter_map(|(_, link)| link.as_deref())
+            .collect();
+        assert_eq!(links, ["https://x.y/z"]);
+    }
+
+    #[test]
+    fn safety_two_addresses_on_one_line_keep_the_text_between_them() {
+        let line = "a https://x.y/1 and https://x.y/2. end";
+
+        let parts = message_parts(line);
+
+        let text: String = parts.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(text, line);
+        let links: Vec<&str> = parts
+            .iter()
+            .filter_map(|(_, link)| link.as_deref())
+            .collect();
+        assert_eq!(links, ["https://x.y/1", "https://x.y/2"]);
+    }
 
     #[test]
     fn a_commit_date_is_a_utc_day() {

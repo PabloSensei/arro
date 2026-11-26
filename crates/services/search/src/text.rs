@@ -2,7 +2,7 @@
 //! pool of threads by the ripgrep searcher, open documents are searched in their current
 //! text instead of the disk.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -231,28 +231,96 @@ fn search_one(
 }
 
 /// The edits Replace makes in one text. With a regex, `$1` and `${name}` in `replacement`
-/// refer to groups. The edits are sorted and do not overlap.
+/// refer to groups. The edits are sorted and do not overlap. The text is matched line by
+/// line, as Find matches it, so `\s` or `[^x]` never take a line end.
 pub fn replace_edits(
     query: &TextQuery,
     replacement: &str,
     text: &str,
 ) -> Result<Vec<Edit>, SearchError> {
+    replace_within(query, replacement, text, 0..text.len(), None)
+}
+
+/// The edits Replace makes for the hits Find reported in `text`, which Find searched in
+/// `range`: the whole text, or the selection of an editor (see [`find_in_selection`]). An
+/// edit is made only where Find reported a match, so a text changed since the search is
+/// not replaced beyond what was found. The edits are in the coordinates of `text`.
+pub fn replace_found(
+    query: &TextQuery,
+    replacement: &str,
+    text: &str,
+    range: Range<usize>,
+    hits: &[LineHit],
+) -> Result<Vec<Edit>, SearchError> {
+    replace_within(query, replacement, text, range, Some(hits))
+}
+
+/// Replaces the matches of `query` in `range` of `text`, one line at a time. With `hits`,
+/// only the matches that those hits name are replaced. A match is named by its line, its
+/// index among the matches of the line, and its text, not by its bytes: Find reads a file
+/// that is not UTF-8 with its bytes replaced, so the byte offsets of a line can differ from
+/// the offsets of the decoded text that Replace reads.
+fn replace_within(
+    query: &TextQuery,
+    replacement: &str,
+    text: &str,
+    range: Range<usize>,
+    hits: Option<&[LineHit]>,
+) -> Result<Vec<Edit>, SearchError> {
     let regex = query.regex()?;
+    let start = range.start.min(text.len());
+    let end = range.end.max(start).min(text.len());
+    let Some(searched) = text.get(start..end) else {
+        return Ok(Vec::new());
+    };
+    let allowed: Option<HashSet<(u64, usize, String)>> = hits.map(|hits| {
+        hits.iter()
+            .flat_map(|hit| {
+                hit.matches.iter().enumerate().map(move |(index, place)| {
+                    let found = hit.text.get(place.clone()).unwrap_or_default();
+                    (hit.line, index, found.to_owned())
+                })
+            })
+            .collect()
+    });
+    // The line numbers are those of the whole file, as in `find_in_selection`.
+    let mut line = text
+        .get(..start)
+        .unwrap_or("")
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count() as u64;
     let mut edits = Vec::new();
-    for captures in regex.captures_iter(text) {
-        let Some(found) = captures.get(0).filter(|found| !found.is_empty()) else {
-            continue;
-        };
-        let mut new_text = String::new();
-        if query.regex {
-            captures.expand(replacement, &mut new_text);
-        } else {
-            new_text.push_str(replacement);
+    let mut line_start = start;
+    for piece in searched.split_inclusive('\n') {
+        line += 1;
+        // The line ends are taken off the text, as `search_one` takes them off the hits.
+        let body = piece.trim_end_matches(['\n', '\r']);
+        let mut index = 0;
+        for captures in regex.captures_iter(body) {
+            let Some(matched) = captures.get(0).filter(|matched| !matched.is_empty()) else {
+                continue;
+            };
+            let this = index;
+            index += 1;
+            if let Some(allowed) = &allowed
+                && !allowed.contains(&(line, this, matched.as_str().to_owned()))
+            {
+                continue;
+            }
+            let mut new_text = String::new();
+            if query.regex {
+                captures.expand(replacement, &mut new_text);
+            } else {
+                new_text.push_str(replacement);
+            }
+            if query.preserve_case {
+                new_text = text_core::find::preserve_case(matched.as_str(), &new_text);
+            }
+            let place = line_start + matched.start()..line_start + matched.end();
+            edits.push(Edit::new(place, new_text));
         }
-        if query.preserve_case {
-            new_text = text_core::find::preserve_case(found.as_str(), &new_text);
-        }
-        edits.push(Edit::new(found.range(), new_text));
+        line_start += piece.len();
     }
     Ok(edits)
 }
@@ -331,6 +399,82 @@ mod tests {
         };
         let edits = replace_edits(&regex, "read$1()", "x.getName();").unwrap();
         assert_eq!(edits, [Edit::new(2..11, "readName()")]);
+    }
+
+    #[test]
+    fn a_replace_matches_a_line_at_a_time_like_find() {
+        let spaces = TextQuery {
+            pattern: r"foo\s+bar".into(),
+            regex: true,
+            ..TextQuery::default()
+        };
+        assert!(
+            replace_edits(&spaces, "x", "foo\nbar").unwrap().is_empty(),
+            "a line end is not a space"
+        );
+        let edits = replace_edits(&spaces, "x", "foo\nbar\r\nfoo bar").unwrap();
+        assert_eq!(edits, [Edit::new(9..16, "x")]);
+
+        let blanks = TextQuery {
+            pattern: r"\s+".into(),
+            regex: true,
+            ..TextQuery::default()
+        };
+        assert_eq!(
+            replace_edits(&blanks, " ", "a \r\nb").unwrap(),
+            [Edit::new(1..2, " ")],
+            "the carriage return of a CRLF line is not matched"
+        );
+    }
+
+    #[test]
+    fn a_replace_changes_only_the_matches_find_reported() {
+        let query = TextQuery::plain("one");
+        let text = "one one\nthree\n";
+        let hits = find_in_selection(&query, Path::new("a.txt"), text, 0..6).unwrap();
+        assert_eq!(
+            replace_found(&query, "x", text, 0..6, &hits.lines).unwrap(),
+            [Edit::new(0..3, "x")],
+            "the selection covers the first match only"
+        );
+
+        // The text grew since the search: the second match was not found, so it stays.
+        let stale = find_in_selection(&query, Path::new("a.txt"), "one\n", 0..4).unwrap();
+        let grown = "one one\n";
+        assert_eq!(
+            replace_found(&query, "x", grown, 0..grown.len(), &stale.lines).unwrap(),
+            [Edit::new(0..3, "x")]
+        );
+    }
+
+    #[test]
+    fn a_found_match_is_named_by_its_place_not_by_its_bytes() {
+        // Find read the line with its bytes replaced, so its match sits at other offsets
+        // than the decoded text that Replace reads.
+        let query = TextQuery::plain("one");
+        let place = 7..10;
+        let found = [LineHit {
+            line: 1,
+            text: "\u{FFFD}\u{FFFD} one".to_owned(),
+            matches: vec![place],
+        }];
+        assert_eq!(
+            replace_found(&query, "x", "ab one\n", 0..7, &found).unwrap(),
+            [Edit::new(3..6, "x")]
+        );
+    }
+
+    #[test]
+    fn a_selection_replace_keeps_the_lines_of_the_whole_file() {
+        let query = TextQuery::plain("one");
+        let text = "one\ntwo one\none\n";
+        let start = text.find("two one").unwrap();
+        let end = start + "two one".len();
+        let hits = find_in_selection(&query, Path::new("a.txt"), text, start..end).unwrap();
+        assert_eq!(
+            replace_found(&query, "x", text, start..end, &hits.lines).unwrap(),
+            [Edit::new(8..11, "x")]
+        );
     }
 
     #[test]

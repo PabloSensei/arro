@@ -13,6 +13,7 @@ use std::cmp::Ordering;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Duration;
 
 use base::Cancel;
@@ -27,7 +28,51 @@ const WORK: &str = ".download";
 /// The most a metadata or checksum file may be.
 const SMALL_LIMIT: usize = 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// The time a server has to send the headers of an answer.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a body may stay silent between two reads. A slow transfer is not a broken
+/// one: only a read that waits longer than this fails, and the bytes already written stay.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The limits of one transfer. A test keeps them short; the download of a tool uses
+/// [`Timeouts::default`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Timeouts {
+    pub(crate) connect: Duration,
+    pub(crate) response: Duration,
+    pub(crate) read: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            connect: CONNECT_TIMEOUT,
+            response: RESPONSE_TIMEOUT,
+            read: READ_TIMEOUT,
+        }
+    }
+}
+
+static ATTEMPT: AtomicU64 = AtomicU64::new(0);
+
+/// A folder no other transfer shares: `<stem>.<pid>.<number>`. Two windows that install
+/// one tool at the same time never write into the folder of each other.
+pub(crate) fn attempt_folder(parent: &Path, stem: &str) -> PathBuf {
+    let serial = ATTEMPT.fetch_add(1, AtomicOrdering::Relaxed);
+    parent.join(format!("{stem}.{}.{serial}", std::process::id()))
+}
+
+/// Removes the folder of one attempt and its parent when the last attempt is gone. A
+/// failed transfer leaves nothing that a later one could mistake for a copy.
+pub(crate) fn remove_work(work: &Path) {
+    let _ = fs::remove_dir_all(work);
+    if let Some(parent) = work.parent()
+        && let Ok(mut entries) = fs::read_dir(parent)
+        && entries.next().is_none()
+    {
+        let _ = fs::remove_dir(parent);
+    }
+}
 
 /// The kind of archive a platform takes, which is the one the official page offers it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +139,8 @@ pub(crate) enum DownloadError {
     Files(io::Error),
     /// An archive ended in the middle or holds no usable home.
     Archive(String),
+    /// The address of a distribution is not https, so nothing is requested from it.
+    Insecure,
     NoStableVersion,
 }
 
@@ -117,6 +164,10 @@ impl std::fmt::Display for DownloadError {
                  download."
             ),
             Self::Archive(detail) => write!(formatter, "The archive cannot be unpacked: {detail}"),
+            Self::Insecure => formatter.write_str(
+                "The wrapper names an insecure http:// address. Arro downloads distributions \
+                 over https only.",
+            ),
             Self::NoStableVersion => {
                 formatter.write_str("The server offers no stable version of the tool.")
             }
@@ -148,7 +199,8 @@ pub(crate) struct Release {
 impl Release {
     /// Downloads the archive, checks it and unpacks it into
     /// `<data>/tools/<tool>/<version>`. A copy of an earlier download is returned without
-    /// a request.
+    /// a request. The unpacking happens in a folder of this attempt and the home appears
+    /// under its final name by a rename, so two windows never share a half-written copy.
     pub(crate) fn install(
         &self,
         data_dir: &Path,
@@ -160,51 +212,48 @@ impl Release {
         if has_program(&home, &self.program) {
             return Ok(home);
         }
-        let work = data_dir.join(TOOLS).join(self.tool).join(WORK);
+        if home.exists() {
+            // A folder without the program was left by an interrupted install of an
+            // older version: no build treats it as a home, so it is replaced. A copy
+            // that another window completed in the meantime is used as it is.
+            if has_program(&home, &self.program) {
+                return Ok(home);
+            }
+            fs::remove_dir_all(&home).map_err(DownloadError::Files)?;
+        }
+        let root = data_dir.join(TOOLS).join(self.tool);
+        let work = attempt_folder(&root.join(WORK), &format!("{version}.unpack"));
         fs::create_dir_all(&work).map_err(DownloadError::Files)?;
         let file = self.file_name();
         let part = work.join(format!("{file}.part"));
-        if let Err(error) = stream_to(&self.url, &part, progress, cancel) {
-            let _ = fs::remove_file(&part);
-            return Err(error);
-        }
-        if let Err(error) = verify(&self.checksum, &part, self.algorithm) {
-            // A file that does not match the server is not the tool: it never reaches a
-            // name the build would run.
-            let _ = fs::remove_file(&part);
-            return Err(error);
-        }
-        let unpacked = work.join(format!("{version}.unpack"));
-        let _ = fs::remove_dir_all(&unpacked);
-        fs::create_dir_all(&unpacked).map_err(DownloadError::Files)?;
-        let extracted = match self.archive {
-            Archive::Zip => extract_zip(&part, &unpacked, &self.top, cancel),
-            Archive::TarGz => extract_tar_gz(&part, &unpacked, &self.top, cancel),
-        };
-        if let Err(error) = extracted {
-            let _ = fs::remove_dir_all(&unpacked);
-            let _ = fs::remove_file(&part);
-            return Err(error);
-        }
-        let Some(found) = find_home(&unpacked, &self.top) else {
-            let _ = fs::remove_dir_all(&unpacked);
-            let _ = fs::remove_file(&part);
-            return Err(DownloadError::Archive(format!(
-                "no bin/{} in {file}",
-                self.program
-            )));
-        };
-        if home.exists() {
-            fs::remove_dir_all(&home).map_err(DownloadError::Files)?;
-        }
-        fs::rename(&found, &home).map_err(|error| {
-            let _ = fs::remove_dir_all(&unpacked);
-            let _ = fs::remove_file(&part);
-            DownloadError::Files(error)
-        })?;
-        let _ = fs::remove_dir_all(&unpacked);
-        let _ = fs::remove_file(&part);
-        Ok(home)
+        let unpacked = work.join("unpacked");
+        let installed = (|| {
+            stream_to(&self.url, &part, progress, cancel)?;
+            verify(&self.checksum, &part, self.algorithm)?;
+            fs::create_dir_all(&unpacked).map_err(DownloadError::Files)?;
+            let extracted = match self.archive {
+                Archive::Zip => extract_zip(&part, &unpacked, &self.top, cancel),
+                Archive::TarGz => extract_tar_gz(&part, &unpacked, &self.top, cancel),
+            };
+            extracted?;
+            let found = find_home(&unpacked, &self.top).ok_or_else(|| {
+                DownloadError::Archive(format!("no bin/{} in {file}", self.program))
+            })?;
+            match fs::rename(&found, &home) {
+                Ok(()) => Ok(home.clone()),
+                Err(error) => {
+                    // Another window named the same version complete while this one was
+                    // unpacking: its copy is the home, and this one is dropped.
+                    if has_program(&home, &self.program) {
+                        Ok(home.clone())
+                    } else {
+                        Err(DownloadError::Files(error))
+                    }
+                }
+            }
+        })();
+        remove_work(&work);
+        installed
     }
 
     /// The name of the archive: the top folder plus the kind of the archive.
@@ -575,12 +624,19 @@ fn skip_padding(reader: &mut impl Read, size: usize) -> Result<(), DownloadError
         .map_err(|error| DownloadError::Archive(error.to_string()))
 }
 
-fn agent() -> ureq::Agent {
+/// The agent every download of the IDE uses: the same limits for the tools of a project
+/// and for the drivers of the Database window. A body has no total limit; a server that
+/// stays silent for [`READ_TIMEOUT`] is the one that fails.
+pub fn download_agent() -> ureq::Agent {
+    agent_with(Timeouts::default())
+}
+
+fn agent_with(timeouts: Timeouts) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(None)
-        .timeout_connect(Some(CONNECT_TIMEOUT))
-        .timeout_recv_response(Some(RESPONSE_TIMEOUT))
-        .timeout_recv_body(Some(RESPONSE_TIMEOUT))
+        .timeout_connect(Some(timeouts.connect))
+        .timeout_recv_response(Some(timeouts.response))
+        .timeout_per_read(Some(timeouts.read))
         .http_status_as_error(false)
         .tls_config(
             ureq::tls::TlsConfig::builder()
@@ -591,8 +647,11 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
-fn get(url: &str) -> Result<ureq::http::Response<ureq::Body>, DownloadError> {
-    let response = agent()
+fn get_with(
+    url: &str,
+    timeouts: Timeouts,
+) -> Result<ureq::http::Response<ureq::Body>, DownloadError> {
+    let response = agent_with(timeouts)
         .get(url)
         .header("User-Agent", USER_AGENT)
         .call()
@@ -620,7 +679,11 @@ fn network(error: ureq::Error) -> DownloadError {
 
 /// Reads a small file of the server: the list of the versions or a checksum.
 pub(crate) fn fetch(url: &str) -> Result<Vec<u8>, DownloadError> {
-    let response = get(url)?;
+    fetch_with(url, Timeouts::default())
+}
+
+fn fetch_with(url: &str, timeouts: Timeouts) -> Result<Vec<u8>, DownloadError> {
+    let response = get_with(url, timeouts)?;
     let mut body = response.into_body().into_reader();
     let mut bytes = Vec::new();
     let mut buffer = [0u8; 16 * 1024];
@@ -647,10 +710,21 @@ pub(crate) fn stream_to(
     progress: &ToolProgress,
     cancel: &Cancel,
 ) -> Result<(), DownloadError> {
+    stream_to_with(url, path, progress, cancel, Timeouts::default())
+}
+
+/// The same with the limits of the caller, which a test keeps short.
+pub(crate) fn stream_to_with(
+    url: &str,
+    path: &Path,
+    progress: &ToolProgress,
+    cancel: &Cancel,
+    timeouts: Timeouts,
+) -> Result<(), DownloadError> {
     if cancel.is_cancelled() {
         return Err(DownloadError::Cancelled);
     }
-    let response = get(url)?;
+    let response = get_with(url, timeouts)?;
     let total = response
         .headers()
         .get("content-length")
@@ -778,6 +852,20 @@ pub(crate) mod testing {
 
     impl Server {
         pub(crate) fn start(answers: Vec<(String, Vec<u8>)>) -> Self {
+            Self::start_with(answers, None)
+        }
+
+        /// A server whose body arrives in `chunk` bytes every `delay`, so a test can make
+        /// a transfer longer than a total limit without a single read waiting that long.
+        pub(crate) fn start_slow(
+            answers: Vec<(String, Vec<u8>)>,
+            chunk: usize,
+            delay: Duration,
+        ) -> Self {
+            Self::start_with(answers, Some((chunk, delay)))
+        }
+
+        fn start_with(answers: Vec<(String, Vec<u8>)>, slow: Option<(usize, Duration)>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("a local port");
             let address = listener.local_addr().expect("the address of the listener");
             listener
@@ -811,7 +899,7 @@ pub(crate) mod testing {
                                     );
                                     socket
                                         .write_all(head.as_bytes())
-                                        .and_then(|_| socket.write_all(bytes))
+                                        .and_then(|_| write_body(&mut socket, bytes, slow))
                                 }
                                 None => socket.write_all(
                                     b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -838,6 +926,22 @@ pub(crate) mod testing {
         pub(crate) fn requests(&self) -> usize {
             self.requests.load(Ordering::Relaxed)
         }
+    }
+
+    /// Writes the body as one piece, or in pieces with a pause between them.
+    fn write_body(
+        socket: &mut TcpStream,
+        bytes: &[u8],
+        slow: Option<(usize, Duration)>,
+    ) -> io::Result<()> {
+        let Some((chunk, delay)) = slow.filter(|(chunk, _)| *chunk > 0) else {
+            return socket.write_all(bytes);
+        };
+        for piece in bytes.chunks(chunk) {
+            socket.write_all(piece)?;
+            thread::sleep(delay);
+        }
+        Ok(())
     }
 
     impl Drop for Server {

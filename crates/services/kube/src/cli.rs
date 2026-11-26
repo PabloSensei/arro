@@ -13,6 +13,7 @@ use base::Cancel;
 use proc_sup::{CaptureError, Process, ProcessSpec, capture};
 use serde::Deserialize;
 use serde_json::Value;
+use terminal::{Dialect, QuoteError, shell_line};
 
 /// A CLI call that has not answered in this long counts as a cluster that is not there:
 /// `kubectl` may wait for a context that points at an unreachable server.
@@ -608,8 +609,14 @@ impl Kubectl {
         spec
     }
 
-    /// A shell inside a Pod, for the built-in terminal.
-    pub fn exec_command_line(&self, pod: &str, shell: &str) -> String {
+    /// A shell inside a Pod, for the built-in terminal: a line of the shell that reads it,
+    /// so the names of the cluster reach `kubectl` as they are.
+    pub fn exec_command_line(
+        &self,
+        pod: &str,
+        shell: &str,
+        dialect: Dialect,
+    ) -> Result<String, QuoteError> {
         let mut words = self.words();
         words.extend([
             "exec".into(),
@@ -622,7 +629,7 @@ impl Kubectl {
         }
         words.push("--".into());
         words.push(shell.into());
-        join_command_line(&words)
+        shell_line(dialect, &words)
     }
 
     /// Starts `kubectl port-forward` and keeps its process alive with the returned value.
@@ -917,72 +924,6 @@ fn keys_of(item: &Value) -> Vec<String> {
         }
     }
     keys
-}
-
-/// Quotes the way the C runtime of Windows reads a command line back into arguments.
-#[cfg(not(unix))]
-fn join_command_line(words: &[String]) -> String {
-    let quote = |word: &String| {
-        if !word.is_empty() && !word.contains([' ', '\t', '"']) {
-            return word.clone();
-        }
-        let mut quoted = String::from("\"");
-        let mut slashes = 0;
-        for c in word.chars() {
-            match c {
-                '\\' => slashes += 1,
-                '"' => {
-                    quoted.push_str(&"\\".repeat(slashes * 2 + 1));
-                    quoted.push('"');
-                    slashes = 0;
-                }
-                _ => {
-                    quoted.push_str(&"\\".repeat(slashes));
-                    quoted.push(c);
-                    slashes = 0;
-                }
-            }
-        }
-        quoted.push_str(&"\\".repeat(slashes * 2));
-        quoted.push('"');
-        quoted
-    };
-    words.iter().map(quote).collect::<Vec<_>>().join(" ")
-}
-
-/// Quotes one argument the way `/bin/sh` reads it back.
-#[cfg(unix)]
-fn push_argument(line: &mut String, argument: &str) {
-    if !argument.is_empty()
-        && argument
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-_./:=@%+,".contains(&byte))
-    {
-        line.push_str(argument);
-        return;
-    }
-    line.push('\'');
-    for ch in argument.chars() {
-        if ch == '\'' {
-            line.push_str("'\\''");
-        } else {
-            line.push(ch);
-        }
-    }
-    line.push('\'');
-}
-
-/// One line for `/bin/sh -c` from the words of a command.
-#[cfg(unix)]
-fn join_command_line(words: &[String]) -> String {
-    let mut line = String::new();
-    for word in words {
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        push_argument(&mut line, word);
-    }
-    line
 }
 
 #[cfg(test)]

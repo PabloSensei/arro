@@ -12,6 +12,7 @@ use ui_kit::prelude::*;
 use ui_kit::*;
 #[cfg(test)]
 use vcs::patch_files;
+use vcs::patch_without;
 use workspace::Workspace;
 
 use crate::project_state::project_key;
@@ -136,6 +137,35 @@ impl ShelfStore {
         let _ = std::fs::remove_file(self.patch_path(id));
     }
 
+    /// Takes the files that an Unshelve put back out of a shelf: the patch and the meta file
+    /// keep the other files. Returns `true` when no file is left, and then the shelf is
+    /// deleted. The new patch and meta file are written beside the old ones and renamed over
+    /// them, so a failed write leaves the shelf as it was.
+    pub fn remove_applied(&self, id: &str, applied: &[String]) -> std::io::Result<bool> {
+        let meta_path = self.meta_path(id);
+        let text = std::fs::read_to_string(&meta_path)?;
+        let meta: Meta = serde_json::from_str(&text).map_err(std::io::Error::other)?;
+        let patch = std::fs::read(self.patch_path(id))?;
+        let rest = patch_without(&patch, applied);
+        if rest.is_empty() {
+            self.delete(id);
+            return Ok(true);
+        }
+        let files: Vec<String> = meta
+            .files
+            .into_iter()
+            .filter(|file| !applied.contains(file))
+            .collect();
+        let meta_text = serde_json::to_string(&Meta {
+            name: meta.name,
+            files,
+        })
+        .map_err(std::io::Error::other)?;
+        replace_file(&self.patch_path(id), &rest)?;
+        replace_file(&meta_path, meta_text.as_bytes())?;
+        Ok(false)
+    }
+
     fn next_id(&self) -> String {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -152,6 +182,20 @@ impl ShelfStore {
     fn patch_path(&self, id: &str) -> PathBuf {
         self.dir.join(format!("{id}.patch"))
     }
+}
+
+/// Writes `bytes` into `path` by way of a file beside it that is renamed over `path`, so a
+/// failed write leaves the old file whole.
+fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    let written =
+        std::fs::write(&temporary, bytes).and_then(|()| std::fs::rename(&temporary, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written
 }
 
 /// The named parts of a patch, in the order of the patch.
@@ -465,7 +509,40 @@ impl Render for UnshelveDialog {
 
 #[cfg(test)]
 mod tests {
-    use super::patch_sections;
+    use super::{ShelfStore, patch_sections};
+
+    #[test]
+    fn safety_a_shelf_keeps_the_files_an_unshelve_did_not_take() {
+        let state = test_support::scratch("shelf-keeps-rest");
+        let root = state.join("project");
+        let store = ShelfStore::new(&state, &root);
+        let patch = [
+            "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+ONE\n",
+            "diff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-two\n+TWO\n",
+            "diff --git a/c.txt b/c.txt\n--- a/c.txt\n+++ b/c.txt\n@@ -1 +1 @@\n-three\n+THREE\n",
+        ]
+        .concat()
+        .into_bytes();
+        let files = ["a.txt", "b.txt", "c.txt"].map(str::to_owned).to_vec();
+        let shelf = store.create("Changes", files, patch).unwrap();
+
+        let gone = store
+            .remove_applied(&shelf.id, &["a.txt".to_owned(), "b.txt".to_owned()])
+            .unwrap();
+
+        assert!(!gone, "c.txt stays in the shelf");
+        let kept = store.list();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].files, ["c.txt"]);
+        assert_eq!(vcs::patch_files(&kept[0].patch), ["c.txt"]);
+
+        let gone = store
+            .remove_applied(&shelf.id, &["c.txt".to_owned()])
+            .unwrap();
+
+        assert!(gone, "the last file takes the shelf away");
+        assert!(store.list().is_empty());
+    }
 
     #[test]
     fn the_patch_is_split_by_file() {

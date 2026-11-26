@@ -2134,7 +2134,7 @@ impl DiffView {
                     }
                 }
             }
-            EditorEvent::Failed(_) => {
+            EditorEvent::Failed(_) | EditorEvent::Unmappable(_) => {
                 // The write failed: the pane keeps the text of the edits.
                 self.leave_detached(cx);
             }

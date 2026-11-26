@@ -62,16 +62,13 @@ impl AgentsPanel {
         cx.notify();
     }
 
-    /// Takes back "Allow for this session" of the selected client: its next `Execute`
-    /// call asks the user again.
+    /// Takes back "Allow for this session" of the clients outside the window: the next
+    /// `Execute` call of any of them asks the user again. The agents of the window keep theirs.
     pub(crate) fn revoke_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.selected_client() else {
-            return;
-        };
         let Some(gateway) = self.gateway() else {
             return;
         };
-        gateway.revoke_session(&client.session);
+        gateway.revoke_client_sessions();
         cx.notify();
     }
 

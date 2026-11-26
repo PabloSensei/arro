@@ -8,6 +8,7 @@ use std::time::Duration;
 use base::Cancel;
 use proc_sup::{CaptureError, ProcessSpec, capture};
 use serde::Deserialize;
+use terminal::{Dialect, QuoteError, shell_line};
 
 /// A CLI call that has not answered in this long counts as a daemon that is not there:
 /// Docker Desktop that is still starting may keep the CLI waiting.
@@ -366,8 +367,14 @@ impl DockerCli {
         self.compose(&["--file", &file], action)
     }
 
-    /// For the built-in terminal: compose runs in front of the user and may ask things.
-    pub fn compose_command_line(&self, file: &Path, action: ComposeAction) -> String {
+    /// For the built-in terminal: compose runs in front of the user and may ask things. The
+    /// line is quoted for the shell of `dialect` that reads it.
+    pub fn compose_command_line(
+        &self,
+        file: &Path,
+        action: ComposeAction,
+        dialect: Dialect,
+    ) -> Result<String, QuoteError> {
         let mut words = self.words();
         words.extend([
             "compose".into(),
@@ -380,14 +387,19 @@ impl DockerCli {
             ComposeAction::Restart => words.push("restart".into()),
             ComposeAction::Stop => words.push("stop".into()),
         }
-        join_command_line(&words)
+        shell_line(dialect, &words)
     }
 
-    /// A shell inside a container, for the built-in terminal.
-    pub fn exec_command_line(&self, id: &str, shell: &str) -> String {
+    /// A shell inside a container, for the built-in terminal, as a line of `dialect`.
+    pub fn exec_command_line(
+        &self,
+        id: &str,
+        shell: &str,
+        dialect: Dialect,
+    ) -> Result<String, QuoteError> {
         let mut words = self.words();
         words.extend(["exec", "--interactive", "--tty", id, shell].map(String::from));
-        join_command_line(&words)
+        shell_line(dialect, &words)
     }
 
     fn words(&self) -> Vec<String> {
@@ -441,75 +453,6 @@ fn container_of(line: PsLine) -> Container {
         status: line.status,
         ports: line.ports,
     }
-}
-
-/// Quotes the way the C runtime of Windows reads a command line back into arguments.
-#[cfg(not(unix))]
-fn join_command_line(words: &[String]) -> String {
-    let quote = |word: &String| {
-        if !word.is_empty() && !word.contains([' ', '\t', '"']) {
-            return word.clone();
-        }
-        let mut quoted = String::from("\"");
-        let mut slashes = 0;
-        for c in word.chars() {
-            match c {
-                '\\' => slashes += 1,
-                '"' => {
-                    quoted.push_str(&"\\".repeat(slashes * 2 + 1));
-                    quoted.push('"');
-                    slashes = 0;
-                }
-                _ => {
-                    quoted.push_str(&"\\".repeat(slashes));
-                    quoted.push(c);
-                    slashes = 0;
-                }
-            }
-        }
-        quoted.push_str(&"\\".repeat(slashes * 2));
-        quoted.push('"');
-        quoted
-    };
-    words.iter().map(quote).collect::<Vec<_>>().join(" ")
-}
-
-/// Quotes one argument the way `/bin/sh` reads it back.
-///
-/// Single quotes leave `$`, a double quote and a backslash as they are. An inner single
-/// quote closes the quoted part, adds an escaped one and opens it again.
-#[cfg(unix)]
-fn push_argument(line: &mut String, argument: &str) {
-    if !argument.is_empty()
-        && argument
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-_./:=@%+,".contains(&byte))
-    {
-        line.push_str(argument);
-        return;
-    }
-    line.push('\'');
-    for ch in argument.chars() {
-        if ch == '\'' {
-            line.push_str("'\\''");
-        } else {
-            line.push(ch);
-        }
-    }
-    line.push('\'');
-}
-
-/// One line for `/bin/sh -c` from the words of a command.
-#[cfg(unix)]
-fn join_command_line(words: &[String]) -> String {
-    let mut line = String::new();
-    for word in words {
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        push_argument(&mut line, word);
-    }
-    line
 }
 
 #[cfg(test)]
@@ -582,20 +525,36 @@ mod tests {
         assert_eq!(ComposeAction::Stop.words(), ["stop"]);
     }
 
-    #[cfg(not(unix))]
+    /// The line of the same command for PowerShell and for the command prompt: each word is
+    /// quoted for the shell that reads it, the program first.
     #[test]
-    fn command_lines_quote_what_needs_it() {
+    fn command_lines_quote_what_needs_it_for_each_shell() {
         let cli = DockerCli::new("C:/Program Files/Docker/docker.exe")
             .with_context(Some("desktop-linux".into()));
-
-        let line = cli.compose_command_line(Path::new("C:/my app/compose.yaml"), ComposeAction::Up);
+        let file = Path::new("C:/my app/compose.yaml");
 
         assert_eq!(
-            line,
+            cli.compose_command_line(file, ComposeAction::Up, Dialect::PowerShell)
+                .unwrap(),
+            "& 'C:/Program Files/Docker/docker.exe' '--context' 'desktop-linux' 'compose' '--file' 'C:/my app/compose.yaml' 'up'"
+        );
+        assert_eq!(
+            cli.compose_command_line(file, ComposeAction::Up, Dialect::Cmd)
+                .unwrap(),
             "\"C:/Program Files/Docker/docker.exe\" --context desktop-linux compose --file \"C:/my app/compose.yaml\" up"
         );
-        let words = vec![r#"a "b" c\"#.to_owned()];
-        assert_eq!(join_command_line(&words), r#""a \"b\" c\\""#);
+    }
+
+    /// A name with a line break in it would press Enter in the middle of the command, so
+    /// the line is refused instead.
+    #[test]
+    fn a_container_name_with_a_line_break_refuses_the_exec_line() {
+        let cli = DockerCli::new("docker");
+
+        assert!(
+            cli.exec_command_line("4f2a\r", "/bin/sh", Dialect::Posix)
+                .is_err()
+        );
     }
 
     /// Every argument survives the shell that reads the line back, with the same order
@@ -619,7 +578,10 @@ mod tests {
         .map(|word| (*word).to_owned())
         .collect();
 
-        let line = format!("printf '%s\\n' {}", join_command_line(&words));
+        let line = format!(
+            "printf '%s\\n' {}",
+            shell_line(Dialect::Posix, &words).unwrap()
+        );
         let output = Command::new("/bin/sh")
             .args(["-c", &line])
             .output()
@@ -642,8 +604,13 @@ mod tests {
         let cli =
             DockerCli::new("/usr/local/bin/docker").with_context(Some("desktop-linux".into()));
 
-        let line =
-            cli.compose_command_line(Path::new("/home/me/my app/compose.yaml"), ComposeAction::Up);
+        let line = cli
+            .compose_command_line(
+                Path::new("/home/me/my app/compose.yaml"),
+                ComposeAction::Up,
+                Dialect::Posix,
+            )
+            .unwrap();
 
         assert_eq!(
             line,

@@ -255,7 +255,7 @@ fn save_as(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Work
             editor_view::EditorState::save_snapshot(&target, snapshot).result
         });
         match write.await {
-            Ok(()) => {
+            editor_view::SaveResult::Saved => {
                 workspace
                     .update_in(cx, |workspace, window, cx| {
                         workspace.open_file_keeping_edits(path.clone(), window, cx)
@@ -269,7 +269,18 @@ fn save_as(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Work
                     panel.update(cx, |panel, cx| panel.select_path(&path, cx));
                 }
             }
-            Err(error) => {
+            editor_view::SaveResult::Unmappable(encoding) => {
+                let text = format!(
+                    "{} contains characters that {encoding} cannot store",
+                    path.display()
+                );
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.notify_error("Cannot save", text, cx)
+                    })
+                    .ok();
+            }
+            editor_view::SaveResult::Failed(error) => {
                 let text = format!("{}: {error}", path.display());
                 workspace
                     .update(cx, |workspace, cx| {

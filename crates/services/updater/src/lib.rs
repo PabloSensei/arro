@@ -12,6 +12,8 @@ use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+pub mod signature;
+
 /// A system the release is built for. The archive of a release is named after it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Platform {
@@ -81,10 +83,23 @@ impl Platform {
 
 /// Where the latest release is described.
 pub const RELEASES_URL: &str = "https://api.github.com/repos/PabloSensei/arro/releases/latest";
-/// Replaces [`RELEASES_URL`], for tests and for a moved repository.
+/// Replaces [`RELEASES_URL`], for tests and for a moved repository. A debug build
+/// takes it; a release build takes it only with [`ALLOW_UPDATE_URL_ENV`] set to `1`.
 pub const UPDATE_URL_ENV: &str = "ARRO_UPDATE_URL";
+/// Set to `1` to let [`UPDATE_URL_ENV`] work in a release build as well. The address
+/// still has to name one of [`UPDATE_HOSTS`].
+pub const ALLOW_UPDATE_URL_ENV: &str = "ARRO_ALLOW_UPDATE_URL";
 /// Set to `1` to turn the automatic check off.
 pub const NO_UPDATE_CHECK_ENV: &str = "ARRO_NO_UPDATE_CHECK";
+/// The only hosts an update and its files may come from. The release itself is
+/// described by `api.github.com`; the archive and the checksum are served by
+/// `github.com` or by one of the asset hosts it redirects to.
+pub const UPDATE_HOSTS: [&str; 4] = [
+    "github.com",
+    "api.github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+];
 /// The suffix the assets of this build carry, `windows-x86_64` for example, and empty
 /// on a system without a release.
 pub const PLATFORM: &str = match Platform::current() {
@@ -108,6 +123,9 @@ const APPIMAGE_SUFFIX: &str = "x86_64.AppImage";
 
 const USER_AGENT: &str = "Arro";
 const TIMEOUT: Duration = Duration::from_secs(60);
+/// How many redirects a request may follow before it is refused. A release file
+/// redirects once or twice, from `github.com` to an asset host.
+const MAX_REDIRECTS: u32 = 10;
 /// How often a wait asks whether a process or a file is gone.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -129,6 +147,9 @@ pub struct Release {
     pub page_url: String,
     pub archive: Asset,
     pub checksum: Asset,
+    /// The signature of the checksum file, when the release publishes one. It is
+    /// checked only when [`signature::PUBLIC_KEY`] is set.
+    pub signature: Option<Asset>,
 }
 
 impl Release {
@@ -151,12 +172,10 @@ impl Default for UpdateSource {
 }
 
 impl UpdateSource {
-    /// [`RELEASES_URL`], unless the environment names another address.
+    /// [`RELEASES_URL`], unless a build that may take [`UPDATE_URL_ENV`] names another
+    /// address.
     pub fn new() -> Self {
-        let url = std::env::var(UPDATE_URL_ENV)
-            .ok()
-            .filter(|url| !url.trim().is_empty())
-            .unwrap_or_else(|| RELEASES_URL.to_owned());
+        let url = update_url_override().unwrap_or_else(|| RELEASES_URL.to_owned());
         Self { url }
     }
 
@@ -185,10 +204,16 @@ impl UpdateSource {
     /// Downloads the archive of `release` into `dir`, checks its SHA-256 and returns the
     /// file. A failed or interrupted download leaves nothing behind.
     pub fn download(&self, release: &Release, dir: &Path) -> Result<PathBuf, Error> {
+        self.download_signed(release, dir, signature::PUBLIC_KEY)
+    }
+
+    /// [`download`](Self::download) against `key`, which the tests of the updater pass
+    /// in themselves: an empty key trusts the hash alone.
+    fn download_signed(&self, release: &Release, dir: &Path, key: &str) -> Result<PathBuf, Error> {
         fs::create_dir_all(dir)?;
         let target = dir.join(&release.archive.name);
         let partial = dir.join(format!(".{}.part", release.archive.name));
-        let result = self.download_inner(release, &partial);
+        let result = self.download_inner(release, &partial, key);
         match result {
             Ok(()) => {
                 if target.exists() {
@@ -204,7 +229,19 @@ impl UpdateSource {
         }
     }
 
-    fn download_inner(&self, release: &Release, partial: &Path) -> Result<(), Error> {
+    fn download_inner(&self, release: &Release, partial: &Path, key: &str) -> Result<(), Error> {
+        // The checksum and its signature come first: an archive that no key vouches for
+        // is not written to the disk at all.
+        let checksum = self.fetch(release.checksum.url.as_str())?;
+        if !key.is_empty() {
+            let signature = release.signature.as_ref().ok_or(Error::Unsigned)?;
+            let bytes = self.fetch(signature.url.as_str())?;
+            if !signature::verify_with(key, &checksum, &bytes) {
+                return Err(Error::Unsigned);
+            }
+        }
+        let text = String::from_utf8(checksum).map_err(|error| Error::Http(error.to_string()))?;
+        let expected = parse_checksum(&text)?;
         {
             // The archive goes to the disk as it comes: it is tens of megabytes, more
             // than a body read into memory may hold.
@@ -214,8 +251,6 @@ impl UpdateSource {
             io::copy(&mut body, &mut file).map_err(|error| Error::Http(error.to_string()))?;
             file.flush()?;
         }
-        let text = self.fetch_text(release.checksum.url.as_str())?;
-        let expected = parse_checksum(&text)?;
         let actual = sha256_file(partial)?;
         if !expected.eq_ignore_ascii_case(&actual) {
             return Err(Error::Checksum { expected, actual });
@@ -238,7 +273,8 @@ impl UpdateSource {
 
     /// Sends a GET to `url`. `total` bounds the whole call; without it only the connection
     /// and the start of the answer are bounded, so a long download on a slow line is not
-    /// cut while bytes still arrive.
+    /// cut while bytes still arrive. Every redirect is followed by hand, so the address
+    /// of the next request is checked before a byte leaves for it.
     fn call(
         &self,
         url: &str,
@@ -248,6 +284,7 @@ impl UpdateSource {
             .timeout_global(total)
             .timeout_connect(Some(TIMEOUT))
             .timeout_recv_response(Some(TIMEOUT))
+            .max_redirects(0)
             .tls_config(
                 ureq::tls::TlsConfig::builder()
                     .root_certs(ureq::tls::RootCerts::PlatformVerifier)
@@ -255,13 +292,107 @@ impl UpdateSource {
             )
             .build()
             .into();
-        agent
-            .get(url)
-            .header("User-Agent", USER_AGENT)
-            .header("Accept", "application/vnd.github+json")
-            .call()
-            .map_err(|error| Error::Http(error.to_string()))
+        let mut url = url.to_owned();
+        for _ in 0..=MAX_REDIRECTS {
+            check_update_url(&url)?;
+            let response = agent
+                .get(&url)
+                .header("User-Agent", USER_AGENT)
+                .header("Accept", "application/vnd.github+json")
+                .call()
+                .map_err(|error| Error::Http(error.to_string()))?;
+            if !response.status().is_redirection() {
+                return Ok(response);
+            }
+            let location = response
+                .headers()
+                .get("location")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+                .ok_or_else(|| Error::Http("a redirect without a location".to_owned()))?;
+            // Releases of GitHub name the whole address. A relative one is refused
+            // rather than joined to an address this code would have to parse itself.
+            url = location;
+        }
+        Err(Error::Http("too many redirects".to_owned()))
     }
+}
+
+/// Whether `url` may be fetched: `https://` on one of [`UPDATE_HOSTS`]. A debug build
+/// also takes the loopback server the tests run on.
+pub fn update_url_allowed(url: &str) -> bool {
+    let Some((scheme, host)) = split_address(url) else {
+        return false;
+    };
+    if scheme.eq_ignore_ascii_case("https")
+        && UPDATE_HOSTS
+            .iter()
+            .any(|allowed| host.eq_ignore_ascii_case(allowed))
+    {
+        return true;
+    }
+    cfg!(debug_assertions)
+        && scheme.eq_ignore_ascii_case("http")
+        && matches!(host.as_str(), "127.0.0.1" | "localhost" | "[::1]")
+}
+
+fn check_update_url(url: &str) -> Result<(), Error> {
+    if update_url_allowed(url) {
+        Ok(())
+    } else {
+        Err(Error::InsecureUrl(url.to_owned()))
+    }
+}
+
+/// The scheme and the host of `url`, with the host in lowercase. `None` for an address
+/// the updater would have to guess: a user name, a percent escape or a malformed port
+/// can make the host read differently from the one actually dialled.
+fn split_address(url: &str) -> Option<(&str, String)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.is_empty() {
+        return None;
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    if let Some(port) = port
+        && (port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+    if host.is_empty() || host.contains('@') || host.contains('%') {
+        return None;
+    }
+    // An address in brackets, `[::1]`, keeps them, so that the comparisons above name it
+    // exactly as a constant can. Any other use of a colon is refused.
+    let bracketed = host.starts_with('[') && host.ends_with(']');
+    let known = host.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(byte, b'.' | b'-')
+            || (bracketed && matches!(byte, b':' | b'[' | b']'))
+    });
+    if !known {
+        return None;
+    }
+    Some((scheme, host.to_ascii_lowercase()))
+}
+
+/// The address of [`UPDATE_URL_ENV`], when this build may take it.
+fn update_url_override() -> Option<String> {
+    let url = std::env::var(UPDATE_URL_ENV).ok()?;
+    let url = url.trim();
+    if url.is_empty() || !update_url_override_allowed() {
+        return None;
+    }
+    Some(url.to_owned())
+}
+
+/// Whether this build may take [`UPDATE_URL_ENV`]: a debug build does, a release build
+/// only with [`ALLOW_UPDATE_URL_ENV`] set to `1`.
+fn update_url_override_allowed() -> bool {
+    cfg!(debug_assertions) || std::env::var(ALLOW_UPDATE_URL_ENV).is_ok_and(|value| value == "1")
 }
 
 /// The release in a GitHub Releases response. `None` for a draft, a prerelease and a
@@ -289,8 +420,11 @@ fn parse_release_of(text: &str, appimage: Option<&OsStr>) -> Result<Option<Relea
     let checksum_name = format!("{expected}.sha256");
     let archive = asset_of(&response.assets, &expected)
         .ok_or_else(|| Error::MissingAsset(expected.clone()))?;
-    let checksum =
-        asset_of(&response.assets, &checksum_name).ok_or(Error::MissingAsset(checksum_name))?;
+    let checksum = asset_of(&response.assets, &checksum_name)
+        .ok_or(Error::MissingAsset(checksum_name.clone()))?;
+    // A release without a signature is still an update: while the key is empty the
+    // hash alone decides. With a key set, the download refuses it.
+    let signature = asset_of(&response.assets, &format!("{checksum_name}.sig"));
     Ok(Some(Release {
         version,
         tag,
@@ -298,6 +432,7 @@ fn parse_release_of(text: &str, appimage: Option<&OsStr>) -> Result<Option<Relea
         page_url: response.html_url.unwrap_or_default(),
         archive,
         checksum,
+        signature,
     }))
 }
 
@@ -1220,7 +1355,15 @@ pub enum Error {
     MissingField(&'static str),
     MissingAsset(String),
     ChecksumFile(String),
-    Checksum { expected: String, actual: String },
+    Checksum {
+        expected: String,
+        actual: String,
+    },
+    /// The update is not signed by [`signature::PUBLIC_KEY`], or the signature does
+    /// not match its bytes.
+    Unsigned,
+    /// A release file is served from an address that is not https on GitHub.
+    InsecureUrl(String),
     Zip(String),
     Tar(String),
     Io(io::Error),
@@ -1244,6 +1387,11 @@ impl std::fmt::Display for Error {
             Self::Checksum { expected, actual } => {
                 write!(formatter, "the archive is {actual}, not {expected}")
             }
+            Self::Unsigned => write!(formatter, "The update is not signed by Arro"),
+            Self::InsecureUrl(url) => write!(
+                formatter,
+                "the update address {url} is not an https address of GitHub"
+            ),
             Self::Zip(message) => write!(formatter, "the archive is broken: {message}"),
             Self::Tar(message) => write!(formatter, "the archive is broken: {message}"),
             Self::Io(error) => write!(formatter, "the update cannot touch the files: {error}"),
@@ -1716,4 +1864,10 @@ mod platform_tests;
 #[cfg(test)]
 mod release_tests;
 #[cfg(test)]
+mod signature_tests;
+#[cfg(test)]
+mod test_server;
+#[cfg(test)]
 mod update_tests;
+#[cfg(test)]
+mod url_tests;

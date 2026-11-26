@@ -2827,6 +2827,17 @@ impl SettingsView {
                 })),
             );
         }
+        // A project file gets the stdio entry whatever transport is chosen: the token of the
+        // window stays out of a file that may be committed.
+        if project
+            && mcp_discovery::file_transport(mcp_discovery::Scope::Project, self.mcp_transport)
+                != self.mcp_transport
+        {
+            menu = menu.child(note(
+                "Project files get the Stdio entry, so the token stays out of them",
+                theme,
+            ));
+        }
         let open_selector = format!("{prefix}-{id}-open");
         menu = menu.child(
             dialog_button(

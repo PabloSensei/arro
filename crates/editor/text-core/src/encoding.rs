@@ -245,10 +245,13 @@ fn eol_style(lines: Vec<Eol>) -> EolStyle {
     }
 }
 
-/// The bytes of `text`, a text with `\n` line ends, in `format`.
-pub fn encode(text: &str, format: &FileFormat) -> Vec<u8> {
+/// The bytes of `text`, a text with `\n` line ends, in `format`, and whether the encoding
+/// had to replace characters it cannot store. A replacement character in a legacy
+/// encoding becomes `&#NNNN;` in the bytes, so a save must refuse such a text.
+pub fn encode_checked(text: &str, format: &FileFormat) -> (Vec<u8>, bool) {
     let text = join_eols(text, &format.eol);
     let mut bytes = Vec::with_capacity(text.len() + 3);
+    let mut unrepresentable = false;
     match format.encoding {
         TextEncoding::Utf8 => {
             if format.bom {
@@ -269,11 +272,25 @@ pub fn encode(text: &str, format: &FileFormat) -> Vec<u8> {
             bytes.extend(text.encode_utf16().flat_map(u16::to_be_bytes));
         }
         TextEncoding::Legacy(encoding) => {
-            let (encoded, _, _) = encoding.encode(&text);
+            let (encoded, _, had_errors) = encoding.encode(&text);
+            unrepresentable = had_errors;
             bytes.extend_from_slice(&encoded);
         }
     }
-    bytes
+    (bytes, unrepresentable)
+}
+
+/// The bytes of `text`, a text with `\n` line ends, in `format`.
+pub fn encode(text: &str, format: &FileFormat) -> Vec<u8> {
+    encode_checked(text, format).0
+}
+
+/// The name of the encoding that cannot store every character of `text`, when a save in
+/// `format` would replace some of them.
+pub fn unmappable_encoding(text: &str, format: &FileFormat) -> Option<&'static str> {
+    encode_checked(text, format)
+        .1
+        .then(|| format.encoding.name())
 }
 
 fn join_eols<'a>(text: &'a str, style: &EolStyle) -> Cow<'a, str> {

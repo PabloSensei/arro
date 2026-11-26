@@ -258,6 +258,11 @@ pub enum ConfigFieldKind {
     Choice(Vec<String>),
     /// Text the dialog shows with a button that copies it; the user cannot change it.
     ReadOnly,
+    /// A module of the project. The dialog offers the modules of the project model.
+    Module,
+    /// The entry point of a program, typed or picked from the entry points the providers
+    /// found. The dialog lists the discovered configurations of the same provider.
+    Entry,
 }
 
 /// One editable field of a configuration. The provider reads and writes the value in
@@ -268,7 +273,14 @@ pub struct ConfigField {
     pub key: &'static str,
     pub label: &'static str,
     pub kind: ConfigFieldKind,
+    /// The text under the field: for a field of `Env` kind, how the variables are separated.
     pub hint: Option<&'static str>,
+    /// The label stands above the field instead of at its left, as the fields of a program
+    /// form do. See [`ConfigField::inline`].
+    pub inline: bool,
+    /// The field is on the form only when the Modify options menu checks it, under the
+    /// section this name gives. `None` keeps it on the form.
+    pub option: Option<&'static str>,
 }
 
 impl ConfigField {
@@ -278,6 +290,8 @@ impl ConfigField {
             label,
             kind: ConfigFieldKind::Text,
             hint: None,
+            inline: false,
+            option: None,
         }
     }
 
@@ -287,6 +301,8 @@ impl ConfigField {
             label,
             kind: ConfigFieldKind::Arguments,
             hint: None,
+            inline: false,
+            option: None,
         }
     }
 
@@ -296,6 +312,8 @@ impl ConfigField {
             label,
             kind: ConfigFieldKind::Env,
             hint: None,
+            inline: false,
+            option: None,
         }
     }
 
@@ -305,6 +323,8 @@ impl ConfigField {
             label,
             kind: ConfigFieldKind::Path,
             hint: None,
+            inline: false,
+            option: None,
         }
     }
 
@@ -316,6 +336,8 @@ impl ConfigField {
             label,
             kind: ConfigFieldKind::ReadOnly,
             hint: None,
+            inline: false,
+            option: None,
         }
     }
 
@@ -325,6 +347,8 @@ impl ConfigField {
             label,
             kind: ConfigFieldKind::Bool,
             hint: None,
+            inline: false,
+            option: None,
         }
     }
 
@@ -334,11 +358,50 @@ impl ConfigField {
             label,
             kind: ConfigFieldKind::Choice(choices),
             hint: None,
+            inline: false,
+            option: None,
+        }
+    }
+
+    /// A module of the project, chosen from the modules of the project model.
+    pub fn module(key: &'static str, label: &'static str) -> Self {
+        Self {
+            key,
+            label,
+            kind: ConfigFieldKind::Module,
+            hint: None,
+            inline: false,
+            option: None,
+        }
+    }
+
+    /// The entry point of a program, typed or picked from the entry points found.
+    pub fn entry(key: &'static str, label: &'static str) -> Self {
+        Self {
+            key,
+            label,
+            kind: ConfigFieldKind::Entry,
+            hint: None,
+            inline: false,
+            option: None,
         }
     }
 
     pub fn hint(mut self, hint: &'static str) -> Self {
         self.hint = Some(hint);
+        self
+    }
+
+    /// The label stands above the field, small, instead of at its left. The field takes
+    /// the whole row, or half of it next to an entry field.
+    pub fn inline(mut self) -> Self {
+        self.inline = true;
+        self
+    }
+
+    /// The field is on the form when the Modify options menu checks it, under `section`.
+    pub fn option(mut self, section: &'static str) -> Self {
+        self.option = Some(section);
         self
     }
 }
@@ -385,6 +448,26 @@ pub trait RunConfigProvider: Send + Sync {
     fn id(&self) -> &'static str;
     fn discover(&self, model: &ProjectModel) -> Result<Vec<RunConfig>>;
     fn plan(&self, config: &RunConfig, model: &ProjectModel) -> Result<RunPlan>;
+
+    /// The found configurations the run list shows by itself. The default shows every one
+    /// of them that this provider found, so a provider whose findings all belong in the
+    /// list keeps working; a provider that finds configurations the list should not offer
+    /// overrides this. A found configuration stays available to the launch points and the
+    /// windows that read [`RunConfigProvider::discover`] even when it is left out here.
+    fn suggestions(&self, _stored: &[RunConfig], discovered: &[RunConfig]) -> Vec<RunConfig> {
+        discovered
+            .iter()
+            .filter(|config| config.provider == self.id())
+            .cloned()
+            .collect()
+    }
+
+    /// The fully qualified entry class of `config`, when its provider starts a class.
+    /// The configurations dialog offers the found ones for its entry point field.
+    fn main_class(&self, _config: &RunConfig) -> Option<String> {
+        None
+    }
+
     /// The places in `text`, one source file, that start a program, for the gutter marks
     /// and the keys that run at the caret. A language that starts no file leaves it empty.
     fn launch_points(&self, _text: &str, _file: &Path, _model: &ProjectModel) -> Vec<LaunchPoint> {
@@ -582,6 +665,19 @@ pub trait RunConfigProvider: Send + Sync {
     fn create_config(&self, template: &str, _model: &ProjectModel) -> Result<RunConfig> {
         Err(format!("{} cannot create {template}", self.id()).into())
     }
+
+    /// The request that runs this configuration as tests, for a kind whose program is a
+    /// test class, method or package. `None` starts a program as every other
+    /// configuration does.
+    fn test_request(&self, _config: &RunConfig) -> Option<crate::TestRequest> {
+        None
+    }
+
+    /// The run configurations another IDE stored in the project, for the window to offer
+    /// and import. `None` when this provider reads no such files.
+    fn foreign_configs(&self, _model: &ProjectModel) -> Option<crate::ForeignConfigs> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -632,6 +728,21 @@ mod tests {
 
         assert!(configs[0].assemble_first);
         assert!(configs[0].settings.is_empty());
+    }
+
+    #[test]
+    fn a_field_stays_on_the_form_unless_its_builders_say_otherwise() {
+        let plain = ConfigField::arguments("vm", "VM options");
+        assert!(!plain.inline);
+        assert_eq!(plain.option, None);
+
+        let entry = ConfigField::entry("main", "Main class").inline();
+        assert_eq!(entry.kind, ConfigFieldKind::Entry);
+        assert!(entry.inline);
+
+        let module = ConfigField::module("module", "Module").option("Section");
+        assert_eq!(module.kind, ConfigFieldKind::Module);
+        assert_eq!(module.option, Some("Section"));
     }
 
     #[test]

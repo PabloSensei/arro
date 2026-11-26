@@ -19,8 +19,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{
     EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS, MINIDUMP_EXCEPTION_INFORMATION, MINIDUMP_TYPE,
-    MiniDumpNormal, MiniDumpWithDataSegs, MiniDumpWithThreadInfo, MiniDumpWriteDump,
-    SetUnhandledExceptionFilter,
+    MiniDumpNormal, MiniDumpWithThreadInfo, MiniDumpWriteDump, SetUnhandledExceptionFilter,
 };
 use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -278,7 +277,9 @@ fn write_dump(path: &Path, pointers: *const EXCEPTION_POINTERS, thread_id: u32) 
     } else {
         &raw const info
     };
-    let kind: MINIDUMP_TYPE = MiniDumpNormal | MiniDumpWithDataSegs | MiniDumpWithThreadInfo;
+    // No data segments: they hold the globals of the program, where a password may sit. The
+    // stacks, the threads and the modules stay, which is what the report is read for.
+    let kind: MINIDUMP_TYPE = MiniDumpNormal | MiniDumpWithThreadInfo;
     // SAFETY: the process and thread pseudohandles belong to this process, the file handle
     // is open for the call, and `info` outlives it.
     let done = unsafe {
@@ -325,8 +326,12 @@ fn report_text(exception: Option<(u32, usize)>, thread_id: u32) -> String {
             )
         }
     };
-    format!("{}{body}", header())
+    format!("{}{body}{DUMP_CONTENT}", header())
 }
+
+/// What the dump next to the report holds. The stacks can still show the values of local
+/// variables, so a dump is not free of secrets, only of the data segments.
+const DUMP_CONTENT: &str = "dump: thread stacks, the thread list and the module list; the data segments are not included\n";
 
 /// The three lines that name the build, so a user's report can be matched with its
 /// symbols even when the binary on disk is newer.
@@ -548,6 +553,13 @@ mod tests {
         assert!(text.contains("exception: stack overflow"), "{text}");
         assert!(text.contains("0xC00000FD"), "{text}");
         assert!(text.contains("thread: 7"), "{text}");
+    }
+
+    #[test]
+    fn the_report_says_what_the_dump_holds() {
+        let text = report_text(None, 1);
+        assert!(text.contains("dump: thread stacks"), "{text}");
+        assert!(text.contains("data segments are not included"), "{text}");
     }
 
     #[test]

@@ -458,6 +458,9 @@ impl RunPanel {
     /// Runs tests, stopping what runs now first. Planning can run a tool, so it happens in
     /// the background.
     pub fn run_tests(&mut self, request: TestRequest, cx: &mut Context<Self>) {
+        if !self.may_run_project_code("Tests", cx) {
+            return;
+        }
         if self.starting {
             return;
         }

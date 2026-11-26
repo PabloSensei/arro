@@ -582,6 +582,8 @@ pub struct CommitPanel {
     shelf_selected: Option<usize>,
     shelf_file: Option<usize>,
     shelf_preview: Option<ShelfPreview>,
+    /// The serial of the shelf list read in the background, so a late one is dropped.
+    shelves_serial: u64,
     /// The serial of the preview read in the background, so a late one is dropped.
     preview_serial: u64,
     /// The commit whose analysis is running.
@@ -612,9 +614,8 @@ impl CommitPanel {
     ) -> Entity<Self> {
         bind_keys(cx);
         let shelf_store = ShelfStore::new(&state_dir, &root);
-        let shelves = shelf_store.list();
         let window = window.window_handle();
-        cx.new(|cx| {
+        let panel = cx.new(|cx| {
             let observe = cx.observe(&git, |this: &mut Self, git, cx| {
                 let status = git.read(cx).status().clone();
                 this.status_changed(&status, cx);
@@ -661,11 +662,12 @@ impl CommitPanel {
                 analysis,
                 tab: Tab::Commit,
                 lists,
-                shelves,
+                shelves: Vec::new(),
                 shelf_store,
                 shelf_selected: None,
                 shelf_file: None,
                 shelf_preview: None,
+                shelves_serial: 0,
                 preview_serial: 0,
                 analyzing: None,
                 analysis_observe: None,
@@ -677,7 +679,10 @@ impl CommitPanel {
                 _git: observe,
                 _draft: observe_draft,
             }
-        })
+        });
+        // The shelves are listed in the background: a shelf holds its whole patch.
+        panel.update(cx, |this, cx| this.reload_shelves(false, cx));
+        panel
     }
 
     /// Makes the panel a tab of another window: the list, the message and the buttons
@@ -1086,27 +1091,47 @@ impl CommitPanel {
         self.selected = None;
         self.selected_node = None;
         if tab == Tab::Shelf {
-            self.reload_shelves(cx);
-            if self.shelf_selected.is_none() && !self.shelves.is_empty() {
-                self.shelf_selected = Some(0);
-                self.shelf_file = Some(0);
-            }
-            self.refresh_shelf_preview(cx);
+            self.reload_shelves(true, cx);
         }
         cx.notify();
     }
 
-    fn reload_shelves(&mut self, cx: &mut Context<Self>) {
-        self.shelves = self.shelf_store.list();
-        if self
-            .shelf_selected
-            .is_some_and(|index| index >= self.shelves.len())
-        {
-            self.shelf_selected = None;
-        }
-        self.shelf_file = None;
-        self.shelf_preview = None;
-        cx.notify();
+    /// Lists the shelves on the background executor: a shelf holds its whole patch. The list
+    /// replaces the shelves when it is read, and a list that a later one has overtaken is
+    /// dropped. With `select_first`, the first shelf and its first file are selected when
+    /// nothing is selected, and the preview follows.
+    fn reload_shelves(&mut self, select_first: bool, cx: &mut Context<Self>) {
+        self.shelves_serial += 1;
+        let serial = self.shelves_serial;
+        let store = self.shelf_store.clone();
+        let task = cx.background_executor().spawn(async move { store.list() });
+        cx.spawn(async move |this, cx| {
+            let shelves = task.await;
+            this.update(cx, |this, cx| {
+                if serial != this.shelves_serial {
+                    return;
+                }
+                this.shelves = shelves;
+                if this
+                    .shelf_selected
+                    .is_some_and(|index| index >= this.shelves.len())
+                {
+                    this.shelf_selected = None;
+                }
+                this.shelf_file = None;
+                this.shelf_preview = None;
+                if select_first {
+                    if this.shelf_selected.is_none() && !this.shelves.is_empty() {
+                        this.shelf_selected = Some(0);
+                        this.shelf_file = Some(0);
+                    }
+                    this.refresh_shelf_preview(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn select_shelf(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -1569,6 +1594,7 @@ impl CommitPanel {
         let store = self.shelf_store.clone();
         let files = paths.clone();
         let shown = name.clone();
+        let changed: Vec<PathBuf> = paths.iter().map(|path| self.root.join(path)).collect();
         let me = cx.weak_entity();
         self.git.update(cx, |git, cx| {
             git.run(
@@ -1582,13 +1608,13 @@ impl CommitPanel {
                     Ok(())
                 },
                 move |git, (), cx| {
-                    git.reload_everything_from_disk(cx);
+                    git.reload_paths(&changed, cx);
                     me.update(cx, |this, cx| {
                         this.change(cx, |draft| {
                             draft.message.text.clear();
                             draft.unchecked.clear();
                         });
-                        this.reload_shelves(cx);
+                        this.reload_shelves(false, cx);
                     })
                     .ok();
                     git.tell("Shelve", format!("Shelved to {shown}"), cx);
@@ -1653,21 +1679,38 @@ impl CommitPanel {
         let store = self.shelf_store.clone();
         let count = files.len();
         let paths = files.clone();
+        let applied = files.clone();
+        let changed: Vec<PathBuf> = files.iter().map(|file| self.root.join(file)).collect();
         let me = cx.weak_entity();
         self.git.update(cx, |git, cx| {
             git.run(
                 "Unshelve",
                 move |repo| repo.apply_patch(&patch, Some(&paths)),
                 move |git, (), cx| {
+                    // The files that went back leave the shelf; the rest of the shelf stays
+                    // and goes away with its last file.
+                    let mut shelf_gone = false;
                     if delete_after {
-                        store.delete(&id);
+                        match store.remove_applied(&id, &applied) {
+                            Ok(gone) => shelf_gone = gone,
+                            Err(error) => git.report(
+                                "Unshelve",
+                                format!("the shelf keeps its files: {error}"),
+                                cx,
+                            ),
+                        }
                     }
-                    git.reload_everything_from_disk(cx);
-                    me.update(cx, |this, cx| this.reload_shelves(cx)).ok();
-                    let text = if delete_after {
-                        format!("Unshelved {count} file(s) from {shown} and deleted it")
-                    } else {
-                        format!("Unshelved {count} file(s) from {shown}")
+                    git.reload_paths(&changed, cx);
+                    me.update(cx, |this, cx| this.reload_shelves(false, cx))
+                        .ok();
+                    let text = match (delete_after, shelf_gone) {
+                        (true, true) => {
+                            format!("Unshelved {count} file(s) from {shown} and deleted it")
+                        }
+                        (true, false) => {
+                            format!("Unshelved {count} file(s) from {shown}; the rest stays in it")
+                        }
+                        (false, _) => format!("Unshelved {count} file(s) from {shown}"),
                     };
                     git.tell("Unshelve", text, cx);
                 },
@@ -1698,7 +1741,8 @@ impl CommitPanel {
                         if let Err(error) = store.rename(&id, &new_name) {
                             eprintln!("shelf is not renamed: {error}");
                         }
-                        me.update(cx, |this, cx| this.reload_shelves(cx)).ok();
+                        me.update(cx, |this, cx| this.reload_shelves(false, cx))
+                            .ok();
                     },
                     workspace,
                     window,
@@ -1723,7 +1767,8 @@ impl CommitPanel {
                     &question,
                     move |cx| {
                         store.delete(&id);
-                        me.update(cx, |this, cx| this.reload_shelves(cx)).ok();
+                        me.update(cx, |this, cx| this.reload_shelves(false, cx))
+                            .ok();
                     },
                     workspace,
                     window,
@@ -1823,26 +1868,36 @@ impl CommitPanel {
         if !warn {
             return;
         }
-        let turned: Vec<&String> = paths
-            .iter()
-            .filter(|path| {
-                std::fs::read(self.root.join(path))
-                    .is_ok_and(|text| text.windows(2).any(|pair| pair == b"\r\n"))
-            })
-            .collect();
-        let text = match turned.as_slice() {
-            [] => return,
-            [path] => format!("{path} has CRLF line separators. The commit goes on."),
-            [_, ..] => format!(
-                "{} files have CRLF line separators. The commit goes on.",
-                turned.len()
-            ),
-        };
-        self.workspace
-            .update(cx, |workspace, cx| {
-                workspace.notify_warning("Commit", text, cx)
-            })
-            .ok();
+        // The files are read on the background executor; the commit does not wait for them.
+        let root = self.root.clone();
+        let paths = paths.to_vec();
+        let task = cx.background_executor().spawn(async move {
+            paths
+                .into_iter()
+                .filter(|path| {
+                    std::fs::read(root.join(path))
+                        .is_ok_and(|text| text.windows(2).any(|pair| pair == b"\r\n"))
+                })
+                .collect::<Vec<String>>()
+        });
+        let workspace = self.workspace.clone();
+        cx.spawn(async move |_, cx| {
+            let turned = task.await;
+            let text = match turned.as_slice() {
+                [] => return,
+                [path] => format!("{path} has CRLF line separators. The commit goes on."),
+                [_, ..] => format!(
+                    "{} files have CRLF line separators. The commit goes on.",
+                    turned.len()
+                ),
+            };
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.notify_warning("Commit", text, cx)
+                })
+                .ok();
+        })
+        .detach();
     }
 
     /// Sends the request to git. The message field stays as the user left it when git

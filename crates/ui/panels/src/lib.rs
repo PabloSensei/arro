@@ -353,6 +353,8 @@ mod window_tests_build_tool;
 #[cfg(test)]
 mod window_tests_run_configs;
 #[cfg(test)]
+mod window_tests_run_idea;
+#[cfg(test)]
 mod window_tests_spacing_popups;
 #[cfg(test)]
 mod window_tests_spacing_tools;
@@ -793,6 +795,7 @@ pub use start::{
     Generators, ProjectTemplate, run as run_start, set_generators as set_project_generators,
 };
 pub use tree_ops::{Creates, FileTemplate};
+pub use trust::{LanguageStart, ProjectTrust, ServerTrust};
 pub use usages::{ActiveUsages, UsagesHub};
 pub use window_popups::{ScratchFileType, ScratchFileTypes};
 
@@ -857,6 +860,7 @@ pub fn run(
         project,
         server,
         None,
+        ProjectTrust::trusted(),
         CacheLocations::default(),
         TemplatesSetup::default(),
         |_| None,
@@ -878,6 +882,7 @@ pub fn run_with_setup(
     project: ProjectSetup,
     server: Option<LanguageServer>,
     setup: Option<LanguageSetup>,
+    trust: ProjectTrust,
     cache: CacheLocations,
     templates: TemplatesSetup,
     code_style_language: fn(&std::path::Path) -> Option<&'static str>,
@@ -896,6 +901,7 @@ pub fn run_with_setup(
         ::base::program::home_dir(),
     );
     workspace::run(launch, requests, move |workspace, window, cx| {
+        cx.set_global(trust);
         cx.set_global(claude);
         cx.set_global(languages);
         cx.set_global(scratch);
@@ -1259,7 +1265,12 @@ fn install(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    history::open(&agents.state_dir, cx);
+    let trust = cx
+        .try_global::<trust::ProjectTrust>()
+        .cloned()
+        .unwrap_or_default();
+    workspace.set_safe_mode(!trust.trusted, cx);
+    history::open(&agents.state_dir, project.skipped_folders.clone(), cx);
     clipboard::open(&agents.state_dir, cx);
     editor_view::install_find_history(&agents.state_dir, cx);
     editor_view::install_completion_usage(&agents.state_dir, cx);
@@ -1491,11 +1502,14 @@ fn install(
     jshell_panel::install(workspace, weak.clone(), cx);
 
     let root = workspace.root().to_path_buf();
+    let store = workspace.store();
     let runs = run::RunPanel::create(
         root,
         project.clone(),
         workspace.state_dir().to_path_buf(),
+        store,
         weak.clone(),
+        trust.trusted,
         cx,
     );
     let focus = runs.read(cx).focus();
@@ -1898,7 +1912,70 @@ fn install(
     cx.set_global(bookmarks::ActiveBookmarks(bookmarks));
     settings_archive::bind_commands(workspace, cx);
     idea_import::bind_commands(workspace, cx);
+    // The offer of the run configurations of another IDE and the answer Not Now reach
+    // the Run window through these commands, as the buttons of its notification.
+    workspace.register_command(
+        "run.import_idea_configs",
+        "Import Run Configurations from IntelliJ IDEA...",
+        |_workspace, _window, cx| {
+            if let Some(panel) = cx.try_global::<script::ActiveRunPanel>() {
+                let panel = panel.0.clone();
+                panel.update(cx, |panel, cx| panel.import_foreign_configs(cx));
+            }
+        },
+    );
+    workspace.register_command(
+        "run.dismiss_idea_configs",
+        "Not Now",
+        |_workspace, _window, cx| {
+            if let Some(panel) = cx.try_global::<script::ActiveRunPanel>() {
+                let panel = panel.0.clone();
+                panel.update(cx, |panel, cx| panel.dismiss_foreign_configs(cx));
+            }
+        },
+    );
+    workspace.register_command(
+        workspace::TRUST_PROJECT_COMMAND,
+        "Trust Project...",
+        trust::ProjectTrustDialog::show,
+    );
+    workspace.register_command("file.forget_trust", "Forget Trust", |workspace, _, cx| {
+        forget_trust(workspace, cx);
+    });
+    if !trust.trusted {
+        // The window asks the language server of an untrusted project only to say that
+        // nothing starts; a server that refuses the untrusted project sends `None`.
+        if let Some(start) = &trust.start {
+            let (sender, _receiver) = futures_channel::mpsc::unbounded();
+            start.start(trust::ServerTrust::Untrusted, sender);
+        }
+        trust::ProjectTrustDialog::show(workspace, window, cx);
+    }
     release_on_close(window, cx);
+}
+
+/// File > Forget Trust: the project asks again the next time it opens, and nothing of it
+/// runs in this window from now on.
+fn forget_trust(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
+    let list = store::TrustList::new(workspace.state_dir());
+    if let Err(error) = list.untrust(workspace.root()) {
+        let text = format!("{}: {error}", workspace.root().display());
+        workspace.notify_error("Trust is not forgotten", text, cx);
+    }
+    workspace.set_safe_mode(true, cx);
+    workspace.set_language_status(None, cx);
+    if let Some(semantic) = cx.try_global::<Semantic>() {
+        semantic.0.stop_server();
+    }
+    if let Some(panel) = cx.try_global::<script::ActiveRunPanel>() {
+        let panel = panel.0.clone();
+        panel.update(cx, |panel, cx| panel.forget_trust(cx));
+    }
+    workspace.notify_user(
+        "Trust",
+        "The project is no longer trusted: the build stays off until you trust it again.",
+        cx,
+    );
 }
 
 /// The window of a project is the only one of its process: nothing may keep its panels,
@@ -2270,6 +2347,8 @@ mod window_tests_run_idle;
 #[cfg(test)]
 mod window_tests_database_copy;
 #[cfg(test)]
+mod window_tests_database_safety;
+#[cfg(test)]
 mod window_tests_editor_importing;
 #[cfg(test)]
 mod window_tests_find_action_data;
@@ -2482,3 +2561,20 @@ mod window_tests_extract_wide;
 
 #[cfg(test)]
 mod window_tests_real_extract_name;
+#[cfg(test)]
+mod window_tests_replace_files;
+#[cfg(test)]
+mod window_tests_settings_file;
+#[cfg(test)]
+mod window_tests_trust;
+
+#[cfg(test)]
+mod window_tests_git_safety;
+
+#[cfg(test)]
+mod window_tests_cut_paste;
+
+#[cfg(test)]
+mod window_tests_run_config_look;
+#[cfg(test)]
+mod window_tests_run_list;

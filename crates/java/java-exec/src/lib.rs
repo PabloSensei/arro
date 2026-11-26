@@ -5,6 +5,8 @@
 mod attach;
 mod coverage;
 mod flags;
+mod idea_run;
+mod junit;
 mod live;
 mod mains;
 mod pathing;
@@ -19,6 +21,8 @@ pub use attach::{
 };
 pub use coverage::{exec_file, report};
 pub use flags::JvmFlags;
+pub use idea_run::{IdeaRunProvider, read as read_idea_run_configs};
+pub use junit::{JUnitProvider, JUnitTarget};
 pub use live::{
     SpringLive, SpringSettings, parse_beans, parse_environment, parse_health, parse_mappings,
     server_port, started_line,

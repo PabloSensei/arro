@@ -572,6 +572,20 @@ impl BuildSystem for Gradle {
             && !distribution.installed(&user_home)
         {
             self.set_pending(Some(distribution.clone()));
+            if !distribution.is_secure() {
+                // The address in the file is http: nothing is requested, and the only
+                // button is the one that asks the same host over https.
+                return Some(ToolSetup {
+                    name: "Gradle".into(),
+                    title: "Gradle wrapper".into(),
+                    text: tool_download::DownloadError::Insecure.to_string(),
+                    download: Some("Use https".into()),
+                    choose: None,
+                    create_wrapper: None,
+                    use_downloaded: None,
+                    settings: None,
+                });
+            }
             let label = distribution_label(&distribution);
             let automatic = self.env.build_tools.second.download_wrapper;
             let download = if !automatic {
@@ -698,6 +712,15 @@ impl BuildSystem for Gradle {
     fn install_tool(&self, progress: &ToolProgress, cancel: &Cancel) -> Result<Option<PathBuf>> {
         match self.take_pending() {
             Some(distribution) => {
+                // The button of an insecure address says Use https: the transfer goes to
+                // the same host over https, and the file of the project stays as it is.
+                let distribution = if distribution.is_secure() {
+                    distribution
+                } else {
+                    distribution
+                        .with_https()
+                        .ok_or_else(|| tool_download::DownloadError::Insecure.to_string())?
+                };
                 let user_home = self
                     .gradle_user_home()
                     .ok_or_else(|| "no user home for the wrapper of Gradle".to_owned())?;

@@ -2808,7 +2808,7 @@ impl Provider<DiagnosticsQuery, Vec<DiagnosticEntry>> for LspProviders {
         cancel: Cancel,
         mut reply: Reply<Vec<DiagnosticEntry>>,
     ) {
-        let Ok(uri) = Uri::from_str(&query.0) else {
+        let Some(uri) = lsp_client::uri::server_uri(&query.0) else {
             return;
         };
         let published = self.published.clone();

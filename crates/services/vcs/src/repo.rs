@@ -4,8 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::rebase;
+use crate::temp::{TempFolder, write_private};
 use crate::{
-    BlobReader, Change, GitRunner, Hunk, RebasePlan, RebaseReport, Status, line_hunks, parse_status,
+    BlobReader, Change, GitRunner, Hunk, RebasePlan, RebaseReport, SegmentKind, Status, line_hunks,
+    merge, parse_status,
 };
 
 const FIELD: char = '\u{1f}';
@@ -138,9 +140,11 @@ pub struct CommitOptions {
 pub struct ConflictVersions {
     /// `:1:path`, the common ancestor. `None` when both sides added the file.
     pub base: Option<Vec<u8>>,
-    /// `:2:path`, ours. `None` when we deleted the file.
+    /// The version of the user: `:2:path` (ours) in a merge, `:3:path` in a rebase, where git
+    /// stages the commit being replayed as theirs. `None` when the user deleted the file.
     pub yours: Option<Vec<u8>>,
-    /// `:3:path`, theirs. `None` when they deleted the file.
+    /// The other side: `:3:path` (theirs) in a merge, `:2:path` in a rebase, where that stage
+    /// is the upstream. `None` when the other side deleted the file.
     pub theirs: Option<Vec<u8>>,
 }
 
@@ -244,6 +248,16 @@ pub struct UpdateReport {
 pub enum ConflictSide {
     Yours,
     Theirs,
+}
+
+/// What Revert of a file of a commit left behind, see [`Repository::revert_file_of_commit`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileRevert {
+    /// The working file has the changes of the commit taken back, or had them already.
+    Reverted,
+    /// Later changes meet the changes of the commit in the same lines. The working file keeps
+    /// its text, and the index holds the three versions as the stages of a conflict.
+    Conflict,
 }
 
 pub struct Repository {
@@ -416,11 +430,11 @@ impl Repository {
             return self.commit_with(request, options);
         }
         let head = self.status()?.head.is_some();
-        let index = temp_path("commit-index");
-        let _ = std::fs::remove_file(&index);
+        let folder = TempFolder::create("commit")?;
+        let index = folder.join("index");
         let env = [("GIT_INDEX_FILE", index.as_os_str())];
         let result = self.commit_partial_with(request, options, partial, head, &env);
-        let _ = std::fs::remove_file(&index);
+        drop(folder);
         result?;
         // The real index follows the new commit for the chosen files: what went into the
         // commit stops showing as a change there, and the hunks left out stay unstaged.
@@ -528,11 +542,11 @@ impl Repository {
     /// its parents stay, and the index and the working tree are not touched, so a change
     /// that is only there stays out of the commit. Returns the new commit.
     pub fn amend_message(&self, message: &str, options: &CommitOptions) -> io::Result<String> {
-        let index = temp_path("amend-index");
-        let _ = std::fs::remove_file(&index);
+        let folder = TempFolder::create("amend")?;
+        let index = folder.join("index");
         let env = [("GIT_INDEX_FILE", index.as_os_str())];
         let result = self.amend_message_with(message, options, &env);
-        let _ = std::fs::remove_file(&index);
+        drop(folder);
         result?;
         Ok(self.run(["rev-parse", "HEAD"])?.trim().to_owned())
     }
@@ -631,8 +645,8 @@ impl Repository {
         let commit = full.as_str();
         let head = self.run(["rev-parse", "HEAD"])?.trim().to_owned();
         if head == commit {
-            let index = temp_path("reword-index");
-            let _ = std::fs::remove_file(&index);
+            let folder = TempFolder::create("reword")?;
+            let index = folder.join("index");
             let env = [("GIT_INDEX_FILE", index.as_os_str())];
             let base = self.run_env_check(&["read-tree", "HEAD"], &env);
             let result = base.and_then(|()| {
@@ -642,7 +656,7 @@ impl Repository {
                     Some(message.as_bytes()),
                 )
             });
-            let _ = std::fs::remove_file(&index);
+            drop(folder);
             return result.map(drop);
         }
         // A rebase of the user stays theirs: the abort below would throw it away.
@@ -676,13 +690,11 @@ impl Repository {
             let verb = if index == 0 { "reword" } else { "pick" };
             todo.push_str(&format!("{verb} {id} {subject}\n"));
         }
-        let folder = temp_path("reword");
-        let _ = std::fs::remove_dir_all(&folder);
-        std::fs::create_dir_all(&folder)?;
+        let folder = TempFolder::create("reword")?;
         let todo_file = folder.join("todo.txt");
         let message_file = folder.join("message.txt");
-        std::fs::write(&todo_file, todo)?;
-        std::fs::write(&message_file, message)?;
+        write_private(&todo_file, todo.as_bytes())?;
+        write_private(&message_file, message.as_bytes())?;
         let mut command = self.git.command(&self.root);
         match &parent {
             Ok(_) => {
@@ -696,7 +708,7 @@ impl Repository {
             .env("GIT_SEQUENCE_EDITOR", rebase::copy_command(&todo_file))
             .env("GIT_EDITOR", rebase::copy_command(&message_file))
             .output();
-        let _ = std::fs::remove_dir_all(&folder);
+        drop(folder);
         match output {
             Ok(output) if output.status.success() => Ok(()),
             Ok(output) => {
@@ -802,6 +814,7 @@ impl Repository {
         if request.set_upstream {
             args.push("--set-upstream");
         }
+        args.push("--end-of-options");
         args.push(request.remote.as_str());
         let refspec;
         if request.set_upstream && request.destination == request.branch {
@@ -848,14 +861,14 @@ impl Repository {
     /// A conflict is in the report with the operation that waits for the user.
     pub fn merge_branch(&self, branch: &str) -> io::Result<UpdateReport> {
         let stashes = self.stash_ids()?;
-        let result = self.run(["merge", "--autostash", branch]);
+        let result = self.run(["merge", "--autostash", "--end-of-options", branch]);
         self.report_update(result, stashes)
     }
 
     /// Replays the current branch onto `branch`, with the local changes stashed around it.
     pub fn rebase_onto(&self, branch: &str) -> io::Result<UpdateReport> {
         let stashes = self.stash_ids()?;
-        let result = self.run(["rebase", "--autostash", branch]);
+        let result = self.run(["rebase", "--autostash", "--end-of-options", branch]);
         self.report_update(result, stashes)
     }
 
@@ -1033,11 +1046,15 @@ impl Repository {
             .collect())
     }
 
-    /// Takes one side of a conflict and marks the file resolved, as IDEA does.
+    /// Takes one side of a conflict and marks the file resolved, as IDEA does. `Yours` is the
+    /// user's version: in a rebase git calls the commit being replayed `--theirs` and the
+    /// upstream `--ours`, so the flags swap there.
     pub fn accept_side(&self, path: &str, side: ConflictSide) -> io::Result<()> {
-        let flag = match side {
-            ConflictSide::Yours => "--ours",
-            ConflictSide::Theirs => "--theirs",
+        let flag = match (side, self.operation()?) {
+            (ConflictSide::Yours, Operation::Rebase) => "--theirs",
+            (ConflictSide::Theirs, Operation::Rebase) => "--ours",
+            (ConflictSide::Yours, _) => "--ours",
+            (ConflictSide::Theirs, _) => "--theirs",
         };
         self.git.run(&self.root, ["checkout", flag, "--", path])?;
         self.mark_resolved(path)
@@ -1048,18 +1065,28 @@ impl Repository {
         self.git.run(&self.root, ["add", "--", path]).map(drop)
     }
 
-    /// The three versions of a conflicted file from the index stages: the common
-    /// ancestor, ours and theirs. A stage the index has no entry for is `None`, as for a
-    /// file one side added or deleted.
+    /// The three versions of a conflicted file from the index stages, see
+    /// [`ConflictVersions`]. A stage the index has no entry for is `None`, as for a file one
+    /// side added or deleted.
     pub fn conflict_versions(
         &self,
         blobs: &mut BlobReader,
         path: &str,
     ) -> io::Result<ConflictVersions> {
+        let base = blobs.read(&format!(":1:{path}"))?;
+        let ours = blobs.read(&format!(":2:{path}"))?;
+        let theirs = blobs.read(&format!(":3:{path}"))?;
+        if self.operation()? == Operation::Rebase {
+            return Ok(ConflictVersions {
+                base,
+                yours: theirs,
+                theirs: ours,
+            });
+        }
         Ok(ConflictVersions {
-            base: blobs.read(&format!(":1:{path}"))?,
-            yours: blobs.read(&format!(":2:{path}"))?,
-            theirs: blobs.read(&format!(":3:{path}"))?,
+            base,
+            yours: ours,
+            theirs,
         })
     }
 
@@ -1306,7 +1333,9 @@ impl Repository {
     }
 
     pub fn switch(&self, branch: &str) -> io::Result<()> {
-        self.git.run(&self.root, ["switch", branch]).map(drop)
+        self.git
+            .run(&self.root, ["switch", "--end-of-options", branch])
+            .map(drop)
     }
 
     /// Checks a remote branch out. A local branch of that name is created to track it,
@@ -1320,29 +1349,45 @@ impl Repository {
         {
             return self.switch(local);
         }
-        self.run(["switch", "--create", local, "--track", branch])
-            .map(drop)
+        self.run([
+            "switch",
+            "--create",
+            local,
+            "--track",
+            "--end-of-options",
+            branch,
+        ])
+        .map(drop)
     }
 
     pub fn create_branch(&self, name: &str, start: &str) -> io::Result<()> {
         self.git
-            .run(&self.root, ["switch", "-c", name, start])
+            .run(
+                &self.root,
+                ["switch", "-c", name, "--end-of-options", start],
+            )
             .map(drop)
     }
 
     /// Only a branch that is merged, as `git branch -d` does.
     pub fn delete_branch(&self, name: &str) -> io::Result<()> {
-        self.git.run(&self.root, ["branch", "-d", name]).map(drop)
+        self.git
+            .run(&self.root, ["branch", "-d", "--end-of-options", name])
+            .map(drop)
     }
 
     /// Deletes a branch that is not merged, as the Force Delete button does.
     pub fn force_delete_branch(&self, name: &str) -> io::Result<()> {
-        self.git.run(&self.root, ["branch", "-D", name]).map(drop)
+        self.git
+            .run(&self.root, ["branch", "-D", "--end-of-options", name])
+            .map(drop)
     }
 
     /// Puts a deleted branch back at the commit it pointed at.
     pub fn restore_branch(&self, name: &str, id: &str) -> io::Result<()> {
-        self.git.run(&self.root, ["branch", name, id]).map(drop)
+        self.git
+            .run(&self.root, ["branch", "--end-of-options", name, id])
+            .map(drop)
     }
 
     /// The commit a local branch points at, for the Restore of a deleted one.
@@ -1364,14 +1409,17 @@ impl Repository {
     /// Deletes a branch on its remote, as Delete of a remote branch does.
     pub fn delete_remote_branch(&self, remote: &str, branch: &str) -> io::Result<()> {
         self.git
-            .run(&self.root, ["push", remote, "--delete", branch])
+            .run(
+                &self.root,
+                ["push", "--delete", "--end-of-options", remote, branch],
+            )
             .map(drop)
     }
 
     /// Gives a local branch another name, keeping the one checked out current.
     pub fn rename_branch(&self, from: &str, to: &str) -> io::Result<()> {
         self.git
-            .run(&self.root, ["branch", "-m", from, to])
+            .run(&self.root, ["branch", "-m", "--end-of-options", from, to])
             .map(drop)
     }
 
@@ -1465,15 +1513,128 @@ impl Repository {
         })
     }
 
-    /// Puts the named files back as `revision` has them, in the index and the working
-    /// tree, for Revert of the files of a commit.
-    pub fn restore_paths_from(&self, revision: &str, paths: &[String]) -> io::Result<()> {
-        if paths.is_empty() {
-            return Ok(());
+    /// Takes back the changes `commit` made to `path` in the working tree, as Revert of a
+    /// file does. The result is a three-way merge of the working file: the version of the
+    /// commit is the base, the version of its parent is theirs and the working file is yours.
+    /// Later commits and uncommitted changes in other lines stay. A clean result is written
+    /// with the line ends of the file, and the index is left alone. Changes that the commit
+    /// and the working file both made leave the file as it is and put the three versions into
+    /// the index as the stages of a conflict. A file the commit added, a file that is not text
+    /// and a file that is not in the working tree are refused, and nothing is written for them.
+    pub fn revert_file_of_commit(&self, commit: &str, path: &str) -> io::Result<FileRevert> {
+        let commit = self.run(["rev-parse", "--verify", &format!("{commit}^{{commit}}")])?;
+        let commit = commit.trim().to_owned();
+        let parent = self
+            .run(["rev-parse", "--verify", "--quiet", &format!("{commit}^")])
+            .map(|id| id.trim().to_owned())
+            .unwrap_or_default();
+        if parent.is_empty() {
+            return Err(io::Error::other(
+                "the first commit has no parent to go back to",
+            ));
         }
-        let mut args = vec!["checkout", revision, "--"];
-        args.extend(paths.iter().map(String::as_str));
-        self.git.run(&self.root, &args).map(drop)
+        let absolute = self.root.join(path);
+        let mut blobs = self.blobs()?;
+        let base = blobs.read(&format!("{commit}:{path}"))?;
+        let theirs = blobs.read(&format!("{parent}:{path}"))?;
+        let current = match std::fs::read(&absolute) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        match (base, theirs) {
+            (None, None) => Err(io::Error::other(format!(
+                "the commit does not change {path}"
+            ))),
+            (Some(_), None) => Err(io::Error::other(format!(
+                "the commit adds {path}, Revert Commit takes it away"
+            ))),
+            (None, Some(bytes)) => {
+                // The commit deleted the file: its text comes back where nothing is in the way.
+                if current.is_some() {
+                    return Err(io::Error::other(format!(
+                        "{path} is in the working tree again, nothing was changed"
+                    )));
+                }
+                let text = text_core::decode(&bytes);
+                if !text.lossless {
+                    return Err(io::Error::other(format!("{path} is not a text file")));
+                }
+                text_core::write_file(&absolute, &text.text, &text.format)?;
+                Ok(FileRevert::Reverted)
+            }
+            (Some(base), Some(theirs)) => {
+                let Some(yours) = current else {
+                    return Err(io::Error::other(format!(
+                        "{path} is not in the working tree, nothing was changed"
+                    )));
+                };
+                let base = text_core::decode(&base);
+                let theirs = text_core::decode(&theirs);
+                let yours_text = text_core::decode(&yours);
+                if !(base.lossless && theirs.lossless && yours_text.lossless) {
+                    return Err(io::Error::other(format!("{path} is not a text file")));
+                }
+                let three = merge(&base.text, &yours_text.text, &theirs.text);
+                let clean = three
+                    .segments
+                    .iter()
+                    .all(|segment| segment.kind != SegmentKind::Conflict);
+                if clean {
+                    if three.result != yours_text.text {
+                        text_core::write_file(&absolute, &three.result, &yours_text.format)?;
+                    }
+                    return Ok(FileRevert::Reverted);
+                }
+                self.stage_conflict(&commit, &parent, path, &yours)?;
+                Ok(FileRevert::Conflict)
+            }
+        }
+    }
+
+    /// Puts the three versions of `path` into the index as the stages of a conflict: the
+    /// version of `commit` as the base, the working file as the user's version and the
+    /// version of `parent` as theirs. The entry of the path is replaced; the working file
+    /// is left alone.
+    fn stage_conflict(
+        &self,
+        commit: &str,
+        parent: &str,
+        path: &str,
+        yours: &[u8],
+    ) -> io::Result<()> {
+        let (Some((mode, base)), Some((_, theirs))) = (
+            self.tree_entry(commit, path)?,
+            self.tree_entry(parent, path)?,
+        ) else {
+            return Err(io::Error::other(format!("{path} is not in both versions")));
+        };
+        let ours =
+            self.git
+                .run_with_input(&self.root, ["hash-object", "-w", "--stdin"], Some(yours))?;
+        let ours = String::from_utf8_lossy(&ours).trim().to_owned();
+        let zero = "0000000000000000000000000000000000000000";
+        // An entry with mode 0 removes the path from the index, then the three stages follow.
+        let stages = format!(
+            "0 {zero}\t{path}\n{mode} {base} 1\t{path}\n{mode} {ours} 2\t{path}\n{mode} {theirs} 3\t{path}\n"
+        );
+        self.git.run_with_input(
+            &self.root,
+            ["update-index", "--index-info"],
+            Some(stages.as_bytes()),
+        )?;
+        Ok(())
+    }
+
+    /// The mode and the blob id of `path` in `revision`, `None` when the revision has no such
+    /// file.
+    fn tree_entry(&self, revision: &str, path: &str) -> io::Result<Option<(String, String)>> {
+        let listed = self.run(["ls-tree", revision, "--", path])?;
+        let mut fields = listed.split_whitespace();
+        Ok(match (fields.next(), fields.next(), fields.next()) {
+            (Some(mode), Some(_kind), Some(id)) => Some((mode.to_owned(), id.to_owned())),
+            _ => None,
+        })
     }
 
     /// The commits of a revision range such as `main..feature`, newest first.
@@ -1539,7 +1700,7 @@ impl Repository {
 
     /// Adds the files whose text differs between `revisions`, as git diff names them.
     fn collect_files(&self, files: &mut Vec<String>, revisions: &[&str]) -> io::Result<()> {
-        let mut args = vec!["diff", "--name-only"];
+        let mut args = vec!["diff", "--name-only", "--no-ext-diff", "--no-textconv"];
         args.extend(revisions.iter().copied());
         let output = self.git.run(&self.root, &args)?;
         let output = String::from_utf8_lossy(&output);
@@ -1557,18 +1718,24 @@ impl Repository {
     /// log does. Local changes git cannot keep are an error, as they are for a branch.
     pub fn checkout_commit(&self, commit: &str) -> io::Result<()> {
         self.git
-            .run(&self.root, ["switch", "--detach", commit])
+            .run(
+                &self.root,
+                ["switch", "--detach", "--end-of-options", commit],
+            )
             .map(drop)
     }
 
     /// New Tag of the log: a lightweight tag at `commit`.
     pub fn create_tag(&self, name: &str, commit: &str) -> io::Result<()> {
-        self.git.run(&self.root, ["tag", name, commit]).map(drop)
+        self.git
+            .run(&self.root, ["tag", "--end-of-options", name, commit])
+            .map(drop)
     }
 
     /// New Branch of the log: a branch at `commit`, checked out when `checkout` is set.
     pub fn branch_from(&self, name: &str, commit: &str, checkout: bool) -> io::Result<()> {
-        self.git.run(&self.root, ["branch", name, commit])?;
+        self.git
+            .run(&self.root, ["branch", "--end-of-options", name, commit])?;
         if checkout {
             self.switch(name)?;
         }
@@ -1597,7 +1764,7 @@ impl Repository {
     /// conflict comes back with `Operation::Revert`.
     pub fn revert_commit(&self, commit: &str) -> io::Result<UpdateReport> {
         let before = self.stash_ids()?;
-        let result = self.run(["revert", "--no-edit", commit]);
+        let result = self.run(["revert", "--no-edit", "--end-of-options", commit]);
         self.report_update(result, before)
     }
 
@@ -1605,7 +1772,10 @@ impl Repository {
     /// Reset dialog chose.
     pub fn reset(&self, commit: &str, mode: ResetMode) -> io::Result<()> {
         self.git
-            .run(&self.root, ["reset", mode.flag(), commit])
+            .run(
+                &self.root,
+                ["reset", mode.flag(), "--end-of-options", commit],
+            )
             .map(drop)
     }
 
@@ -1930,14 +2100,6 @@ fn unified_patch(path: &str, base_exists: bool, base: &str, target: &str) -> Vec
         new_at += 1;
     }
     patch.into_bytes()
-}
-
-/// A unique path in the temporary folder for an index or a script of a reword.
-fn temp_path(kind: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let serial = NEXT.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("ide-{kind}-{}-{serial}", std::process::id()))
 }
 
 /// The original failure plus where git kept the local changes, so the window can say it.

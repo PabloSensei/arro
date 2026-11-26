@@ -61,6 +61,30 @@ pub fn private_file(path: &Path) -> io::Result<std::fs::File> {
     Ok(file)
 }
 
+/// Creates a folder that its owner alone may enter: `0700` on a system with permission bits,
+/// the attributes of the folder on Windows. The folders above it are made as usual, and an
+/// existing folder gets the same mode.
+pub fn private_dir(path: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    set_mode(path, 0o700)
+}
+
+/// Creates one folder that its owner alone may enter: `0700` on a system with permission
+/// bits, the attributes of the folder on Windows. It fails when `path` exists, so a folder
+/// another user made under the same name is never taken over.
+#[cfg(unix)]
+pub fn private_new_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    std::fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+/// Creates one folder that its owner alone may enter, see the Unix version.
+#[cfg(not(unix))]
+pub fn private_new_dir(path: &Path) -> io::Result<()> {
+    std::fs::create_dir(path)
+}
+
 /// The permission bits of `path`, or `0` on a system without them.
 #[cfg(unix)]
 pub fn mode(path: &Path) -> io::Result<u32> {
@@ -72,4 +96,23 @@ pub fn mode(path: &Path) -> io::Result<u32> {
 #[cfg(not(unix))]
 pub fn mode(_path: &Path) -> io::Result<u32> {
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_private_folder_is_made_with_its_parents_and_keeps_its_mode() {
+        let temp = test_support::TempDir::new("private-dir");
+        let folder = temp.path().join("config").join("ide");
+
+        private_dir(&folder).expect("the folder is made");
+        private_dir(&folder).expect("a second call changes nothing");
+
+        assert!(folder.is_dir());
+        if cfg!(unix) {
+            assert_eq!(mode(&folder).expect("the mode"), 0o700);
+        }
+    }
 }

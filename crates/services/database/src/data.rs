@@ -10,7 +10,7 @@
 
 use crate::export::csv_field;
 use crate::protocol::Value;
-use crate::schema::{Column, ColumnKind};
+use crate::schema::{Column, ColumnKind, Table};
 use crate::sources::DriverKind;
 
 /// How a product quotes a name, writes a boolean and pages a result.
@@ -47,6 +47,11 @@ impl Dialect {
             Self::MySql | Self::MariaDb => '`',
             Self::H2 | Self::PostgreSql | Self::Sqlite | Self::Oracle | Self::SqlServer => '"',
         }
+    }
+
+    /// Whether the product refuses `OFFSET … FETCH NEXT` without an `ORDER BY` before it.
+    fn needs_order_for_paging(self) -> bool {
+        matches!(self, Self::SqlServer)
     }
 
     /// Wraps a name in the quotes of the product; a quote inside it is doubled.
@@ -168,6 +173,8 @@ pub struct PageQuery {
     /// The name of the sorted column; `None` keeps the order of the table.
     pub sort: Option<String>,
     pub ascending: bool,
+    /// The columns that tell a row apart, for a product that pages only in an order.
+    pub key: Vec<String>,
     pub offset: usize,
     pub limit: usize,
 }
@@ -185,14 +192,35 @@ impl PageQuery {
             text.push_str(filter);
             text.push(')');
         }
-        if let Some(column) = &self.sort {
-            text.push_str(" ORDER BY ");
-            text.push_str(&dialect.quote_name(column));
-            text.push_str(if self.ascending { " ASC" } else { " DESC" });
-        }
+        text.push_str(&self.order_clause(dialect));
         text.push(' ');
         text.push_str(&dialect.paging(self.limit, self.offset));
         text
+    }
+
+    /// The sort of the grid, or the order that a product needs to page a result. SQL Server
+    /// refuses `OFFSET … FETCH NEXT` without one, so a table without a sort is ordered by
+    /// its key, and a table without a key by a constant that keeps the order of the table.
+    fn order_clause(&self, dialect: Dialect) -> String {
+        if let Some(column) = &self.sort {
+            return format!(
+                " ORDER BY {} {}",
+                dialect.quote_name(column),
+                if self.ascending { "ASC" } else { "DESC" }
+            );
+        }
+        if !dialect.needs_order_for_paging() {
+            return String::new();
+        }
+        if self.key.is_empty() {
+            return " ORDER BY (SELECT NULL)".to_owned();
+        }
+        let columns: Vec<String> = self
+            .key
+            .iter()
+            .map(|column| format!("{} ASC", dialect.quote_name(column)))
+            .collect();
+        format!(" ORDER BY {}", columns.join(", "))
     }
 
     pub fn count_sql(&self, dialect: Dialect) -> String {
@@ -214,6 +242,54 @@ fn filter_expression(text: &str) -> Option<&str> {
         _ => text,
     };
     (!rest.is_empty()).then_some(rest)
+}
+
+/// The columns that tell a row of the table apart, in the order of the table: its primary
+/// key, or a unique index over columns that cannot be NULL when it has no primary key. A
+/// unique index with a nullable column does not tell two rows with NULL apart, and a value
+/// without a primary key cannot be matched safely.
+pub fn identifying_columns(table: &Table) -> Vec<usize> {
+    let primary: Vec<usize> = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.primary_key)
+        .map(|(index, _)| index)
+        .collect();
+    if !primary.is_empty() {
+        return primary;
+    }
+    for index in &table.indexes {
+        if !index.unique || index.columns.is_empty() {
+            continue;
+        }
+        let columns: Option<Vec<usize>> = index
+            .columns
+            .iter()
+            .map(|name| {
+                let index = column_of(table, name)?;
+                (!table.columns[index].nullable).then_some(index)
+            })
+            .collect();
+        if let Some(columns) = columns {
+            return columns;
+        }
+    }
+    Vec::new()
+}
+
+/// The position of a column of the table by its name, as the driver wrote it.
+fn column_of(table: &Table, name: &str) -> Option<usize> {
+    table
+        .columns
+        .iter()
+        .position(|column| column.name == name)
+        .or_else(|| {
+            table
+                .columns
+                .iter()
+                .position(|column| column.name.eq_ignore_ascii_case(name))
+        })
 }
 
 /// One cell edit of a row: `None` means the column is left out of the statement, which
@@ -325,6 +401,8 @@ fn same_value(left: &Value, right: &Value) -> bool {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DataModel {
     columns: Vec<Column>,
+    /// The columns that identify a row of the table; empty when no such column exists.
+    key: Vec<usize>,
     rows: Vec<DataRow>,
 }
 
@@ -332,8 +410,25 @@ impl DataModel {
     /// The kinds and keys of the columns come from the schema of the table, not from the
     /// metadata of the result, which names no key.
     pub fn new(columns: Vec<Column>) -> Self {
+        let key = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.primary_key)
+            .map(|(index, _)| index)
+            .collect();
+        Self::with_key(columns, key)
+    }
+
+    /// A model whose rows are told apart by `key`, which the schema of the table names; a
+    /// unique index may take the place of a primary key.
+    pub fn with_key(columns: Vec<Column>, key: Vec<usize>) -> Self {
+        let key = key
+            .into_iter()
+            .filter(|index| *index < columns.len())
+            .collect();
         Self {
             columns,
+            key,
             rows: Vec::new(),
         }
     }
@@ -354,18 +449,13 @@ impl DataModel {
         self.rows.len()
     }
 
-    /// The columns that identify a row on the table; empty when it has no primary key.
+    /// The columns that identify a row on the table; empty when the table has no key.
     pub fn key(&self) -> Vec<usize> {
-        self.columns
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| column.primary_key)
-            .map(|(index, _)| index)
-            .collect()
+        self.key.clone()
     }
 
     pub fn has_key(&self) -> bool {
-        self.columns.iter().any(|column| column.primary_key)
+        !self.key.is_empty()
     }
 
     /// Replaces the page. A row carries one value per column of the schema.
@@ -467,12 +557,6 @@ impl DataModel {
     /// The unsaved rows as the statements of one transaction.
     pub fn plan(&self, dialect: Dialect, table: &TableRef) -> Plan {
         let mut plan = Plan::default();
-        if !self.has_key() {
-            plan.warnings.push(format!(
-                "{} has no primary key; every column of a row is compared to find it.",
-                table.name
-            ));
-        }
         let key = self.key();
         for (index, row) in self.rows.iter().enumerate() {
             let outcome = match row.kind() {
@@ -483,9 +567,10 @@ impl DataModel {
             };
             match outcome {
                 Outcome::Unchanged => {}
-                Outcome::Statement(sql) => plan.statements.push(Statement {
+                Outcome::Statement { sql, one_row } => plan.statements.push(Statement {
                     sql,
                     row: Some(index),
+                    one_row,
                 }),
                 Outcome::Failed(text) => {
                     plan.error = Some(format!("Row {}: {text}", index + 1));
@@ -518,11 +603,14 @@ impl DataModel {
             Ok(condition) => condition,
             Err(text) => return Outcome::Failed(text),
         };
-        Outcome::statement(format!(
-            "UPDATE {} SET {} WHERE {condition}",
-            table.qualified(dialect),
-            set.join(", ")
-        ))
+        Outcome::statement(
+            format!(
+                "UPDATE {} SET {} WHERE {condition}",
+                table.qualified(dialect),
+                set.join(", ")
+            ),
+            true,
+        )
     }
 
     fn insert(&self, dialect: Dialect, table: &TableRef, row: &DataRow) -> Outcome {
@@ -541,12 +629,15 @@ impl DataModel {
         if names.is_empty() {
             return Outcome::Failed("the new row has no value".to_owned());
         }
-        Outcome::statement(format!(
-            "INSERT INTO {} ({}) VALUES ({})",
-            table.qualified(dialect),
-            names.join(", "),
-            values.join(", ")
-        ))
+        Outcome::statement(
+            format!(
+                "INSERT INTO {} ({}) VALUES ({})",
+                table.qualified(dialect),
+                names.join(", "),
+                values.join(", ")
+            ),
+            false,
+        )
     }
 
     fn delete(&self, dialect: Dialect, table: &TableRef, row: &DataRow, key: &[usize]) -> Outcome {
@@ -554,21 +645,20 @@ impl DataModel {
             Ok(condition) => condition,
             Err(text) => return Outcome::Failed(text),
         };
-        Outcome::statement(format!(
-            "DELETE FROM {} WHERE {condition}",
-            table.qualified(dialect)
-        ))
+        Outcome::statement(
+            format!("DELETE FROM {} WHERE {condition}", table.qualified(dialect)),
+            true,
+        )
     }
 
-    /// The key of the row, or every original value when the table has none.
+    /// The key of the row. A table without a key of its own cannot name one row among equal
+    /// ones, so its rows are not written at all.
     fn condition(&self, dialect: Dialect, row: &DataRow, key: &[usize]) -> Result<String, String> {
-        let columns: Vec<usize> = if key.is_empty() {
-            (0..self.columns.len()).collect()
-        } else {
-            key.to_vec()
-        };
+        if key.is_empty() {
+            return Err(NO_KEY.to_owned());
+        }
         let mut parts = Vec::new();
-        for index in columns {
+        for &index in key {
             let column = self
                 .columns
                 .get(index)
@@ -586,24 +676,24 @@ impl DataModel {
                 }
             }
         }
-        if parts.is_empty() {
-            return Err("the row has no value to find it by".to_owned());
-        }
         Ok(parts.join(" AND "))
     }
 }
+
+/// What a table without a key cannot do, in the words the window shows.
+pub const NO_KEY: &str = "the table has no key, so a row cannot be told apart";
 
 /// What one row contributes to a plan, so that a row that cannot be written stops the
 /// whole plan instead of hiding among the warnings.
 enum Outcome {
     Unchanged,
-    Statement(String),
+    Statement { sql: String, one_row: bool },
     Failed(String),
 }
 
 impl Outcome {
-    fn statement(sql: String) -> Self {
-        Outcome::Statement(sql)
+    fn statement(sql: String, one_row: bool) -> Self {
+        Outcome::Statement { sql, one_row }
     }
 
     fn failed(what: &str) -> Self {
@@ -619,6 +709,9 @@ pub struct Statement {
     pub sql: String,
     /// The index of the row in the model, for a message at that row.
     pub row: Option<usize>,
+    /// The statement names one row by its key, so the product must report exactly one
+    /// changed row; any other count means it wrote other rows or none at all.
+    pub one_row: bool,
 }
 
 /// What Submit sends and what the user should know before it does.
@@ -636,29 +729,30 @@ impl Plan {
     }
 }
 
-/// Reads the text of a cell as the kind of its column says.
+/// Reads the text of a cell as the kind of its column says. Text keeps every space the user
+/// typed: a column of text may hold them, and the grid shows them again after a read.
 fn parse_text(kind: ColumnKind, text: &str) -> Result<Value, String> {
-    let text = text.trim();
+    let trimmed = text.trim();
     match kind {
-        ColumnKind::Integer => text
+        ColumnKind::Integer => trimmed
             .parse::<i64>()
             .map(Value::Integer)
-            .map_err(|_| format!("{text} is not a whole number.")),
+            .map_err(|_| format!("{trimmed} is not a whole number.")),
         ColumnKind::Decimal | ColumnKind::Number => {
-            if is_number(text) {
-                Ok(Value::Decimal(text.to_owned()))
+            if is_number(trimmed) {
+                Ok(Value::Decimal(trimmed.to_owned()))
             } else {
-                Err(format!("{text} is not a number."))
+                Err(format!("{trimmed} is not a number."))
             }
         }
-        ColumnKind::Boolean => match text.to_ascii_lowercase().as_str() {
+        ColumnKind::Boolean => match trimmed.to_ascii_lowercase().as_str() {
             "true" | "t" | "1" | "yes" => Ok(Value::Boolean(true)),
             "false" | "f" | "0" | "no" => Ok(Value::Boolean(false)),
-            _ => Err(format!("{text} is not true or false.")),
+            _ => Err(format!("{trimmed} is not true or false.")),
         },
-        ColumnKind::Date => Ok(Value::Date(text.to_owned())),
-        ColumnKind::Time => Ok(Value::Time(text.to_owned())),
-        ColumnKind::Timestamp => Ok(Value::Timestamp(text.to_owned())),
+        ColumnKind::Date => Ok(Value::Date(trimmed.to_owned())),
+        ColumnKind::Time => Ok(Value::Time(trimmed.to_owned())),
+        ColumnKind::Timestamp => Ok(Value::Timestamp(trimmed.to_owned())),
         ColumnKind::Binary => Err("A binary value is read-only.".to_owned()),
         ColumnKind::Text | ColumnKind::Other => Ok(Value::Text(text.to_owned())),
     }
@@ -809,6 +903,7 @@ pub fn tsv(rows: &[Vec<Value>]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::Index;
 
     fn column(name: &str, kind: ColumnKind, nullable: bool, primary_key: bool) -> Column {
         Column {
@@ -852,6 +947,7 @@ mod tests {
             filter: "AGE > 18".into(),
             sort: Some("NAME".into()),
             ascending: false,
+            key: vec!["ID".into()],
             offset: 500,
             limit: 500,
         };
@@ -926,13 +1022,14 @@ mod tests {
                       WHERE \"ID\" = 1"
                     .into(),
                 row: Some(0),
+                one_row: true,
             }]
         );
         assert!(plan.warnings.is_empty());
     }
 
     #[test]
-    fn an_update_without_a_key_compares_every_original_value_and_says_so() {
+    fn an_update_of_a_table_without_a_key_is_refused() {
         let mut columns = owners();
         columns[0].primary_key = false;
         let mut model = DataModel::new(columns);
@@ -944,13 +1041,8 @@ mod tests {
         model.set_text(0, 1, "Ann Lee").unwrap();
 
         let plan = model.plan(Dialect::PostgreSql, &table());
-        assert_eq!(
-            plan.statements[0].sql,
-            "UPDATE \"PUBLIC\".\"OWNERS\" SET \"NAME\" = 'Ann Lee' WHERE \"ID\" = 1 \
-             AND \"NAME\" = 'Ann' AND \"AGE\" IS NULL"
-        );
-        assert_eq!(plan.warnings.len(), 1);
-        assert!(plan.warnings[0].contains("no primary key"));
+        assert!(plan.statements.is_empty());
+        assert_eq!(plan.error, Some(format!("Row 1: {NO_KEY}")));
     }
 
     #[test]
@@ -986,6 +1078,7 @@ mod tests {
             vec![Statement {
                 sql: "DELETE FROM \"PUBLIC\".\"OWNERS\" WHERE \"ID\" = 2".into(),
                 row: Some(1),
+                one_row: true,
             }]
         );
         assert_eq!(model.row(1).map(DataRow::kind), Some(RowKind::Deleted));
@@ -1022,14 +1115,17 @@ mod tests {
                             "UPDATE {qualified} SET {name} = 'Ann O''Neil' WHERE {id} = 1"
                         ),
                         row: Some(0),
+                        one_row: true,
                     },
                     Statement {
                         sql: format!("DELETE FROM {qualified} WHERE {id} = 2"),
                         row: Some(1),
+                        one_row: true,
                     },
                     Statement {
                         sql: format!("INSERT INTO {qualified} ({id}, {name}) VALUES (3, 'Bob')"),
                         row: Some(2),
+                        one_row: false,
                     },
                 ],
                 "{dialect:?}"
@@ -1210,10 +1306,10 @@ mod tests {
     #[test]
     fn a_binary_value_has_no_literal_and_stops_the_plan() {
         let mut columns = owners();
-        columns.push(column("PHOTO", ColumnKind::Binary, true, false));
-        // Without a key the row is found by every value, and a binary value has no
-        // literal: the statement cannot name the row.
         columns[0].primary_key = false;
+        columns.push(column("PHOTO", ColumnKind::Binary, true, true));
+        // The key of the table is the binary column, and a binary value has no literal: the
+        // statement cannot name the row it changes.
         let mut model = DataModel::new(columns);
         model.set_rows(vec![vec![
             Value::Integer(1),
@@ -1253,5 +1349,102 @@ mod tests {
             "ID,NAME,AGE\n1,\"Ann, \"\"A\"\"\",NULL\n"
         );
         assert_eq!(tsv(&[row]), "1\tAnn, \"A\"\tNULL");
+    }
+
+    #[test]
+    fn sql_server_pages_only_in_an_order() {
+        let mut query = PageQuery {
+            table: table(),
+            key: vec!["ID".into()],
+            limit: 10,
+            ..PageQuery::default()
+        };
+        assert_eq!(
+            query.sql(Dialect::SqlServer),
+            "SELECT * FROM \"PUBLIC\".\"OWNERS\" ORDER BY \"ID\" ASC \
+             OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY"
+        );
+
+        query.key.clear();
+        assert_eq!(
+            query.sql(Dialect::SqlServer),
+            "SELECT * FROM \"PUBLIC\".\"OWNERS\" ORDER BY (SELECT NULL) \
+             OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY"
+        );
+
+        // A chosen sort wins over the key, and the other products need no order at all.
+        query.sort = Some("NAME".into());
+        query.ascending = true;
+        assert_eq!(
+            query.sql(Dialect::SqlServer),
+            "SELECT * FROM \"PUBLIC\".\"OWNERS\" ORDER BY \"NAME\" ASC \
+             OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY"
+        );
+        let plain = PageQuery {
+            table: table(),
+            limit: 10,
+            ..PageQuery::default()
+        };
+        assert!(!plain.sql(Dialect::PostgreSql).contains("ORDER BY"));
+    }
+
+    #[test]
+    fn a_text_keeps_the_spaces_around_it() {
+        let mut model = model();
+        model.set_text(0, 1, "  Ann  ").unwrap();
+
+        assert_eq!(
+            model.row(0).and_then(|row| row.cell(1)),
+            Some(&Value::Text("  Ann  ".into()))
+        );
+        assert_eq!(
+            model.plan(Dialect::H2, &table()).statements[0].sql,
+            "UPDATE \"PUBLIC\".\"OWNERS\" SET \"NAME\" = '  Ann  ' WHERE \"ID\" = 1"
+        );
+    }
+
+    #[test]
+    fn a_unique_index_over_columns_that_cannot_be_null_is_a_key() {
+        let mut table = schema_table();
+        table.indexes = vec![Index {
+            name: "UQ_EMAIL".into(),
+            unique: true,
+            columns: vec!["EMAIL".into()],
+        }];
+        table.columns[1].nullable = false;
+        assert_eq!(identifying_columns(&table), vec![1]);
+        assert_eq!(
+            identifier_names(&table, identifying_columns(&table)),
+            vec!["EMAIL".to_owned()]
+        );
+
+        // A unique index over a column that takes NULL does not tell two rows apart.
+        table.columns[1].nullable = true;
+        assert!(identifying_columns(&table).is_empty());
+
+        // A primary key wins over every index.
+        table.columns[0].primary_key = true;
+        assert_eq!(identifying_columns(&table), vec![0]);
+    }
+
+    fn schema_table() -> Table {
+        Table {
+            schema: "PUBLIC".into(),
+            name: "OWNERS".into(),
+            kind: crate::schema::TableKind::Table,
+            columns: vec![
+                column("ID", ColumnKind::Integer, false, false),
+                column("EMAIL", ColumnKind::Text, false, false),
+            ],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            partial: false,
+        }
+    }
+
+    fn identifier_names(table: &Table, key: Vec<usize>) -> Vec<String> {
+        key.into_iter()
+            .map(|index| table.columns[index].name.clone())
+            .collect()
     }
 }

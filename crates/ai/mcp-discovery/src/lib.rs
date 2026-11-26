@@ -16,7 +16,7 @@ pub mod clients;
 
 pub use clients::{
     CLIENTS, Client, ClientState, ConfigError, Scope, Server, Status, Transport, configure,
-    has_entry, home_folder, remove, snippet, state,
+    file_transport, has_entry, home_folder, remove, snippet, state,
 };
 
 /// The folder of the entry points under the state folder of Arro.

@@ -78,6 +78,13 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// Stops the language server of the project, for a project whose trust the user
+    /// revoked: the server may run code of the project, so it must not keep running.
+    /// False when this language has no server or it does not run.
+    fn stop_server(&self) -> bool {
+        false
+    }
+
     /// Whether the language server can answer now. Navigation falls back to the project
     /// index while it cannot, such as during the import of the project.
     fn server_ready(&self) -> bool {

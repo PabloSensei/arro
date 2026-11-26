@@ -1193,6 +1193,7 @@ impl DatabasePanel {
             dbms: source.kind.title().to_string(),
             driver,
             url: tool_gateway::hide_secrets(&source.url),
+            notice: None,
         }
     }
 
@@ -1250,6 +1251,9 @@ impl DatabasePanel {
         if url.trim().is_empty() {
             return Err("the address of a connection is required".to_string());
         }
+        if let Some(reason) = database::running_parameter(url) {
+            return Err(reason);
+        }
         let name = if name.trim().is_empty() {
             source_name(url)
         } else {
@@ -1295,12 +1299,26 @@ impl DatabasePanel {
         if url.trim().is_empty() {
             return Err("the address of a connection is required".to_string());
         }
+        if let Some(reason) = database::running_parameter(url) {
+            return Err(reason);
+        }
         let Some(index) = self.sources.iter().position(|known| known.id == source) else {
             return Err(format!("no connection has the id {connection_id}"));
         };
-        let changed = self.sources[index].url != url
-            || kind.is_some_and(|kind| kind != self.sources[index].kind);
-        self.sources[index].url = tool_gateway::without_password(url);
+        let known = self.sources[index].clone();
+        let moved = database::points_elsewhere(&known.url, url)
+            || kind.is_some_and(|kind| kind != known.kind);
+        let stripped = tool_gateway::without_password(url);
+        let changed = known.url != stripped || kind.is_some_and(|kind| kind != known.kind);
+        if moved {
+            // The password of the old address belongs to another machine: it is not sent to
+            // the new one, and the user enters it again.
+            self.passwords.remove(&source);
+            if self.secrets.ready() {
+                self.forget_password(&known, cx);
+            }
+        }
+        self.sources[index].url = stripped;
         if let Some(kind) = kind {
             self.sources[index].kind = kind;
         }
@@ -1316,8 +1334,16 @@ impl DatabasePanel {
         let check = need_to_check
             .then(|| self.test_connection(&source).ok())
             .flatten();
+        let mut connection = self.connection_of(&saved);
+        if moved {
+            connection.notice = Some(format!(
+                "{} points at another host, port or database, so the stored password was \
+                 removed.",
+                saved.name
+            ));
+        }
         cx.notify();
-        Ok(DatabaseAnswer::Saved(self.connection_of(&saved), check))
+        Ok(DatabaseAnswer::Saved(connection, check))
     }
 
     /// Runs a statement for a tool on the console of its connection and keeps the job
@@ -1837,6 +1863,18 @@ impl DatabasePanel {
     #[cfg(test)]
     pub(crate) fn running_for_test(&self) -> bool {
         !self.query_ids.is_empty()
+    }
+
+    /// Whether the console of a source is in Manual, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn manual_for_test(&self, source: &SourceId) -> bool {
+        !self.auto_commit(source)
+    }
+
+    /// The folder of the state of the Database window, for the window tests.
+    #[cfg(test)]
+    pub(crate) fn state_dir_for_test(&self) -> PathBuf {
+        self.state_dir.clone()
     }
 
     /// The language side of the window, for the window tests: the application puts one
@@ -2645,6 +2683,13 @@ impl DatabasePanel {
 
     fn connect_source(&mut self, source: Source, password: Secret, cx: &mut Context<Self>) {
         if self.sessions.contains_key(&source.id) || self.scripted.is_some() {
+            return;
+        }
+        if let Some(reason) = database::running_parameter(&source.url) {
+            // An address that runs code on connect is refused even when an older state file
+            // kept it: the helper never sees it.
+            self.errors.insert(source.id.clone(), reason);
+            cx.notify();
             return;
         }
         if self.driver_missing(&source) {
@@ -3927,10 +3972,13 @@ impl DatabasePanel {
     ) {
         match command {
             // The data tab and the console share the one connection of a source: its
-            // transaction commands end the pending changes of both.
+            // transaction commands end the pending changes of both. Turning auto-commit on
+            // ends the transaction the driver holds; turning it off keeps what waits.
             DataCommand::AutoCommit(on) => {
                 self.manual.insert(source.clone(), !on);
-                self.pending.remove(&source);
+                if on {
+                    self.pending.remove(&source);
+                }
             }
             DataCommand::Commit | DataCommand::Rollback => {
                 self.pending.remove(&source);
@@ -4158,6 +4206,26 @@ impl DatabasePanel {
     /// The statements of a source that wait for Commit or Rollback.
     pub(crate) fn pending_count(&self, source: &SourceId) -> u32 {
         self.pending.get(source).copied().unwrap_or(0)
+    }
+
+    /// Whether the console of a source holds a transaction that waits for Commit or
+    /// Rollback. A data tab asks before Submit, because one connection carries both.
+    pub(crate) fn has_open_transaction(&self, source: &SourceId) -> bool {
+        self.pending_count(source) > 0
+    }
+
+    /// Whether the console of a source runs its statements only on Commit.
+    pub(crate) fn console_manual(&self, source: &SourceId) -> bool {
+        !self.auto_commit(source)
+    }
+
+    /// The name of a source as the windows show it, or its id for one that is gone.
+    pub(crate) fn source_title(&self, source: &SourceId) -> String {
+        self.sources
+            .iter()
+            .find(|known| &known.id == source)
+            .map(|known| known.name.clone())
+            .unwrap_or_else(|| source.to_string())
     }
 
     /// Switches the console of a source between Auto-commit and Manual. A driver that
@@ -4418,15 +4486,21 @@ impl DatabasePanel {
             save_changed,
             account,
         } = edit;
+        // The state of the project keeps no password of an address, whichever caller wrote
+        // the edit: the store keeps it.
+        source.url = tool_gateway::without_password(&source.url);
         source.name = source.name.trim().to_owned();
         if source.name.is_empty() {
             source.name = source_name(&source.url);
         }
         let typed = password.is_some();
+        let mut address_moved = false;
         let (id, added) = match id {
             Some(id) => {
                 let index = self.sources.iter().position(|known| known.id == id)?;
                 let known = self.sources[index].clone();
+                address_moved = known.kind != source.kind
+                    || database::points_elsewhere(&known.url, &source.url);
                 if known.url != source.url || known.kind != source.kind || known.user != source.user
                 {
                     // The address of a live connection is gone: the helper reads a new one on
@@ -4456,15 +4530,21 @@ impl DatabasePanel {
                 self.passwords.insert(id.clone(), password.clone());
             }
         }
+        if address_moved && !typed {
+            // The password of the old address is not the password of the new one.
+            self.passwords.remove(&id);
+        }
         if self.secrets.ready() {
-            let moved = !added && account != source.user;
-            if moved {
+            let account_moved = !added && account != source.user;
+            if account_moved {
                 // The password of the old account is not the password of the new one.
                 let mut old = source.clone();
                 old.user = account;
                 self.forget_password(&old, cx);
             }
-            if typed || save_changed || moved {
+            if address_moved && !typed {
+                self.forget_password(&source, cx);
+            } else if typed || save_changed || account_moved {
                 match self.passwords.get(&id).cloned() {
                     Some(password) if save_password => {
                         self.remember_password(&source, password, cx)
@@ -4496,6 +4576,9 @@ impl DatabasePanel {
         password: Option<Secret>,
         cx: &App,
     ) -> Task<Result<String, String>> {
+        if let Some(reason) = database::running_parameter(&source.url) {
+            return Task::ready(Err(reason));
+        }
         if let Some(events) = self.probe_script.clone() {
             return Task::ready(probe_outcome(events));
         }

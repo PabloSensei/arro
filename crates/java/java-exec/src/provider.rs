@@ -1,11 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base::Cancel;
 use base::Result;
-use java_project::{BuildEnv, CoverageTools, Jdk};
+use java_project::{BuildEnv, CoverageTools, Jdk, find_jdks};
 use proc_sup::ProcessSpec;
 use project_model::{BuildSystem, MAIN_UNIT, Module, ProjectModel};
 use runner::{
@@ -30,6 +30,8 @@ const FIELD_SPRING_PROFILES: &str = "spring_profiles";
 const FIELD_HOST: &str = "host";
 const FIELD_PORT: &str = "port";
 const FIELD_AGENT: &str = "agent";
+/// The home of the JDK a configuration runs on. An empty value is the project's JDK.
+const FIELD_JDK: &str = "jdk";
 /// The only kind of configuration the Add button offers.
 const TEMPLATE_APPLICATION: &str = "application";
 /// The template that attaches to a JVM another process started.
@@ -70,6 +72,9 @@ pub struct JavaTarget {
     pub remote: bool,
     pub host: String,
     pub port: u16,
+    /// The home of the JDK the program runs on, when it is not the project's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jdk: Option<PathBuf>,
 }
 
 /// A configuration written before the before launch list existed builds through its flag;
@@ -83,15 +88,55 @@ fn needs_build(config: &RunConfig) -> bool {
 pub struct JavaProvider {
     env: BuildEnv,
     tool: Arc<dyn BuildSystem>,
+    /// The homes of the JDKs found on this machine. A thread that starts with the provider
+    /// fills them, so the dialog never searches the machine itself.
+    jdks: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 impl JavaProvider {
     pub fn new(env: BuildEnv, tool: Arc<dyn BuildSystem>) -> Self {
-        Self { env, tool }
+        let jdks = Arc::new(Mutex::new(Vec::new()));
+        let found = Arc::clone(&jdks);
+        std::thread::spawn(move || {
+            let homes: Vec<PathBuf> = find_jdks().into_iter().map(|jdk| jdk.home).collect();
+            if let Ok(mut jdks) = found.lock() {
+                *jdks = homes;
+            }
+        });
+        Self { env, tool, jdks }
     }
 
     fn jdk(&self, model: &ProjectModel) -> Result<Jdk> {
         self.env.project_jdk(&model.root)
+    }
+
+    /// The JDK a configuration runs on: the one it names, or the project's.
+    fn jdk_of(&self, model: &ProjectModel, target: &JavaTarget) -> Result<Jdk> {
+        match &target.jdk {
+            Some(home) => {
+                Jdk::at(home).ok_or_else(|| format!("no JDK at {}", home.display()).into())
+            }
+            None => self.jdk(model),
+        }
+    }
+
+    /// The choices of the JRE field: the project's JDK as the empty value, then the homes
+    /// found on this machine, and the home the configuration names when it is still a JDK.
+    /// A home that is not one any more is left out, so the configuration shows its error.
+    fn jdk_choices(&self, target: &JavaTarget) -> Vec<String> {
+        let mut choices = vec![String::new()];
+        if let Ok(jdks) = self.jdks.lock() {
+            choices.extend(jdks.iter().map(|home| home.display().to_string()));
+        }
+        if let Some(home) = &target.jdk
+            && Jdk::at(home).is_some()
+        {
+            let home = home.display().to_string();
+            if !choices.contains(&home) {
+                choices.push(home);
+            }
+        }
+        choices
     }
 
     /// The Java part of a stored configuration. A table that cannot be read as one is an
@@ -278,6 +323,41 @@ impl RunConfigProvider for JavaProvider {
         Ok(configs)
     }
 
+    /// A plain program is run from its launch point and listed by the Services window, but
+    /// it is not a configuration of the project: only an application that starts a server
+    /// is offered by itself, and only while no configuration of that class is stored.
+    fn suggestions(&self, stored: &[RunConfig], discovered: &[RunConfig]) -> Vec<RunConfig> {
+        let stored_classes: HashSet<String> = stored
+            .iter()
+            .map(Self::target)
+            .map(|target| target.main_class)
+            .filter(|class| !class.trim().is_empty())
+            .collect();
+        let mut found = Vec::new();
+        let mut classes = HashSet::new();
+        for config in discovered {
+            if config.provider != PROVIDER_ID {
+                continue;
+            }
+            let target = Self::target(config);
+            if !target.spring_boot || target.main_class.trim().is_empty() {
+                continue;
+            }
+            if stored_classes.contains(&target.main_class) {
+                continue;
+            }
+            if classes.insert(target.main_class.clone()) {
+                found.push(config.clone());
+            }
+        }
+        found
+    }
+
+    fn main_class(&self, config: &RunConfig) -> Option<String> {
+        let target = Self::target(config);
+        (!target.main_class.trim().is_empty()).then_some(target.main_class)
+    }
+
     fn plan(&self, config: &RunConfig, model: &ProjectModel) -> Result<RunPlan> {
         if !model.resolved {
             return Err("the project model has no dependencies yet, sync first".into());
@@ -288,7 +368,7 @@ impl RunConfigProvider for JavaProvider {
                 "the remote configuration attaches to a running JVM, it starts nothing".into(),
             );
         }
-        let jdk = self.jdk(model)?;
+        let jdk = self.jdk_of(model, &target)?;
         let before = needs_build(config)
             .then(|| self.tool.assemble_if_needed(&model.root))
             .transpose()?
@@ -310,7 +390,7 @@ impl RunConfigProvider for JavaProvider {
                 "the remote configuration attaches to a running JVM, it starts nothing".into(),
             );
         }
-        let jdk = self.jdk(model)?;
+        let jdk = self.jdk_of(model, &target)?;
         let before = needs_build(config)
             .then(|| self.tool.assemble_if_needed(&model.root))
             .transpose()?
@@ -351,7 +431,7 @@ impl RunConfigProvider for JavaProvider {
             return Err("the project model has no dependencies yet, sync first".into());
         }
         let target: JavaTarget = config.settings.clone().try_into()?;
-        let jdk = self.jdk(model)?;
+        let jdk = self.jdk_of(model, &target)?;
         let tools = self.env.coverage_tools()?;
         if !tools.agent.is_file() {
             return Err(format!("no coverage agent at {}", tools.agent.display()).into());
@@ -392,7 +472,7 @@ impl RunConfigProvider for JavaProvider {
             return Err("the project model has no dependencies yet, sync first".into());
         }
         let target: JavaTarget = config.settings.clone().try_into()?;
-        let jdk = self.jdk(model)?;
+        let jdk = self.jdk_of(model, &target)?;
         if !crate::profile::supported(&jdk) {
             return Err(format!(
                 "the profiler needs Flight Recorder, which JDK {} does not have; use 8u262 or newer",
@@ -534,22 +614,20 @@ impl RunConfigProvider for JavaProvider {
             ];
         }
         let mut fields = vec![
-            ConfigField::text(FIELD_MAIN_CLASS, "Main class")
-                .hint("The fully qualified name of the class with the main method"),
-            ConfigField::text(FIELD_MODULE, "Module").hint("The module of the project"),
-            ConfigField::arguments(FIELD_PROGRAM_ARGS, "Program arguments")
-                .hint("Quotes keep a space inside one argument"),
+            ConfigField::choice(FIELD_JDK, "java", self.jdk_choices(&target)),
+            ConfigField::module(FIELD_MODULE, "-cp"),
             ConfigField::arguments(FIELD_VM_OPTIONS, "VM options")
-                .hint("Options of the JVM, such as -Xmx512m"),
-            ConfigField::env(FIELD_ENV, "Environment variables").hint("A=1;B=2"),
-            ConfigField::path(FIELD_WORKING_DIR, "Working directory")
-                .hint("The module directory if empty"),
+                .inline()
+                .option("Java"),
+            ConfigField::entry(FIELD_MAIN_CLASS, "Main class").inline(),
+            ConfigField::arguments(FIELD_PROGRAM_ARGS, "Program arguments").inline(),
+            ConfigField::path(FIELD_WORKING_DIR, "Working directory").option("Operating System"),
+            ConfigField::env(FIELD_ENV, "Environment variables")
+                .hint("Separate variables with semicolon: VAR=value; VAR1=value1")
+                .option("Operating System"),
         ];
         if target.spring_boot {
-            fields.push(
-                ConfigField::text(FIELD_SPRING_PROFILES, "Spring profiles")
-                    .hint("Comma-separated profiles of the application"),
-            );
+            fields.push(ConfigField::text(FIELD_SPRING_PROFILES, "Active profiles"));
         }
         fields
     }
@@ -568,6 +646,10 @@ impl RunConfigProvider for JavaProvider {
     fn read_field(&self, config: &RunConfig, key: &str) -> String {
         let target = Self::target(config);
         match key {
+            FIELD_JDK => target
+                .jdk
+                .map(|home| home.display().to_string())
+                .unwrap_or_default(),
             FIELD_MAIN_CLASS => target.main_class,
             FIELD_MODULE => target.module,
             FIELD_PROGRAM_ARGS => join_arguments(&target.program_args),
@@ -588,6 +670,10 @@ impl RunConfigProvider for JavaProvider {
     fn write_field(&self, config: &mut RunConfig, key: &str, value: &str) {
         let mut target = Self::target(config);
         match key {
+            FIELD_JDK => {
+                let home = value.trim();
+                target.jdk = (!home.is_empty()).then(|| home.into());
+            }
             FIELD_MAIN_CLASS => target.main_class = value.trim().to_owned(),
             FIELD_MODULE => target.module = value.trim().to_owned(),
             FIELD_PROGRAM_ARGS => target.program_args = split_arguments(value),
@@ -662,6 +748,8 @@ impl RunConfigProvider for JavaProvider {
             name: NEW_CONFIG_NAME.into(),
             provider: PROVIDER_ID.into(),
             assemble_first: true,
+            // A new configuration shows the environment and the working directory from the start.
+            shown_options: vec![FIELD_ENV.into(), FIELD_WORKING_DIR.into()],
             settings: Self::store(&target)?,
             ..RunConfig::default()
         })
@@ -754,6 +842,37 @@ mod tests {
         let target: JavaTarget = configs[0].settings.clone().try_into().unwrap();
         assert_eq!(target.main_class, "demo.App");
         assert!(target.spring_boot);
+    }
+
+    #[test]
+    fn only_an_application_is_offered_and_a_stored_one_hides_the_found_one() {
+        let root = temp_dir("suggestions");
+        let provider = provider(&root.join("cache"));
+        let model = model(&root);
+        for name in ["Plain", "Tool"] {
+            let source = format!(
+                "package demo; public class {name} {{ public static void main(String[] a) {{}} }}"
+            );
+            std::fs::write(root.join(format!("src/demo/{name}.java")), source).unwrap();
+        }
+
+        let discovered = provider.discover(&model).unwrap();
+        assert_eq!(discovered.len(), 3, "every program is found");
+        let suggested = provider.suggestions(&[], &discovered);
+        assert_eq!(suggested.len(), 1, "only the application is offered");
+        assert_eq!(suggested[0].name, "App");
+        assert_eq!(
+            provider.main_class(&suggested[0]).as_deref(),
+            Some("demo.App")
+        );
+        assert!(provider.main_class(&discovered[1]).is_some());
+
+        let mut stored = suggested[0].clone();
+        stored.name = "Saved App".into();
+        assert!(
+            provider.suggestions(&[stored], &discovered).is_empty(),
+            "a stored configuration of the class hides the found one"
+        );
     }
 
     #[test]
@@ -949,12 +1068,13 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                FIELD_MAIN_CLASS,
+                FIELD_JDK,
                 FIELD_MODULE,
-                FIELD_PROGRAM_ARGS,
                 FIELD_VM_OPTIONS,
-                FIELD_ENV,
+                FIELD_MAIN_CLASS,
+                FIELD_PROGRAM_ARGS,
                 FIELD_WORKING_DIR,
+                FIELD_ENV,
                 FIELD_SPRING_PROFILES,
             ],
             "a Spring Boot program shows the profiles too"
@@ -986,6 +1106,14 @@ mod tests {
 
         provider.write_field(&mut config, FIELD_WORKING_DIR, " ");
         assert_eq!(provider.read_field(&config, FIELD_WORKING_DIR), "");
+
+        // The empty runtime is the project's JDK and is not written; a home the user names is.
+        assert_eq!(provider.read_field(&config, FIELD_JDK), "");
+        provider.write_field(&mut config, FIELD_JDK, "/opt/jdk");
+        assert_eq!(provider.read_field(&config, FIELD_JDK), "/opt/jdk");
+        provider.write_field(&mut config, FIELD_JDK, "");
+        assert_eq!(provider.read_field(&config, FIELD_JDK), "");
+        assert!(config.settings.get(FIELD_JDK).is_none());
     }
 
     #[test]
@@ -1056,6 +1184,36 @@ mod tests {
                 .any(|arg| arg.starts_with("-agentlib:jdwp")),
             "the debug plan starts with the agent"
         );
+    }
+
+    #[test]
+    fn a_configuration_runs_on_the_jdk_it_names() {
+        let root = temp_dir("named-jdk");
+        let provider = provider(&root.join("cache"));
+        let model = model(&root);
+        let mut config = provider.discover(&model).unwrap().remove(0);
+        let home = root.join("jdk-named");
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for tool in ["java", "javac"] {
+            std::fs::write(
+                bin.join(format!("{tool}{}", std::env::consts::EXE_SUFFIX)),
+                "",
+            )
+            .unwrap();
+        }
+        std::fs::write(home.join("release"), "JAVA_VERSION=\"25.0.3\"\n").unwrap();
+        provider.write_field(&mut config, FIELD_JDK, &home.display().to_string());
+
+        for plan in [
+            provider.plan(&config, &model).unwrap(),
+            provider.debug_plan(&config, &model).unwrap(),
+        ] {
+            assert_eq!(
+                environment(&plan.program, "JAVA_HOME"),
+                Some(home.display().to_string())
+            );
+        }
     }
 
     #[test]

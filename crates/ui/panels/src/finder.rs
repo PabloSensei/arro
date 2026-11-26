@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use ::base::Cancel;
 use editor_view::{EditorView, Languages, Spot};
 use futures_util::StreamExt;
-use search::{FileHits, SearchError, TextQuery, find_in_files, find_in_selection, replace_edits};
+use search::{FileHits, SearchError, TextQuery, find_in_files, find_in_selection, replace_found};
 use serde::{Deserialize, Serialize};
 use ui_kit::metrics::*;
 use ui_kit::prelude::*;
@@ -215,6 +215,9 @@ pub struct Finder {
     history_selected: usize,
     /// Ctrl+Alt+E: search only the selection of the active editor.
     in_selection: bool,
+    /// The selection that the last search kept to, and the file it is in. Replace changes
+    /// only that part of the file.
+    searched_selection: Option<(PathBuf, Range<usize>)>,
     /// The preview of the selected row under the list.
     preview: Entity<FilePreview>,
     /// The height of that preview, changed by the divider above it.
@@ -292,6 +295,7 @@ impl Finder {
             history_popup: false,
             history_selected: 0,
             in_selection: false,
+            searched_selection: None,
             preview,
             preview_height,
             preview_drag: None,
@@ -313,18 +317,15 @@ impl Finder {
         }
     }
 
-    /// Open tabs by path, the views of them.
-    fn open_views(&self, cx: &App) -> Vec<(PathBuf, Entity<EditorView>)> {
-        let Some(workspace) = self.workspace.upgrade() else {
-            return Vec::new();
-        };
-        let workspace = workspace.read(cx);
-        let paths = workspace.open_tabs().into_iter().flatten();
-        let views = paths.filter_map(|path| {
-            let view = workspace.view_of(&path)?.downcast::<EditorView>().ok()?;
-            Some((path, view))
-        });
-        views.collect()
+    /// The editor of `path`: the view of its tab, or the buffer of a file that no tab shows,
+    /// unsaved text included. The path is compared as Windows compares it.
+    fn editor_of(&self, path: &Path, cx: &App) -> Option<Entity<EditorView>> {
+        let workspace = self.workspace.upgrade()?;
+        workspace
+            .read(cx)
+            .view_of(path)?
+            .downcast::<EditorView>()
+            .ok()
     }
 
     /// The selection of the active editor, the file and the text it is in.
@@ -362,7 +363,12 @@ impl Finder {
             cx.notify();
             return;
         }
-        let plan = self.request(cx).plan(cx);
+        let request = self.request(cx);
+        self.searched_selection = request
+            .selection
+            .as_ref()
+            .map(|(path, _, range)| (path.clone(), range.clone()));
+        let plan = request.plan(cx);
         let cancel = self.cancel.clone();
         let serial = self.serial;
         let (sender, mut receiver) = futures_channel::mpsc::unbounded::<FileHits>();
@@ -946,29 +952,44 @@ impl Finder {
         }
         let query = self.query();
         let replacement = self.replacement.text.clone();
-        let open = self.open_views(cx);
         let mut done = 0;
-        let mut closed: Vec<PathBuf> = Vec::new();
+        let mut closed: Vec<FileHits> = Vec::new();
         let mut error = None;
         for hits in &self.results {
-            match open.iter().find(|(path, _)| *path == hits.path) {
-                Some((_, view)) => {
-                    let text = view.read(cx).text().unwrap_or_default();
-                    match replace_edits(&query, &replacement, &text) {
-                        Ok(edits) => {
-                            done += edits.len();
-                            let bytes = view.read(cx).file_bytes();
-                            let cause = local_history::Cause::BeforeReplace;
-                            crate::history::snapshot_bytes(&hits.path, bytes, cause, cx);
-                            view.update(cx, |view, cx| {
-                                view.apply_edits(edits, cx);
-                                view.save(cx);
-                            });
-                        }
-                        Err(failed) => error = Some(failed.to_string()),
-                    }
+            // The part of the file that the search kept to: the selection, or the whole file.
+            let kept = match &self.searched_selection {
+                Some((path, range)) if *path == hits.path => Some(range.clone()),
+                Some(_) => continue,
+                None => None,
+            };
+            let Some(view) = self.editor_of(&hits.path, cx) else {
+                // The places of a selection are the selected text only, so a selection whose
+                // editor is gone is not replaced in the file on disk.
+                if kept.is_none() {
+                    closed.push(hits.clone());
                 }
-                None => closed.push(hits.path.clone()),
+                continue;
+            };
+            // The edits go into the text of the editor, unsaved text included. They reach
+            // the disk only when the editor had no unsaved text before.
+            let text = view.read(cx).text().unwrap_or_default();
+            let range = kept.unwrap_or(0..text.len());
+            match replace_found(&query, &replacement, &text, range, &hits.lines) {
+                Ok(edits) if edits.is_empty() => {}
+                Ok(edits) => {
+                    done += edits.len();
+                    let bytes = view.read(cx).file_bytes();
+                    let cause = local_history::Cause::BeforeReplace;
+                    crate::history::snapshot_bytes(&hits.path, bytes, cause, cx);
+                    let keep_unsaved = view.read(cx).is_dirty();
+                    view.update(cx, |view, cx| {
+                        view.apply_edits(edits, cx);
+                        if !keep_unsaved {
+                            view.save(cx);
+                        }
+                    });
+                }
+                Err(failed) => error = Some(failed.to_string()),
             }
         }
         if let Some(error) = error {
@@ -980,8 +1001,8 @@ impl Finder {
         let history = crate::history::get(cx);
         let work = cx.background_executor().spawn(async move {
             if let Some(history) = history {
-                for path in &closed {
-                    let _ = history.record_file(path, local_history::Cause::BeforeReplace);
+                for hits in &closed {
+                    let _ = history.record_file(&hits.path, local_history::Cause::BeforeReplace);
                 }
             }
             replace_on_disk(&query, &replacement, &closed)
@@ -1728,25 +1749,31 @@ fn segments(text: &str, matches: &[std::ops::Range<usize>]) -> Vec<(String, bool
     parts
 }
 
-/// Replaces in files that are not open: all or none of them change, the writes follow.
+/// Replaces in files that are not open: all or none of them change, the writes follow. Only
+/// the matches that Find reported in each file are replaced.
 fn replace_on_disk(
     query: &TextQuery,
     replacement: &str,
-    paths: &[PathBuf],
+    files: &[FileHits],
 ) -> Result<usize, String> {
     let mut store = DocumentStore::new();
     let mut transaction = WorkspaceTransaction::new(EditSource::User);
     let mut documents = Vec::new();
     let mut count = 0;
-    for path in paths {
-        let file =
-            LoadedFile::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    for hits in files {
+        let file = LoadedFile::read(&hits.path)
+            .map_err(|error| format!("{}: {error}", hits.path.display()))?;
         let document = store.open(file);
         let Some(state) = store.state(document) else {
             continue;
         };
         let text = text_core::TextStore::text(&state.text);
-        let edits = replace_edits(query, replacement, &text).map_err(|error| error.to_string())?;
+        let edits = replace_found(query, replacement, &text, 0..text.len(), &hits.lines)
+            .map_err(|error| error.to_string())?;
+        // A file whose hits no longer match is not written: its text is the same.
+        if edits.is_empty() {
+            continue;
+        }
         count += edits.len();
         transaction = transaction.edit_at(document, state.version, edits);
         documents.push(document);
@@ -2183,10 +2210,11 @@ impl FindRequest {
                 }
             }
         };
-        let files = candidates
+        let files: Vec<PathBuf> = candidates
             .into_iter()
             .filter(|path| accepts_mask(&self.mask, path))
             .collect();
+        let open = spelled_as(open, &files);
         SearchPlan {
             query: self.query.clone(),
             files,
@@ -2300,21 +2328,46 @@ pub(crate) fn find_tree(
     (items, rows)
 }
 
-/// The text of every open tab that has an editor, by path: the unsaved text when the
-/// editor has it.
-fn open_texts(workspace: &WeakEntity<Workspace>, cx: &App) -> HashMap<PathBuf, String> {
+/// The text of every open file that has an editor, by path: the unsaved text when the
+/// editor has it. A file with unsaved text counts even when no tab shows it, because its
+/// buffer is the text that Find has to read.
+pub(crate) fn open_texts(workspace: &WeakEntity<Workspace>, cx: &App) -> HashMap<PathBuf, String> {
     let Some(workspace) = workspace.upgrade() else {
         return HashMap::new();
     };
     let workspace = workspace.read(cx);
-    workspace
-        .open_tabs()
+    let mut paths: Vec<PathBuf> = workspace.open_tabs().into_iter().flatten().collect();
+    paths.extend(workspace.unsaved_files(cx));
+    paths.sort();
+    paths.dedup();
+    paths
         .into_iter()
-        .flatten()
         .filter_map(|path| {
             let view = workspace.view_of(&path)?.downcast::<EditorView>().ok()?;
             let text = view.read(cx).text()?;
             Some((path, text))
+        })
+        .collect()
+}
+
+/// The open texts under the spelling of the files the search reads. Windows writes one
+/// file under two spellings, and the search looks its texts up by the spelling of the list.
+pub(crate) fn spelled_as(
+    open: HashMap<PathBuf, String>,
+    files: &[PathBuf],
+) -> HashMap<PathBuf, String> {
+    if open.is_empty() {
+        return open;
+    }
+    let mut by_key: HashMap<PathBuf, String> = open
+        .into_iter()
+        .map(|(path, text)| (::platform::path_key(&path), text))
+        .collect();
+    files
+        .iter()
+        .filter_map(|file| {
+            let text = by_key.remove(&::platform::path_key(file))?;
+            Some((file.clone(), text))
         })
         .collect()
 }
@@ -2493,6 +2546,8 @@ fn wildcard(pattern: &str, text: &str) -> bool {
 mod tests {
     use std::path::Path;
 
+    use search::{FileHits, find_in_selection};
+
     use super::{TextQuery, accepts_mask, file_title, replace_on_disk, segments, wildcard};
 
     #[test]
@@ -2551,15 +2606,32 @@ mod tests {
         std::fs::write(&second, "two one").unwrap();
 
         let query = TextQuery::plain("one");
-        let count = replace_on_disk(&query, "1", &[first.clone(), second.clone()]).unwrap();
+        let found = [found_in(&query, &first), found_in(&query, &second)];
+        let count = replace_on_disk(&query, "1", &found).unwrap();
         assert_eq!(count, 3);
         assert_eq!(std::fs::read_to_string(&first).unwrap(), "1 two\r\n1");
         assert_eq!(std::fs::read_to_string(&second).unwrap(), "two 1");
 
         let missing = directory.join("none.txt");
-        let failed = replace_on_disk(&TextQuery::plain("1"), "x", &[first.clone(), missing]);
+        let unread = [
+            FileHits {
+                path: first.clone(),
+                lines: Vec::new(),
+            },
+            FileHits {
+                path: missing,
+                lines: Vec::new(),
+            },
+        ];
+        let failed = replace_on_disk(&TextQuery::plain("1"), "x", &unread);
         assert!(failed.is_err());
         assert_eq!(std::fs::read_to_string(&first).unwrap(), "1 two\r\n1");
+    }
+
+    /// The places Find reports in a file, as the search of Find in Files gives them.
+    fn found_in(query: &TextQuery, path: &Path) -> FileHits {
+        let text = std::fs::read_to_string(path).unwrap();
+        find_in_selection(query, path, &text, 0..text.len()).unwrap()
     }
 
     #[test]
@@ -2574,11 +2646,9 @@ mod tests {
         permissions.set_readonly(true);
         std::fs::set_permissions(&second, permissions).unwrap();
 
-        let failed = replace_on_disk(
-            &TextQuery::plain("one"),
-            "1",
-            &[first.clone(), second.clone()],
-        );
+        let query = TextQuery::plain("one");
+        let found = [found_in(&query, &first), found_in(&query, &second)];
+        let failed = replace_on_disk(&query, "1", &found);
         let message = failed.unwrap_err();
         assert!(message.contains("b.txt"), "{message}");
         assert_eq!(std::fs::read(&first).unwrap(), b"one two\r\none");

@@ -451,22 +451,14 @@ impl JavaDebugger {
                 Ok(session) => {
                     // The process lives until the session ends; dropping it kills the debuggee.
                     let _process = process;
-                    if let Err(error) = dap_client::run_with_output(
+                    // The session publishes its own end, with the error when it had one.
+                    let _ = dap_client::run_with_output(
                         session,
                         receiver,
                         Some(output_receiver),
                         failures.clone(),
                     )
-                    .await
-                    {
-                        let snapshot = Snapshot {
-                            state: dap_client::DebugState::Terminated,
-                            console: vec![dap_client::ConsoleLine::new(error.to_string(), true)],
-                            process_id: Some(process_id),
-                            ..Snapshot::default()
-                        };
-                        let _ = failures.send(Arc::new(snapshot));
-                    }
+                    .await;
                 }
                 Err(message) => {
                     let snapshot = Snapshot {
@@ -523,6 +515,7 @@ impl JavaDebugger {
             .await;
             match message {
                 Ok(launch) => {
+                    // The session publishes its own end, with the error when it had one.
                     let _ = dap_client::run(launch, receiver, failures).await;
                 }
                 Err(message) => {

@@ -84,7 +84,11 @@ pub fn resolve_with(
     let settings = load_settings(root);
     let mut runtimes: Vec<(Jdk, bool)> = found.iter().cloned().map(|jdk| (jdk, false)).collect();
     for home in &settings.added {
-        let Some(jdk) = Jdk::at(home) else {
+        let home = project_path(root, home);
+        if platform::is_remote_path(&home) {
+            continue;
+        }
+        let Some(jdk) = Jdk::at(&home) else {
             continue;
         };
         if !runtimes
@@ -96,7 +100,12 @@ pub fn resolve_with(
     }
     let mut notice = None;
     let chosen = settings.selected.as_ref().and_then(|home| {
-        let jdk = Jdk::at(home);
+        let home = project_path(root, home);
+        if platform::is_remote_path(&home) {
+            notice = Some(format!("Network paths are not used: {}", home.display()));
+            return None;
+        }
+        let jdk = Jdk::at(&home);
         if jdk.is_none() {
             notice = Some(format!(
                 "The chosen SDK {} is no longer on disk; the project uses the automatic choice",
@@ -123,7 +132,10 @@ pub fn resolve_with(
         resolved.reason = RuntimeReason::User;
         return resolved;
     }
-    let requested = requested_jdk(root);
+    let requested = match requested_jdk(root) {
+        Requested::Home(home) => Requested::Home(project_path(root, &home)),
+        other => other,
+    };
     let jdks: Vec<Jdk> = resolved.jdks();
     match choose_jdk(&requested, &jdks, default_home) {
         Ok(jdk) => {
@@ -162,6 +174,16 @@ pub fn project_jdk(root: &Path) -> Result<Jdk> {
 
 fn same_home(one: &Path, other: &Path) -> bool {
     same_home_on(Family::current(), one, other)
+}
+
+/// A path of the project settings: a relative one counts from the root of the project,
+/// not from the folder the process happens to run in.
+fn project_path(root: &Path, path: &Path) -> PathBuf {
+    if platform::is_remote_path(path) || path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
 }
 
 /// Windows and macOS ignore the case of a path, the other systems keep it: two folders

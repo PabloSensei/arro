@@ -29,6 +29,9 @@ mod tool_home;
 pub mod updates;
 mod wrapper;
 
+#[cfg(test)]
+mod security_tests;
+
 pub use coverage::CoverageTools;
 pub use database::{drivers, kind_of_jar};
 pub use env::{BuildEnv, detect_build_system};
@@ -65,5 +68,6 @@ pub use sources::{
     source_location,
 };
 pub use test_runs::{TEST_LISTENER, TestHook, TestSelection};
+pub use tool_download::download_agent;
 pub use updates::{BuildFile, Metadata, Slot, Updates, Version, VersionSource, kind_of, slot_at};
 pub use wrapper::{Wrapper, generate as generate_wrapper, generate_with as generate_wrapper_with};

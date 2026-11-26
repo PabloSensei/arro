@@ -843,8 +843,11 @@ impl DockerPanel {
         let Some(cli) = &self.cli else {
             return;
         };
-        let line = cli.exec_command_line(&container.id, EXEC_SHELL);
-        self.in_terminal(line, cx);
+        let dialect = crate::terminal_panel::active_dialect(cx);
+        match cli.exec_command_line(&container.id, EXEC_SHELL, dialect) {
+            Ok(line) => self.in_terminal(line, cx),
+            Err(error) => self.tell("Exec".to_owned(), error.to_string(), cx),
+        }
     }
 
     /// The terminal is another panel that updates the workspace, so this runs deferred.
@@ -1073,7 +1076,7 @@ impl DockerPanel {
         };
         let (providers, configs) = {
             let runs = runs.read(cx);
-            (runs.providers(), runs.configurations().to_vec())
+            (runs.providers(), runs.service_configurations())
         };
         let mut groups: Vec<(ServiceGroup, Vec<RunConfig>)> = Vec::new();
         for config in configs {
@@ -1760,10 +1763,9 @@ impl DockerPanel {
             "edit" => {
                 let Some(config) = runs
                     .read(cx)
-                    .configurations()
-                    .iter()
+                    .service_configurations()
+                    .into_iter()
                     .find(|config| config.name == name)
-                    .cloned()
                 else {
                     return;
                 };

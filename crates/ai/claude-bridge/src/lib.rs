@@ -10,9 +10,9 @@ pub use protocol::file_uri;
 
 use std::collections::HashMap;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
@@ -203,6 +203,8 @@ pub(crate) struct Shared {
     next_diff: AtomicU64,
     next_connection: AtomicU64,
     connected: AtomicUsize,
+    /// The connections open now, the ones that still wait for their headers included.
+    open: AtomicUsize,
     pending: Mutex<HashMap<u64, Pending>>,
     events: Sender<BridgeEvent>,
 }
@@ -320,6 +322,7 @@ impl Bridge {
             next_diff: AtomicU64::new(0),
             next_connection: AtomicU64::new(0),
             connected: AtomicUsize::new(0),
+            open: AtomicUsize::new(0),
             pending: Mutex::new(HashMap::new()),
             events: sender,
         });
@@ -434,9 +437,11 @@ fn lock_path(config: &Path, port: u16) -> PathBuf {
     config.join("ide").join(format!("{port}.lock"))
 }
 
+/// The lock file holds the token of the window, so its folder is private to the owner and so
+/// is the file. Its format is the one the other windows read: only the modes are new.
 fn write_lock(path: &Path, project: &Path, token: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        platform::private_dir(parent)?;
     }
     let project = project.to_string_lossy();
     let text = json!({
@@ -448,20 +453,51 @@ fn write_lock(path: &Path, project: &Path, token: &str) -> io::Result<()> {
         "authToken": token,
     });
     let body = serde_json::to_vec_pretty(&text).map_err(io::Error::other)?;
-    fs::write(path, body)
+    platform::private_file(path)?.write_all(&body)
+}
+
+/// How many connections of the harness are open at once, the ones that wait for their headers
+/// included. A connection past the limit is closed where it is accepted.
+const CONNECTION_LIMIT: usize = 16;
+
+/// A place among the connections of the harness, given back when its connection ends.
+struct Slot(Arc<Shared>);
+
+impl Slot {
+    fn take(shared: &Arc<Shared>) -> Option<Self> {
+        if shared.open.fetch_add(1, Ordering::SeqCst) < CONNECTION_LIMIT {
+            Some(Self(shared.clone()))
+        } else {
+            shared.open.fetch_sub(1, Ordering::SeqCst);
+            None
+        }
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.open.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn accept(shared: Arc<Shared>, listener: TcpListener, stop: Arc<AtomicBool>) {
     // The listener waits inside `accept`; the drop of the bridge wakes it by connecting,
-    // so the loop costs nothing while no harness is here.
+    // so the loop costs nothing while no harness is here. The stop flag is read first, so
+    // that the waking connection ends the loop even when the limit is full.
     while let Ok((stream, _)) = listener.accept() {
         if stop.load(Ordering::SeqCst) {
             break;
         }
+        let Some(slot) = Slot::take(&shared) else {
+            continue;
+        };
         let shared = shared.clone();
         thread::Builder::new()
             .name("claude-bridge-connection".to_string())
-            .spawn(move || connection(shared, stream))
+            .spawn(move || {
+                let _slot = slot;
+                connection(shared, stream);
+            })
             .ok();
     }
 }
@@ -528,43 +564,10 @@ pub(crate) fn write_message(writer: &Arc<Mutex<TcpStream>>, message: &Value) {
     let _ = ws::send_text(&mut *writer, &text);
 }
 
-/// A path of the harness made absolute inside the project. `..` cannot leave it.
+/// A path of the harness made absolute inside the project. `..` cannot leave it, and a link
+/// that points out of it is no path of the project.
 pub(crate) fn resolve(project: &Path, path: &Path) -> Option<PathBuf> {
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        project.join(path)
-    };
-    let mut resolved = PathBuf::new();
-    for component in joined.components() {
-        match component {
-            Component::ParentDir => {
-                resolved.pop();
-            }
-            Component::CurDir => {}
-            other => resolved.push(other),
-        }
-    }
-    inside(project, &resolved).then_some(resolved)
-}
-
-pub(crate) fn inside(project: &Path, path: &Path) -> bool {
-    if cfg!(windows) {
-        let normalize = |path: &Path| {
-            path.to_string_lossy()
-                .replace('/', "\\")
-                .trim_end_matches('\\')
-                .to_lowercase()
-        };
-        let project = normalize(project);
-        let path = normalize(path);
-        path == project
-            || path
-                .strip_prefix(&project)
-                .is_some_and(|rest| rest.starts_with('\\'))
-    } else {
-        path.starts_with(project)
-    }
+    platform::inside_root(project, path)
 }
 
 pub(crate) fn same_path(left: &Path, right: &Path) -> bool {
@@ -709,6 +712,7 @@ mod tests {
             next_diff: AtomicU64::new(0),
             next_connection: AtomicU64::new(0),
             connected: AtomicUsize::new(0),
+            open: AtomicUsize::new(0),
             pending: Mutex::new(HashMap::new()),
             events: sender,
         });
@@ -744,25 +748,114 @@ mod tests {
     #[test]
     fn the_project_is_the_fence_of_a_path() {
         let project = Path::new("work/project");
-        assert!(inside(project, Path::new("work/project/src/a.txt")));
-        assert!(!inside(project, Path::new("work/project-other/a.txt")));
         assert_eq!(
             resolve(project, Path::new("src/../a.txt")),
             Some(PathBuf::from("work/project/a.txt"))
         );
         assert_eq!(resolve(project, Path::new("../secret")), None);
+        assert_eq!(resolve(project, Path::new("../project-other/a.txt")), None);
+    }
+
+    #[test]
+    fn a_link_out_of_the_project_is_no_path_of_it() {
+        let home = test_support::TempDir::new("bridge-link-out");
+        let project = home.path().join("project");
+        let outside = home.path().join("outside");
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("key.txt"), "secret").unwrap();
+        if test_support::link_dir(&outside, &project.join("docs")).is_err() {
+            return;
+        }
+
+        assert_eq!(resolve(&project, Path::new("docs/key.txt")), None);
+        assert_eq!(
+            resolve(&project, Path::new("src/a.txt")),
+            Some(project.join("src").join("a.txt"))
+        );
     }
 
     #[cfg(windows)]
     #[test]
     fn a_windows_path_is_compared_without_case_or_a_trailing_separator() {
         let project = Path::new(r"C:\work\project");
-        assert!(inside(project, Path::new(r"c:\work\project\src\a.txt")));
-        assert!(!inside(project, Path::new(r"C:\work\project-other\a.txt")));
+        assert!(resolve(project, Path::new(r"c:\work\project\src\a.txt")).is_some());
+        assert!(resolve(project, Path::new(r"C:\work\project-other\a.txt")).is_none());
         assert!(same_path(
             Path::new("C:/work/a.txt"),
             Path::new(r"c:\Work\A.txt")
         ));
+    }
+
+    /// A bridge of a test folder, for a test that speaks to it by hand.
+    fn bridge_for(name: &str) -> (test_support::TempDir, Bridge) {
+        let home = test_support::TempDir::new(name);
+        let project = home.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let bridge = Bridge::start(
+            home.path(),
+            &project,
+            Arc::new(Diagnostics::default()),
+            Arc::new(Editors::default()),
+        )
+        .unwrap();
+        (home, bridge)
+    }
+
+    #[test]
+    fn the_lock_file_and_its_folder_are_private_to_the_owner() {
+        let (_home, bridge) = bridge_for("bridge-private");
+        let folder = bridge.lock_path().parent().unwrap().to_path_buf();
+
+        if cfg!(unix) {
+            assert_eq!(platform::mode(bridge.lock_path()).unwrap(), 0o600);
+            assert_eq!(platform::mode(&folder).unwrap(), 0o700);
+        }
+        let lock = fs::read_to_string(bridge.lock_path()).unwrap();
+        let value: Value = serde_json::from_str(&lock).unwrap();
+        assert_eq!(value["ideName"], json!(IDE_NAME), "the format is unchanged");
+    }
+
+    #[test]
+    fn a_connection_that_sends_no_headers_is_closed_after_the_timeout() {
+        use std::io::Read;
+
+        let (_home, bridge) = bridge_for("bridge-silent");
+        let address = SocketAddr::from(([127, 0, 0, 1], bridge.port()));
+        let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(10)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+
+        let mut byte = [0u8; 1];
+        let read = stream.read(&mut byte);
+        assert!(
+            matches!(read, Ok(0)),
+            "the server closes the silent connection: {read:?}"
+        );
+    }
+
+    #[test]
+    fn a_connection_past_the_limit_is_closed_at_once() {
+        use std::io::Read;
+
+        let (_home, bridge) = bridge_for("bridge-limit");
+        let address = SocketAddr::from(([127, 0, 0, 1], bridge.port()));
+        let held: Vec<TcpStream> = (0..CONNECTION_LIMIT)
+            .map(|_| TcpStream::connect_timeout(&address, Duration::from_secs(10)).unwrap())
+            .collect();
+        let mut extra = TcpStream::connect_timeout(&address, Duration::from_secs(10)).unwrap();
+        extra
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+
+        let mut byte = [0u8; 1];
+        let read = extra.read(&mut byte);
+        assert!(
+            matches!(read, Ok(0)),
+            "the connection past the limit: {read:?}"
+        );
+        drop(held);
     }
 
     #[test]

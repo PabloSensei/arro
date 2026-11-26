@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -22,6 +23,10 @@ use crate::model::{
 /// How many answers to identity questions a snapshot keeps. The window asks for the
 /// objects it shows at a stop, so the list only has to outlive a few polls.
 const MAX_IDENTITIES: usize = 512;
+/// How long a session waits for the adapter's `initialized` event after it asked to attach.
+const START_LIMIT: Duration = Duration::from_secs(30);
+/// How long a stop of a session that still starts waits for the adapter to answer it.
+const STOP_LIMIT: Duration = Duration::from_secs(2);
 
 /// What starts a session. `attach_port` is the port the debuggee listens on.
 #[derive(Clone, Debug, Default)]
@@ -58,13 +63,27 @@ pub async fn run(
 }
 
 /// Like [`run`], with the streams of the debuggee that its process gave to the caller.
+///
+/// An error ends the session: the last snapshot then has the state `Terminated` and the
+/// error as its last console line, so the window never waits for a session that is gone.
 pub async fn run_with_output(
     launch: Launch,
     mut commands: UnboundedReceiver<Command>,
     output: Option<UnboundedReceiver<OutputLine>>,
     snapshots: Sender<Arc<Snapshot>>,
 ) -> Result<(), crate::client::Error> {
-    let (client, mut events) = Client::connect(&launch.address).await?;
+    let (client, mut events) = match Client::connect(&launch.address).await {
+        Ok(connected) => connected,
+        Err(error) => {
+            let _ = snapshots.send(Arc::new(Snapshot {
+                state: DebugState::Terminated,
+                console: vec![ConsoleLine::new(error.to_string(), true)],
+                process_id: launch.process_id,
+                ..Snapshot::default()
+            }));
+            return Err(error);
+        }
+    };
     let mut session = Session {
         client,
         state: Snapshot {
@@ -109,39 +128,11 @@ pub async fn run_with_output(
         }
     }
     session.publish();
-    session.start(&mut events).await?;
-
-    loop {
-        let stepped = tokio::select! {
-            event = events.recv() => {
-                let Some(event) = event else {
-                    session.finish();
-                    return Ok(());
-                };
-                session.event(event).await?
-            }
-            command = commands.recv() => {
-                let Some(command) = command else {
-                    session.disconnect().await;
-                    return Ok(());
-                };
-                session.command(command).await?
-            }
-            line = output_line(&mut session.output) => {
-                match line {
-                    Some(line) => {
-                        session.console(line.text, line.error);
-                        session.publish();
-                    }
-                    None => session.output = None,
-                }
-                false
-            }
-        };
-        if stepped {
-            return Ok(());
-        }
+    let result = session.run(&mut events, &mut commands).await;
+    if let Err(error) = &result {
+        session.fail(error);
     }
+    result
 }
 
 /// Waits for the next line of the debuggee, forever when there is no stream.
@@ -197,10 +188,70 @@ impl Session {
         self.publish();
     }
 
+    /// The session ends with an error: the reason goes to the console, then the end.
+    fn fail(&mut self, error: &crate::client::Error) {
+        self.console(error.to_string(), true);
+        self.finish();
+    }
+
+    /// Starts the session, then runs it until it ends.
+    async fn run(
+        &mut self,
+        events: &mut UnboundedReceiver<Event>,
+        commands: &mut UnboundedReceiver<Command>,
+    ) -> Result<(), crate::client::Error> {
+        let mut deferred = Vec::new();
+        if !self.start(events, commands, &mut deferred).await? {
+            return Ok(());
+        }
+        // The commands that came while the session started run now, in their order.
+        for command in deferred {
+            if self.command(command).await? {
+                return Ok(());
+            }
+        }
+        loop {
+            let stepped = tokio::select! {
+                event = events.recv() => {
+                    let Some(event) = event else {
+                        self.finish();
+                        return Ok(());
+                    };
+                    self.event(event).await?
+                }
+                command = commands.recv() => {
+                    let Some(command) = command else {
+                        self.disconnect().await;
+                        return Ok(());
+                    };
+                    self.command(command).await?
+                }
+                line = output_line(&mut self.output) => {
+                    match line {
+                        Some(line) => {
+                            self.console(line.text, line.error);
+                            self.publish();
+                        }
+                        None => self.output = None,
+                    }
+                    false
+                }
+            };
+            if stepped {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Sends `initialize` and `attach`, then waits for the adapter's `initialized` event
+    /// with a limit. A stop meanwhile ends the session, and the other commands wait in
+    /// `deferred`. Returns `false` when the session ended before it started.
     async fn start(
         &mut self,
         events: &mut UnboundedReceiver<Event>,
-    ) -> Result<(), crate::client::Error> {
+        commands: &mut UnboundedReceiver<Command>,
+        deferred: &mut Vec<Command>,
+    ) -> Result<bool, crate::client::Error> {
         let arguments = json!({
             "clientID": "arro",
             "clientName": "Arro",
@@ -231,16 +282,56 @@ impl Session {
         if let Some(project) = &self.project {
             arguments["projectName"] = json!(project);
         }
-        // The adapter sends `initialized` only after it knows what to attach to.
-        let _ = self.client.request("attach", arguments).await;
+        // Some adapters answer `attach` only after the configuration, so the wait does not
+        // hold for the answer: `initialized` decides. A refusal that comes first ends the
+        // session at once; an answer that never comes is no reason to stop.
+        let client = self.client.clone();
+        let mut attach = std::pin::pin!(async move {
+            match client.request("attach", arguments).await {
+                Err(crate::client::Error::TimedOut) => Ok(()),
+                answer => answer.map(drop),
+            }
+        });
+        let mut attached = false;
+        let limit = tokio::time::sleep(START_LIMIT);
+        tokio::pin!(limit);
+        // The adapter sends `initialized` only after it knows what to attach to. The branches
+        // are polled in this order (`biased`): `attach` first, so its request is sent before an
+        // `initialized` that is already queued can end the wait; then the stop and the limit,
+        // which a chatty adapter must not starve; the events and the output come last.
         loop {
-            match events.recv().await {
-                Some(Event::Initialized) => break,
-                Some(Event::Closed) | None => {
-                    self.finish();
-                    return Ok(());
+            tokio::select! {
+                biased;
+                answer = &mut attach, if !attached => {
+                    attached = true;
+                    answer?;
                 }
-                Some(event) => self.collect(event),
+                command = commands.recv() => match command {
+                    Some(Command::Disconnect) | None => {
+                        self.stop_starting().await;
+                        return Ok(false);
+                    }
+                    Some(command) => deferred.push(command),
+                },
+                () = &mut limit => return Err(crate::client::Error::TimedOut),
+                event = events.recv() => match event {
+                    Some(Event::Initialized) => break,
+                    Some(Event::Terminated) => {
+                        self.finish();
+                        return Ok(false);
+                    }
+                    Some(Event::Closed) | None => return Err(crate::client::Error::Closed),
+                    Some(event) => self.collect(event),
+                },
+                line = output_line(&mut self.output) => {
+                    match line {
+                        Some(line) => {
+                            self.console(line.text, line.error);
+                            self.publish();
+                        }
+                        None => self.output = None,
+                    }
+                }
             }
         }
         self.send_exception_filters().await;
@@ -249,7 +340,19 @@ impl Session {
         self.state.state = DebugState::Running;
         self.console("Attached".to_owned(), false);
         self.publish();
-        Ok(())
+        Ok(true)
+    }
+
+    /// A stop while the session starts. The adapter hears the disconnect for a short time
+    /// only, since it may be the reason for the stop. The caller ends the debuggee when the
+    /// session returns: it owns the process.
+    async fn stop_starting(&mut self) {
+        let arguments = json!({"terminateDebuggee": self.owns_process});
+        let _ = self
+            .client
+            .request_with_timeout("disconnect", arguments, STOP_LIMIT)
+            .await;
+        self.finish();
     }
 
     /// Sends the breakpoints of one file and records what the adapter made of them.

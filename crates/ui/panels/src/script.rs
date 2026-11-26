@@ -739,7 +739,7 @@ fn reveal(path: &Path, cx: &mut App) {
 /// Steps that only touch the panel.
 fn panel_step(step: &Step, panel: &mut AgentsPanel, cx: &mut Context<AgentsPanel>) {
     match step {
-        Step::Answer(reply) => panel.answer(*reply, cx),
+        Step::Answer(reply) => panel.answer_script(*reply, cx),
         Step::AgentStop => panel.stop(cx),
         Step::AgentTranscript(path) => panel.set_mock_transcript(path.clone()),
         Step::Changes => panel.show_tab(Tab::Changes, cx),
@@ -778,6 +778,9 @@ fn git_step(step: &Step, window: &mut Window, cx: &mut App) {
 }
 
 /// Waits for `ready` on the panel up to `ms`; false when the time is out or the window gone.
+/// How long `allow` and `deny` wait for the question they answer.
+const ANSWER_PATIENCE_MS: u64 = 60_000;
+
 async fn wait_for(cx: &mut AsyncWindowContext, ms: u64, ready: fn(&AgentsPanel) -> bool) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_millis(ms);
     loop {
@@ -1227,6 +1230,13 @@ pub fn start(script: &str, window: &mut Window, cx: &mut Context<Workspace>) {
                 | Step::ReviewFile(_)
                 | Step::Act(_)
                 | Step::AgentsMd => {
+                    // An answer waits for its question: a tool asks once the agent reaches
+                    // it, which a fixed wait of a demo cannot know.
+                    if matches!(step, Step::Answer(_))
+                        && !wait_for(cx, ANSWER_PATIENCE_MS, AgentsPanel::asks).await
+                    {
+                        eprintln!("no question to answer in {ANSWER_PATIENCE_MS} ms");
+                    }
                     let done = cx.update(|_, cx| {
                         let panel = cx.global::<ActiveAgents>().0.clone();
                         panel.update(cx, |panel, cx| panel_step(&step, panel, cx));

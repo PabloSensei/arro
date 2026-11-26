@@ -12,10 +12,13 @@ use crate::layout::{
     Layout, WindowPlacement, load_layout, load_recent, load_theme, remember_project,
 };
 use crate::settings::{SETTINGS_FILE, Settings};
+use crate::settings_file;
 use crate::window::{Workspace, bind_keys};
 
 const DEFAULT_SIZE: (f32, f32) = (1600., 1000.);
-const DATABASE: &str = "state.sqlite";
+/// The SQLite file of the window state and the recent projects, next to the settings.
+pub const STATE_DATABASE: &str = "state.sqlite";
+const DATABASE: &str = STATE_DATABASE;
 
 /// What the About window and the title bar know about this build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -263,7 +266,9 @@ pub fn run(
         load_recent(store)
     });
     let focus = !launch.background;
-    let settings = settings_at(&launch.settings_dir, theme.chosen);
+    let settings_path = launch.settings_dir.join(SETTINGS_FILE);
+    let reading = settings_file::read(&settings_path, theme.chosen);
+    let settings = reading.settings.clone();
 
     // The Finder hands a document to the delegate of the running application, and the
     // window takes it from the same queue as the paths of a second start.
@@ -324,6 +329,7 @@ pub fn run(
         cx.open_window(options, move |window, cx| {
             cx.new(|cx| {
                 let mut workspace = Workspace::new(launch, layout, store, recent, window, cx);
+                settings_file::announce(&mut workspace, &settings_path, &reading, cx);
                 setup(&mut workspace, window, cx);
                 workspace.restore_tabs(window, cx);
                 workspace.watch_open_requests(watched, window, cx);

@@ -76,8 +76,18 @@ pub(crate) fn open_window_with(
     root: PathBuf,
     setup: ProjectSetup,
 ) -> WindowHandle<Workspace> {
+    open_window_with_state(cx, root, setup, scratch("state"))
+}
+
+/// The same window with the state folder of the caller, for a test that opens the project
+/// twice and expects the state of the first opening to be there.
+pub(crate) fn open_window_with_state(
+    cx: &mut TestAppContext,
+    root: PathBuf,
+    setup: ProjectSetup,
+    state_dir: PathBuf,
+) -> WindowHandle<Workspace> {
     cx.executor().allow_parking();
-    let state_dir = scratch("state");
     let store = store::Store::open(&state_dir.join("state.sqlite"))
         .ok()
         .map(Arc::new);

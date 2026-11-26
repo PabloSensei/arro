@@ -386,21 +386,8 @@ impl StructuralSearch {
             .filter(|path| support.matches(path))
             .cloned()
             .collect();
-        let mut open = HashMap::new();
-        if let Some(workspace) = &workspace {
-            let workspace = workspace.read(cx);
-            for path in workspace.open_tabs().into_iter().flatten() {
-                let Some(view) = workspace.view_of(&path) else {
-                    continue;
-                };
-                let Ok(view) = view.downcast::<EditorView>() else {
-                    continue;
-                };
-                if let Some(text) = view.read(cx).text() {
-                    open.insert(path, text);
-                }
-            }
-        }
+        // The unsaved text of a file that no tab shows is the text to search, as in Find in Files.
+        let open = crate::finder::open_texts(&self.workspace, cx);
         let files = match self.scope {
             StructuralScope::Project => all,
             StructuralScope::Module => {
@@ -453,6 +440,7 @@ impl StructuralSearch {
             }
             range = Some(selection);
         }
+        let open = crate::finder::spelled_as(open, &files);
         Ok((files, open, range))
     }
 
@@ -801,54 +789,41 @@ impl StructuralSearch {
             return;
         };
         let workspace = self.workspace.upgrade();
-        let open: Vec<(PathBuf, Entity<EditorView>)> = workspace
-            .as_ref()
-            .map(|workspace| {
-                let workspace = workspace.read(cx);
-                workspace
-                    .open_tabs()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|path| {
-                        let view = workspace.view_of(&path)?;
-                        let view = view.downcast::<EditorView>().ok()?;
-                        Some((path, view))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
         let mut done = 0;
         let mut closed = Vec::new();
         for path in self.results.keys() {
-            match open.iter().find(|(open, _)| open == path) {
-                Some((_, view)) => {
-                    let text = view.read(cx).text().unwrap_or_default();
-                    let Ok(edits) = support
-                        .structural_search()
-                        .expect("the search ran with the same language")
-                        .replace(&text, &query)
-                    else {
-                        continue;
-                    };
-                    done += edits.len();
-                    let bytes = view.read(cx).file_bytes();
-                    crate::history::snapshot_bytes(
-                        path,
-                        bytes,
-                        local_history::Cause::BeforeReplace,
-                        cx,
-                    );
-                    let edits: Vec<text_core::Edit> = edits
-                        .into_iter()
-                        .map(|edit| text_core::Edit::new(edit.start..edit.end, edit.replacement))
-                        .collect();
-                    view.update(cx, |view, cx| {
-                        view.apply_edits(edits, cx);
-                        view.save(cx);
-                    });
+            // The view of the tab of the file, or of the buffer of a file that no tab shows.
+            let view = workspace
+                .as_ref()
+                .and_then(|workspace| workspace.read(cx).view_of(path))
+                .and_then(|view| view.downcast::<EditorView>().ok());
+            let Some(view) = view else {
+                closed.push(path.clone());
+                continue;
+            };
+            let text = view.read(cx).text().unwrap_or_default();
+            let Ok(edits) = support
+                .structural_search()
+                .expect("the search ran with the same language")
+                .replace(&text, &query)
+            else {
+                continue;
+            };
+            done += edits.len();
+            let bytes = view.read(cx).file_bytes();
+            crate::history::snapshot_bytes(path, bytes, local_history::Cause::BeforeReplace, cx);
+            let edits: Vec<text_core::Edit> = edits
+                .into_iter()
+                .map(|edit| text_core::Edit::new(edit.start..edit.end, edit.replacement))
+                .collect();
+            // Unsaved text stays unsaved: the replacement waits in the buffer until Save.
+            let keep_unsaved = view.read(cx).is_dirty();
+            view.update(cx, |view, cx| {
+                view.apply_edits(edits, cx);
+                if !keep_unsaved {
+                    view.save(cx);
                 }
-                None => closed.push(path.clone()),
-            }
+            });
         }
         let files = self.results.len();
         let history = crate::history::get(cx);

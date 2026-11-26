@@ -22,6 +22,10 @@ use crate::script::ActiveRunPanel;
 use crate::usages::ActiveUsages;
 use crate::{clipboard, debug, marks, navigation, places};
 
+/// The buttons of the save notification for a text the encoding cannot store.
+const SAVE_AS_UTF8: &str = "editor.save_as_utf8";
+const SAVE_CANCEL: &str = "editor.save_cancel";
+
 /// A Safe Delete on a file of the project tree, once the editor of the file is loaded.
 #[derive(Default)]
 pub struct PendingSafeDelete(pub Option<(PathBuf, usize)>);
@@ -1065,6 +1069,22 @@ fn open(
             reports
                 .update(cx, |workspace, cx| {
                     workspace.notify_error(title, message, cx)
+                })
+                .ok();
+        }
+        EditorEvent::Unmappable(message) => {
+            let message = message.clone();
+            reports
+                .update(cx, |workspace, cx| {
+                    workspace.notify_warning_with_commands(
+                        "Save File",
+                        message,
+                        vec![
+                            ("save-utf8", "Save as UTF-8".into(), SAVE_AS_UTF8),
+                            ("cancel", "Cancel".into(), SAVE_CANCEL),
+                        ],
+                        cx,
+                    )
                 })
                 .ok();
         }

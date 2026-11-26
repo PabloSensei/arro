@@ -353,23 +353,10 @@ fn range(text: &str) -> (usize, usize) {
     (start, lines)
 }
 
-/// Rejects a path that would leave the project.
+/// Rejects a path that would leave the project, or that reaches outside it through a link.
 pub fn path_inside(project: &Path, path: &Path) -> Result<PathBuf, String> {
-    let mut resolved = PathBuf::new();
-    for component in project.join(path).components() {
-        match component {
-            std::path::Component::ParentDir => {
-                resolved.pop();
-            }
-            std::path::Component::CurDir => {}
-            other => resolved.push(other),
-        }
-    }
-    let lower = |path: &Path| PathBuf::from(path.to_string_lossy().to_lowercase());
-    if !lower(&resolved).starts_with(lower(project)) {
-        return Err(format!("{} is outside the project", path.display()));
-    }
-    Ok(resolved)
+    platform::inside_root(project, path)
+        .ok_or_else(|| format!("{} is outside the project", path.display()))
 }
 
 /// A one-line picture of a patch for the question of the user.

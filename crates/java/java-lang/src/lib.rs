@@ -52,7 +52,9 @@ pub use newproject::{NewProjectOptions, project_generators};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use java_exec::{JavaProvider, JavaTestProvider, QuarkusDevProvider, parse_tests};
+use java_exec::{
+    IdeaRunProvider, JUnitProvider, JavaProvider, JavaTestProvider, QuarkusDevProvider, parse_tests,
+};
 use java_project::{BuildEnv, detect_build_system};
 use lang_api::SymbolProvider;
 use project_model::BuildSystem;
@@ -179,6 +181,10 @@ pub fn project_build(
                 // A Quarkus module starts through its build tool; the provider finds the
                 // modules that use the framework and offers the Dev Mode of each.
                 Arc::new(QuarkusDevProvider::new(tool.clone())) as Arc<dyn RunConfigProvider>,
+                // Tests of a class, a method or a package, as the Tests window runs them.
+                Arc::new(JUnitProvider) as Arc<dyn RunConfigProvider>,
+                // The run configurations of another IDE, offered for an import.
+                Arc::new(IdeaRunProvider) as Arc<dyn RunConfigProvider>,
             ]
         })
         .collect();

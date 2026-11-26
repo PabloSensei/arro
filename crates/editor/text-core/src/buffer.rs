@@ -53,6 +53,8 @@ struct Shared<S: TextStore> {
     state: u64,
     next_state: u64,
     saved_state: u64,
+    /// The format the bytes on disk have; a format change alone makes the document dirty.
+    saved_format: FileFormat,
     /// The number of the latest change.
     serial: u64,
     /// The latest changes, by number, for the views that have not followed them yet.
@@ -89,6 +91,7 @@ pub struct Buffer<S: TextStore = RopeStore> {
 
 impl<S: TextStore> Buffer<S> {
     pub fn new(text: &str, format: FileFormat) -> Self {
+        let saved_format = format.clone();
         Self {
             shared: Arc::new(Mutex::new(Shared {
                 store: S::from_text(text),
@@ -98,6 +101,7 @@ impl<S: TextStore> Buffer<S> {
                 state: 0,
                 next_state: 1,
                 saved_state: 0,
+                saved_format,
                 serial: 0,
                 changes: VecDeque::new(),
             })),
@@ -175,8 +179,6 @@ impl<S: TextStore> Buffer<S> {
             return;
         }
         shared.format = format;
-        shared.state = shared.next_state;
-        shared.next_state += 1;
         shared.version += 1;
     }
 
@@ -190,12 +192,19 @@ impl<S: TextStore> Buffer<S> {
 
     pub fn is_dirty(&self) -> bool {
         let shared = self.shared.lock().unwrap();
-        shared.state != shared.saved_state
+        shared.state != shared.saved_state || shared.format != shared.saved_format
+    }
+
+    /// Whether the bytes on disk are written in the format the buffer holds now.
+    pub fn is_saved_format(&self) -> bool {
+        let shared = self.shared.lock().unwrap();
+        shared.format == shared.saved_format
     }
 
     pub fn mark_saved(&mut self) {
         let mut shared = self.shared.lock().unwrap();
         shared.saved_state = shared.state;
+        shared.saved_format = shared.format.clone();
         shared.history.seal();
     }
 
@@ -217,7 +226,12 @@ impl<S: TextStore> Buffer<S> {
     ) -> Change {
         self.assert_followed();
         let mut shared = self.shared.lock().unwrap();
-        let edits = prepare(&shared.store, edits);
+        let Ok(edits) = prepare(&shared.store, edits) else {
+            // The callers merge identical edits and drop overlapping ones before they get
+            // here; an answer that still breaks the order changes nothing rather than
+            // poisoning the document.
+            return Change::default();
+        };
         if edits.is_empty() {
             return Change::default();
         }
@@ -379,26 +393,37 @@ fn clamp_selections<S: TextStore>(store: &S, selections: SelectionSet) -> Select
     selections.map(|selection| Selection::new(clamp(selection.anchor), clamp(selection.head)))
 }
 
-/// Normalizes the text of `edits`, drops those that change nothing and checks order.
-fn prepare<S: TextStore>(store: &S, edits: Vec<Edit>) -> Vec<Edit> {
+/// Why a list of edits cannot be one change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EditOrder;
+
+impl std::fmt::Display for EditOrder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("edits must be sorted, inside the text and must not overlap")
+    }
+}
+
+/// Normalizes the text of `edits`, drops those that change nothing and checks order. An
+/// unordered, overlapping or out-of-range list is an error: a language server answer may
+/// bring one, and a panic there would poison the document for every view.
+fn prepare<S: TextStore>(store: &S, edits: Vec<Edit>) -> Result<Vec<Edit>, EditOrder> {
     let mut prepared: Vec<Edit> = Vec::with_capacity(edits.len());
     for edit in edits {
-        assert!(
-            edit.range.end <= store.len(),
-            "edit past the end of the text"
-        );
-        assert!(
-            prepared
-                .last()
-                .is_none_or(|last| last.range.end <= edit.range.start),
-            "edits must be sorted and must not overlap"
-        );
+        if edit.range.end > store.len() {
+            return Err(EditOrder);
+        }
+        if prepared
+            .last()
+            .is_some_and(|last| last.range.end > edit.range.start)
+        {
+            return Err(EditOrder);
+        }
         let text = normalize_newlines(&edit.text).into_owned();
         if !edit.range.is_empty() || !text.is_empty() {
             prepared.push(Edit::new(edit.range, text));
         }
     }
-    prepared
+    Ok(prepared)
 }
 
 /// Replaces the text and returns what undoes it. `edits` refer to the text before the

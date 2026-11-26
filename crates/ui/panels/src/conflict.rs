@@ -14,6 +14,16 @@ use crate::prompt::TextField;
 
 const WIDTH: f32 = 760.;
 
+/// The names of the two Accept buttons. In a rebase Yours is the user's commit that is
+/// replayed and Theirs is the upstream, so the names say so.
+pub(crate) fn accept_labels(rebase: bool) -> (&'static str, &'static str) {
+    if rebase {
+        ("Accept Yours (your commit)", "Accept Theirs (upstream)")
+    } else {
+        ("Accept Yours", "Accept Theirs")
+    }
+}
+
 pub struct ConflictView {
     git: Entity<GitState>,
     workspace: WeakEntity<Workspace>,
@@ -136,6 +146,7 @@ impl ConflictView {
         &self,
         index: usize,
         path: String,
+        labels: (&'static str, &'static str),
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
@@ -171,14 +182,14 @@ impl ConflictView {
             }))
             .child(div().flex_1().min_w_0().overflow_hidden().child(path))
             .child(
-                Self::button(("conflict-yours", index), "Accept Yours", false, theme)
+                Self::button(("conflict-yours", index), labels.0, false, theme)
                     .debug_selector(move || format!("conflict-yours-{index}"))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.accept(yours.clone(), ConflictSide::Yours, cx)
                     })),
             )
             .child(
-                Self::button(("conflict-theirs", index), "Accept Theirs", false, theme)
+                Self::button(("conflict-theirs", index), labels.1, false, theme)
                     .debug_selector(move || format!("conflict-theirs-{index}"))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.accept(theirs.clone(), ConflictSide::Theirs, cx)
@@ -225,10 +236,11 @@ impl Render for ConflictView {
             Operation::Revert => "Revert Conflicts",
             Operation::None => "Conflicts",
         };
+        let labels = accept_labels(operation == Operation::Rebase);
         let rows: Vec<_> = conflicts
             .iter()
             .enumerate()
-            .map(|(index, path)| self.row(index, path.clone(), &theme, cx))
+            .map(|(index, path)| self.row(index, path.clone(), labels, &theme, cx))
             .collect();
         let none = rows.is_empty();
         let message_empty = self.message.text.is_empty();

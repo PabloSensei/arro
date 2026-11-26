@@ -21,6 +21,14 @@ pub(crate) struct Plan {
     pub select: Range<usize>,
 }
 
+/// Whether an edit at `range` breaks the order of one change after `last`: it overlaps
+/// the edit before it, or repeats an insertion at the same place.
+fn repeats_or_overlaps(last: Option<&Range<usize>>, range: &Range<usize>) -> bool {
+    last.is_some_and(|last| {
+        range.start < last.end || (range.start == last.start && range.is_empty() && last.is_empty())
+    })
+}
+
 /// Applies the plans of all carets. A plan that changes nothing still moves its caret.
 pub(crate) fn apply_plans<S: TextStore>(
     buffer: &mut Buffer<S>,
@@ -31,13 +39,20 @@ pub(crate) fn apply_plans<S: TextStore>(
     let mut delta = 0isize;
     let mut carets = Vec::with_capacity(plans.len());
     let mut edits = Vec::with_capacity(plans.len());
+    let mut last: Option<Range<usize>> = None;
     for plan in plans {
         let start = (plan.range.start as isize + delta) as usize;
         carets.push(Selection::new(
             start + plan.select.start,
             start + plan.select.end,
         ));
+        // Two carets in one indentation build the same plan: the first one wins, so the
+        // change keeps its order instead of overlapping itself.
+        if repeats_or_overlaps(last.as_ref(), &plan.range) {
+            continue;
+        }
         delta += plan.text.len() as isize - plan.range.len() as isize;
+        last = Some(plan.range.clone());
         edits.push(Edit::new(plan.range, plan.text));
     }
     let after = SelectionSet::from_vec(carets);
@@ -297,6 +312,7 @@ pub fn toggle_case<S: TextStore>(buffer: &mut Buffer<S>, source: EditSource) -> 
     let mut edits = Vec::new();
     let mut after = Vec::new();
     let mut delta = 0isize;
+    let mut last: Option<Range<usize>> = None;
     for selection in buffer.selections().iter() {
         let range = if selection.is_empty() {
             word_at(&store, selection.head)
@@ -318,10 +334,14 @@ pub fn toggle_case<S: TextStore>(buffer: &mut Buffer<S>, source: EditSource) -> 
         } else {
             after.push(Selection::new(start, start + changed.len()));
         }
-        delta += changed.len() as isize - text.len() as isize;
-        if changed != text {
-            edits.push(Edit::new(range, changed));
+        // Two carets in one word plan the same replacement: it goes in once, and the
+        // carets of both follow it.
+        if changed == text || repeats_or_overlaps(last.as_ref(), &range) {
+            continue;
         }
+        delta += changed.len() as isize - text.len() as isize;
+        last = Some(range.clone());
+        edits.push(Edit::new(range, changed));
     }
     let after = SelectionSet::from_vec(after);
     let change = buffer.apply(edits, Some(after.clone()), source, EditKind::Command);
@@ -513,8 +533,11 @@ pub fn apply_statement_plans<S: TextStore>(
 ) -> Change {
     let mut ordered = plans;
     ordered.sort_by_key(|plan| plan.range.start);
-    // Two carets on one line finish the same statement: the first plan covers both.
-    ordered.dedup_by(|later, earlier| later.range.start < earlier.range.end);
+    // Two carets on one line finish the same statement: the first plan covers both. An
+    // empty range is no wider than its start, so equal starts count as the same place.
+    ordered.dedup_by(|later, earlier| {
+        later.range.start < earlier.range.end || later.range.start == earlier.range.start
+    });
     let plans = ordered
         .into_iter()
         .map(|plan| Plan {

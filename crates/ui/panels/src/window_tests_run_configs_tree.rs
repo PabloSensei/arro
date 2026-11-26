@@ -150,16 +150,15 @@ fn the_tree_groups_configurations_by_their_kind(cx: &mut TestAppContext) {
 
     assert!(on_screen(cx, window, "run-config-group-application"));
     assert!(on_screen(cx, window, "run-config-group-tests"));
-    assert!(
-        on_screen(cx, window, "run-config-group-count-application-2"),
-        "the Application node shows its two configurations"
-    );
-    assert!(on_screen(cx, window, "run-config-group-count-tests-1"));
     assert!(on_screen(cx, window, "run-config-item-0"));
     assert!(on_screen(cx, window, "run-config-item-2"));
     assert!(
-        on_screen(cx, window, "run-config-edit-templates"),
-        "the templates row is the last node of the tree"
+        !on_screen(cx, window, "run-config-group-count-application-2"),
+        "a group shows no count of its configurations"
+    );
+    assert!(
+        !on_screen(cx, window, "run-config-edit-templates"),
+        "there are no templates to edit, so the tree has no link"
     );
 }
 
@@ -183,7 +182,7 @@ fn the_add_menu_searches_the_kinds_and_creates_in_their_group(cx: &mut TestAppCo
     crate::window_tests::click(cx, window, "run-config-template-tests");
     draw(cx, window);
     assert!(
-        on_screen(cx, window, "run-config-group-count-tests-2"),
+        on_screen(cx, window, "run-config-group-tests"),
         "the new configuration is in the Tests group"
     );
 
@@ -209,23 +208,13 @@ fn ctrl_d_copies_and_delete_removes(cx: &mut TestAppContext) {
         on_screen(cx, window, "run-config-item-3"),
         "Ctrl+D adds a configuration"
     );
-    assert!(on_screen(
-        cx,
-        window,
-        "run-config-group-count-application-3"
-    ));
-
     press(cx, window, "delete");
     draw(cx, window);
     assert!(
         !on_screen(cx, window, "run-config-item-3"),
         "Delete removes the selected configuration"
     );
-    assert!(on_screen(
-        cx,
-        window,
-        "run-config-group-count-application-2"
-    ));
+    assert!(on_screen(cx, window, "run-config-group-application"));
 }
 
 #[ui_kit::gpui::test]

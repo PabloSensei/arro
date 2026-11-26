@@ -11,6 +11,7 @@ mod console;
 #[cfg(unix)]
 #[path = "console_unix.rs"]
 mod console;
+mod dialect;
 mod engine;
 mod env;
 mod keys;
@@ -26,6 +27,7 @@ mod shells;
 
 pub use conpty::{Backend, command_line};
 pub use console::{attach_console, console_size};
+pub use dialect::{Dialect, QuoteError, shell_line};
 pub use env::{TERM_VARS, allowlisted, inherited};
 pub use keys::{Key, KeyEvent, Mods, ShiftEnter, encode};
 pub use screen::{Cell, CellColor, CellFlags, Link, Modes, Screen, SearchMatch, SearchResults};

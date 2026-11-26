@@ -39,14 +39,6 @@ ignore = true
 # crate deep inside GPUI or rmcp stopped a release (chrono, 2026-11-17) though nothing could
 # be done about it that day. Vulnerabilities still fail for every crate.
 unmaintained = "workspace"
-# Crates GPUI pulls in that nobody maintains now. No known vulnerability in any of them.
-ignore = [
-    { id = "RUSTSEC-2024-0384", reason = "instant, through GPUI" },
-    { id = "RUSTSEC-2024-0436", reason = "paste, through GPUI" },
-    { id = "RUSTSEC-2026-0192", reason = "ttf-parser, through GPUI" },
-    { id = "RUSTSEC-2026-0206", reason = "rustybuzz, through GPUI" },
-    { id = "RUSTSEC-2026-0543", reason = "chrono, through gpui-base and rmcp; not used directly" },
-]
 
 [bans]
 multiple-versions = "allow"

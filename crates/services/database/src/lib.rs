@@ -26,8 +26,8 @@ pub use console::{
     Parameter, asked_parameters, bind_parameters, parameters, split_statements, statement_at,
 };
 pub use data::{
-    Cell, DataModel, DataRow, Dialect, PageQuery, Plan, RowKind, Statement, TableRef, csv,
-    insert_literal, tsv,
+    Cell, DataModel, DataRow, Dialect, NO_KEY, PageQuery, Plan, RowKind, Statement, TableRef, csv,
+    identifying_columns, insert_literal, tsv,
 };
 pub use explain::{ExplainNode, ExplainPlan, explain_statement, plan_of};
 pub use export::{ExportFormat, Exporter};
@@ -38,8 +38,8 @@ pub use schema::{Column, ColumnKind, ForeignKey, Index, ResultSet, Schema, Table
 pub use session::{Launch, Session, explain_output};
 pub use sources::{
     DownloadProgress, Driver, DriverKind, DriverPackage, Secret, Source, SourceId, SourceStore,
-    Suggestion, Support, VendorTemplate, console_path, ensure_console, source_of_console,
-    state_folder,
+    Suggestion, Support, VendorTemplate, console_path, ensure_console, points_elsewhere,
+    running_parameter, source_of_console, split_password, state_folder,
 };
 
 /// How many rows one message carries before the console asks for the next one.

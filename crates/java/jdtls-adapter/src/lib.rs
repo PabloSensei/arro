@@ -1141,6 +1141,9 @@ impl ServerSpec for Jdtls {
     }
 
     fn starting(&self) {
+        // A new process imports the project again, so an import that ran while the old
+        // one stopped must not leave the status bar at `importing`.
+        self.imports.reset();
         let now = SystemTime::now();
         *self
             .started
@@ -1316,6 +1319,11 @@ impl ServerSpec for Jdtls {
 
     fn request(&self, method: &str, params: Value) -> Result<Value, ResponseError> {
         match method {
+            // The consumer of the sidecar redraws the labels and hints. A null answer
+            // would stop the request here, so the method is passed on.
+            "workspace/codeLens/refresh" | "workspace/inlayHint/refresh" => {
+                Err(ResponseError::method_not_found(method))
+            }
             "workspace/configuration" => {
                 let items = params.get("items").and_then(Value::as_array);
                 let values = items.into_iter().flatten().map(|item| {

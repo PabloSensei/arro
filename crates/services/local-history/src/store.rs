@@ -109,6 +109,13 @@ impl Log {
     }
 }
 
+/// What `BlobStore::put` left on disk: the id, and the bytes it wrote, zero when the blob was
+/// there already.
+pub(crate) struct Stored {
+    pub id: String,
+    pub written: u64,
+}
+
 pub(crate) struct BlobStore {
     dir: PathBuf,
 }
@@ -125,17 +132,20 @@ impl BlobStore {
 
     /// Stores `bytes` once and returns their id. The length is part of the id, so two
     /// contents share an id only when the hash and the length match.
-    pub fn put(&self, bytes: &[u8]) -> io::Result<String> {
+    pub fn put(&self, bytes: &[u8]) -> io::Result<Stored> {
         let id = format!("{:032x}-{}", xxh3_128(bytes), bytes.len());
         let path = self.path_of(&id);
-        if !path.exists() {
-            let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
-            encoder.write_all(bytes)?;
-            let next = path.with_extension("next");
-            fs::write(&next, encoder.finish()?)?;
-            fs::rename(&next, &path)?;
+        if path.exists() {
+            return Ok(Stored { id, written: 0 });
         }
-        Ok(id)
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes)?;
+        let compressed = encoder.finish()?;
+        let written = compressed.len() as u64;
+        let next = path.with_extension("next");
+        fs::write(&next, compressed)?;
+        fs::rename(&next, &path)?;
+        Ok(Stored { id, written })
     }
 
     pub fn get(&self, id: &str) -> io::Result<Vec<u8>> {

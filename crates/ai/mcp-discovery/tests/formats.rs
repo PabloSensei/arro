@@ -58,7 +58,7 @@ fn vscode_writes_the_server_under_servers() {
 }
 
 #[test]
-fn vscode_keeps_the_http_kind_of_a_streamed_server() {
+fn a_project_file_never_carries_the_token_of_a_streamed_server() {
     let home = home("formats-vscode-http");
     let project = home.path().join("shop");
     fs::create_dir_all(&project).unwrap();
@@ -74,12 +74,62 @@ fn vscode_keeps_the_http_kind_of_a_streamed_server() {
     )
     .expect("write");
 
+    let text = fs::read_to_string(&file).unwrap();
+    let root = root_of(&text);
+    assert_eq!(root["servers"]["arro"]["type"], "stdio", "{text}");
+    assert_eq!(root["servers"]["arro"]["command"], "ide-mcp.exe", "{text}");
+    assert!(root["servers"]["arro"].get("headers").is_none(), "{text}");
+    assert!(root["servers"]["arro"].get("url").is_none(), "{text}");
+    assert!(!text.contains("secret"), "the token stays out: {text}");
+}
+
+#[test]
+fn a_user_file_keeps_the_address_and_the_token_of_a_streamed_server() {
+    let home = home("formats-vscode-user-http");
+    let project = home.path().join("shop");
+    fs::create_dir_all(&project).unwrap();
+    let file = Client::VsCode.user_config(home.path());
+
+    clients::configure(
+        Client::VsCode,
+        Scope::User,
+        Transport::HttpStream,
+        &http_server(),
+        home.path(),
+        &project,
+    )
+    .expect("write");
+
     let root = root_of(&fs::read_to_string(&file).unwrap());
     assert_eq!(root["servers"]["arro"]["type"], "http");
     assert_eq!(root["servers"]["arro"]["url"], "http://127.0.0.1:4321/mcp");
     assert_eq!(
         root["servers"]["arro"]["headers"]["Authorization"],
         "Bearer secret"
+    );
+}
+
+#[test]
+fn only_a_project_file_changes_a_streamed_or_sse_transport_to_stdio() {
+    assert_eq!(
+        clients::file_transport(Scope::Project, Transport::HttpStream),
+        Transport::Stdio
+    );
+    assert_eq!(
+        clients::file_transport(Scope::Project, Transport::Sse),
+        Transport::Stdio
+    );
+    assert_eq!(
+        clients::file_transport(Scope::Project, Transport::Stdio),
+        Transport::Stdio
+    );
+    assert_eq!(
+        clients::file_transport(Scope::User, Transport::HttpStream),
+        Transport::HttpStream
+    );
+    assert_eq!(
+        clients::file_transport(Scope::User, Transport::Sse),
+        Transport::Sse
     );
 }
 

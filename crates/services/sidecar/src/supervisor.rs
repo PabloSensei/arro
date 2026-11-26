@@ -187,9 +187,19 @@ impl ServerEvents for Bridge {
     }
 
     fn request(&self, method: &str, params: Value) -> Result<Value, ResponseError> {
-        self.spec.request(method, params)
+        match self.spec.request(method, params.clone()) {
+            // The spec does not know the method, but the consumer may: the server asks
+            // for code lens and inlay hint refreshes there.
+            Err(error) if error.code == ResponseError::METHOD_NOT_FOUND => {
+                self.consumer.request(method, params)
+            }
+            other => other,
+        }
     }
 }
+
+/// How long a dropped sidecar waits for `shutdown` and `exit` before it kills the server.
+const CLOSE_SHUTDOWN: Duration = Duration::from_secs(2);
 
 /// Handle to the supervising task. Dropping it ends the server.
 pub struct Sidecar {
@@ -198,6 +208,8 @@ pub struct Sidecar {
     restart: mpsc::Sender<()>,
     reload: mpsc::Sender<()>,
     task: JoinHandle<()>,
+    runtime: tokio::runtime::Handle,
+    limits: Limits,
 }
 
 impl Sidecar {
@@ -243,13 +255,14 @@ impl Sidecar {
             spec,
             launcher,
             consumer,
-            limits,
+            limits: limits.clone(),
             status: sender,
             stops,
             restarts,
             reloads,
             memory,
         };
+        let runtime = tokio::runtime::Handle::current();
         let task = tokio::spawn(supervisor.run());
         Ok(Self {
             status,
@@ -257,6 +270,8 @@ impl Sidecar {
             restart,
             reload,
             task,
+            runtime,
+            limits,
         })
     }
 
@@ -267,6 +282,20 @@ impl Sidecar {
             return false;
         }
         match self.restart.try_send(()) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(())) => true,
+            Err(mpsc::error::TrySendError::Closed(())) => false,
+        }
+    }
+
+    /// Asks the server to stop without waiting for it, for an owner that cannot give the
+    /// sidecar up. The supervising task ends when the server is gone. False when the
+    /// sidecar does not run.
+    pub fn request_stop(&self) -> bool {
+        if matches!(self.status.borrow().state, State::Stopped) {
+            return false;
+        }
+        match self.stop.try_send(()) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(())) => true,
             Err(mpsc::error::TrySendError::Closed(())) => false,
@@ -306,7 +335,24 @@ impl Sidecar {
 
 impl Drop for Sidecar {
     fn drop(&mut self) {
-        // Drops the process handle, which ends the server.
+        // A window that closes gives the server a moment to run `shutdown` and `exit`
+        // before the process is dropped and killed. The wait runs on a task of the
+        // runtime the sidecar was started on, so no executor of the caller is needed.
+        let running = !matches!(self.status.borrow().state, State::Stopped);
+        if running {
+            let _ = self.stop.try_send(());
+            let mut status = self.status.clone();
+            let (done, finished) = std::sync::mpsc::channel();
+            self.runtime.spawn(async move {
+                let _ = status
+                    .wait_for(|status| status.state == State::Stopped)
+                    .await;
+                let _ = done.send(());
+            });
+            let limit = self.limits.shutdown.min(CLOSE_SHUTDOWN);
+            let _ = finished.recv_timeout(limit);
+        }
+        // Drops the process handle, which ends the server if it is still there.
         self.task.abort();
     }
 }
@@ -671,6 +717,14 @@ impl Supervisor {
         if *self.memory.borrow_and_update() {
             eprintln!("sidecar: memory is low at start, the server starts anyway");
         }
+        // The connection of the previous life is closed by now. Forgetting it before
+        // the generation grows keeps a consumer from replaying its documents into it
+        // and marking them synced, which the new server would then never receive.
+        self.status.send_modify(|status| {
+            status.alive = false;
+            status.client = None;
+            status.process_id = None;
+        });
         let generation = self.status.borrow().generation + 1;
         self.status.send_modify(|status| {
             status.generation = generation;
@@ -762,8 +816,13 @@ impl Supervisor {
     }
 
     async fn shut_down(&self, mut running: Running) {
-        self.status
-            .send_modify(|status| status.state = State::Stopping);
+        // The life ends here: late messages of this generation must not move the state.
+        self.status.send_modify(|status| {
+            status.alive = false;
+            status.client = None;
+            status.process_id = None;
+            status.state = State::Stopping;
+        });
         let limit = self.limits.shutdown;
         let polite = async {
             let _ = running.client.shutdown().await;

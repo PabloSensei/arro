@@ -29,6 +29,7 @@ fn connection(name: &str, url: &str) -> DatabaseConnection {
         dbms: "PostgreSQL".to_string(),
         driver: Some("org.postgresql.Driver".to_string()),
         url: url.to_string(),
+        notice: None,
     }
 }
 
@@ -104,6 +105,7 @@ impl ToolBackend for Fake {
                     dbms: dbms.clone(),
                     driver: None,
                     url: url.clone(),
+                    notice: None,
                 },
                 None,
             )),
@@ -116,6 +118,7 @@ impl ToolBackend for Fake {
                     dbms: "PostgreSQL".to_string(),
                     driver: None,
                     url: url.clone(),
+                    notice: None,
                 },
                 None,
             )),

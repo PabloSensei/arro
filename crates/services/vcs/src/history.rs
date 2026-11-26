@@ -34,7 +34,16 @@ impl Repository {
     /// path the file had then.
     pub fn line_history(&self, path: &str, start: u32, end: u32) -> io::Result<Vec<LineHistory>> {
         let range = format!("{start},{end}:{path}");
-        let output = self.run(["log", "-L", &range, HISTORY_FORMAT])?;
+        // The patch is made by Arro, not by the user: a text conversion or an external
+        // diff of `.git/config` is a program of the project and stays off.
+        let output = self.run([
+            "log",
+            "-L",
+            &range,
+            "--no-ext-diff",
+            "--no-textconv",
+            HISTORY_FORMAT,
+        ])?;
         Ok(parse_line_history(&output))
     }
 }

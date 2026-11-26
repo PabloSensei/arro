@@ -749,6 +749,12 @@ impl JavaProject {
         self.sidecar.restart()
     }
 
+    /// Stops the server without waiting for it, for a project whose trust was revoked.
+    /// False when it does not run.
+    pub fn request_stop(&self) -> bool {
+        self.sidecar.request_stop()
+    }
+
     /// The most heap the server takes from its next start on. A running server keeps the
     /// heap it started with.
     pub(crate) fn set_max_heap_mb(&self, megabytes: Option<u32>) {

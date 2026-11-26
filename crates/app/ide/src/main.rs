@@ -15,6 +15,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,8 +23,8 @@ use std::time::{Duration, Instant};
 use editor_view::Languages;
 use java_lang::{BuildTools, JavaSession, Missing, Toolchain, Trust};
 use lang_api::LanguageSupport;
-use panels::LanguageServer;
 use panels::{Creates, FileTemplate, ProjectSetup, ProjectTemplate, TemplatesSetup};
+use panels::{LanguageServer, LanguageStart, ProjectTrust, ServerTrust};
 use syntax::LanguageConfig;
 use workspace::{AppInfo, FileIcons, Launch, OpenRequests, Request, Settings};
 
@@ -284,10 +285,42 @@ fn launch(mut args: Args) -> Result<(Launch, ProjectSetup, Args), String> {
     Ok((launch, project, args))
 }
 
-/// One place to ask whether a project may run its build tools and servers. Until the
-/// shared trust of the harnesses arrives, a project opened from the command line is.
-fn trust_of(_root: &Path) -> Trust {
-    Trust::Trusted
+/// One place to ask whether a project may run its build tools and servers. The answer is
+/// the shared list of the state folder: a project is trusted when it or a folder above it
+/// is on the list. A project that is not asks in the window before anything runs.
+fn trust_of(state_dir: &Path, root: &Path) -> Trust {
+    if store::TrustList::new(state_dir).is_trusted(root) {
+        Trust::Trusted
+    } else {
+        Trust::Untrusted
+    }
+}
+
+/// The key of the one-time move of the recent projects into the trust list.
+const RECENT_TRUST_KEY: &str = "trust.recent_projects";
+
+/// Trusts the projects of Recent Projects once, for the users who worked with them before
+/// the trust list existed: their own projects must not ask on the first start of a version
+/// that asks. The marker in the state file keeps the move to one start.
+fn migrate_recent_projects(state_dir: &Path) {
+    let Ok(store) = store::Store::open(&state_dir.join(workspace::STATE_DATABASE)) else {
+        return;
+    };
+    if matches!(store.get(RECENT_TRUST_KEY), Ok(Some(_))) {
+        return;
+    }
+    let list = store::TrustList::new(state_dir);
+    for project in workspace::load_recent(&store) {
+        if let Err(error) = list.trust(&project) {
+            eprintln!(
+                "the recent project {} stays untrusted: {error}",
+                project.display()
+            );
+        }
+    }
+    if let Err(error) = store.put(RECENT_TRUST_KEY, "1") {
+        eprintln!("the move of the recent projects is not remembered: {error}");
+    }
 }
 
 /// Looks for the JDK of jdtls, jdtls and java-debug on its own thread while the
@@ -304,6 +337,16 @@ fn find_toolchain() -> thread::JoinHandle<Result<Toolchain, Missing>> {
         .expect("the java-setup thread starts")
 }
 
+/// What the application starts for the window: the session while it lives, the server the
+/// window talks to, the hint of a missing tool, and the starter Safe Mode keeps for the
+/// moment the user trusts the project.
+type LanguageStartup = (
+    Option<JavaSession>,
+    LanguageServer,
+    Option<panels::LanguageSetup>,
+    Option<Rc<dyn panels::LanguageStart>>,
+);
+
 /// Starts jdtls in the background. The session must live as long as the window.
 /// `toolchain` is what `find_toolchain` found; when it is missing, the status line
 /// names the tool and explains where it goes.
@@ -312,16 +355,32 @@ fn language_server(
     toolchain: Result<Toolchain, Missing>,
     build_tools: &BuildTools,
     max_heap_mb: Option<u32>,
-) -> (
-    Option<JavaSession>,
-    LanguageServer,
-    Option<panels::LanguageSetup>,
-) {
+    trust: Trust,
+) -> LanguageStartup {
     let (sender, status) = futures_channel::mpsc::unbounded();
     let none = |status| LanguageServer {
         support: None,
         status,
     };
+    if trust == Trust::Untrusted {
+        // The project opens in Safe Mode: files can be read, but nothing of the project
+        // runs. The window shows it in the status bar and asks the same starter again
+        // once the user trusts the project.
+        if let Ok(toolchain) = &toolchain {
+            let config =
+                java_lang::config_of_with(toolchain, &launch.root, &launch.state_dir, build_tools);
+            // The language refuses an untrusted project before it starts anything.
+            let _ = JavaSession::open(config, trust);
+        }
+        let starter = Rc::new(JavaSetupCheck {
+            root: launch.root.clone(),
+            state_dir: launch.state_dir.clone(),
+            build_tools: build_tools.clone(),
+            max_heap_mb,
+            session: Arc::new(Mutex::new(None)),
+        });
+        return (None, none(status), None, Some(starter));
+    }
     let toolchain = match toolchain {
         Ok(toolchain) => toolchain,
         Err(missing) => {
@@ -344,13 +403,13 @@ fn language_server(
                     session: Arc::new(Mutex::new(None)),
                 })),
             };
-            return (None, none(status), Some(setup));
+            return (None, none(status), Some(setup), None);
         }
     };
     let mut config =
         java_lang::config_of_with(&toolchain, &launch.root, &launch.state_dir, build_tools);
     config.max_heap_mb = max_heap_mb;
-    match JavaSession::open(config, trust_of(&launch.root)) {
+    match JavaSession::open(config, trust) {
         Ok(session) => {
             session.watch_status(move |text| {
                 sender.unbounded_send(text).ok();
@@ -360,13 +419,13 @@ fn language_server(
                 support: Some(support),
                 status,
             };
-            (Some(session), server, None)
+            (Some(session), server, None, None)
         }
         Err(error) => {
             sender
                 .unbounded_send(java_lang::open_error_text(&error))
                 .ok();
-            (None, none(status), None)
+            (None, none(status), None, None)
         }
     }
 }
@@ -386,6 +445,20 @@ impl panels::SetupCheck for JavaSetupCheck {
         &self,
         started: futures_channel::mpsc::UnboundedSender<Option<panels::StartedServer>>,
     ) {
+        self.start(ServerTrust::Trusted, started);
+    }
+}
+
+impl LanguageStart for JavaSetupCheck {
+    fn start(
+        &self,
+        trust: ServerTrust,
+        started: futures_channel::mpsc::UnboundedSender<Option<panels::StartedServer>>,
+    ) {
+        if trust == ServerTrust::Untrusted {
+            let _ = started.unbounded_send(None);
+            return;
+        }
         let root = self.root.clone();
         let state_dir = self.state_dir.clone();
         let build_tools = self.build_tools.clone();
@@ -615,6 +688,7 @@ fn main() -> ExitCode {
         .ok()
         .and_then(|args| args.state_dir.clone())
         .unwrap_or_else(state_folder);
+    migrate_recent_projects(&state_dir);
     let logs = state_dir.join("logs");
     panic_log::install(logs.clone());
     let _ = platform::install_crash_handler(
@@ -674,11 +748,14 @@ fn main() -> ExitCode {
                 resolve: language_for,
                 templates: java_lang::templates_for,
             };
-            let (session, server, setup) = language_server(
+            let trust = trust_of(&launch.state_dir, &launch.root);
+            let trusted = trust == Trust::Trusted;
+            let (session, server, setup, starter) = language_server(
                 &launch,
                 toolchain,
                 &settings.build_tools,
                 settings.language_max_heap(),
+                trust,
             );
             let mut project = project;
             if let Some(session) = &session {
@@ -737,6 +814,10 @@ fn main() -> ExitCode {
                 project,
                 Some(server),
                 setup,
+                ProjectTrust {
+                    trusted,
+                    start: starter,
+                },
                 cache,
                 templates,
                 code_style_language,
@@ -783,6 +864,38 @@ mod tests {
         assert!(args.take_over);
         assert!(!args.new_instance);
         assert_eq!(args.path, Some(PathBuf::from("project")));
+    }
+
+    #[test]
+    fn recent_projects_move_into_the_trust_list_once() {
+        let folder = test_support::TempDir::new("recent-trust");
+        let state = folder.path();
+        let project = state.join("shop");
+        std::fs::create_dir_all(&project).unwrap();
+        let database = state.join(workspace::STATE_DATABASE);
+        {
+            let store = store::Store::open(&database).unwrap();
+            workspace::remember_project(&store, &project).unwrap();
+        }
+
+        migrate_recent_projects(state);
+        let list = store::TrustList::new(state);
+        assert!(list.is_trusted(&project), "a recent project is trusted");
+
+        // The user forgets the trust, and a second start has another recent project: the
+        // move must not run again and trust neither of them.
+        list.untrust(&project).unwrap();
+        let other = state.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        {
+            let store = store::Store::open(&database).unwrap();
+            workspace::remember_project(&store, &other).unwrap();
+        }
+
+        migrate_recent_projects(state);
+
+        assert!(!list.is_trusted(&project), "the move runs only once");
+        assert!(!list.is_trusted(&other));
     }
 
     #[test]

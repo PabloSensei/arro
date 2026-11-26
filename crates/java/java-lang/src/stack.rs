@@ -6,7 +6,6 @@ use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -19,6 +18,7 @@ use lang_api::{
 };
 use lsp_client::lsp_types::{OneOf, Uri, WorkspaceSymbolResponse};
 use platform::CanonPath;
+use proc_sup::ProcessSpec;
 use project_model::ProjectModel;
 use semantic_router::{RouteError, Router};
 use tokio::runtime::Handle;
@@ -594,16 +594,17 @@ pub fn jcmd_thread_dump(home: &Path, pid: u32) -> Result<String, String> {
             jcmd.display()
         ));
     }
-    let mut child = Command::new(&jcmd)
+    // Through the process supervisor: no console window, and the tool ends with the IDE.
+    let spec = ProcessSpec::new(&jcmd)
         .arg(pid.to_string())
-        .arg("Thread.print")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .arg("Thread.print");
+    let mut child = spec
+        .start()
         .map_err(|error| format!("Cannot run {}: {error}", jcmd.display()))?;
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
+    // The tool reads nothing from the console: its standard input closes at once.
+    drop(child.take_stdin());
+    let mut stdout = child.take_stdout();
+    let mut stderr = child.take_stderr();
     let out = std::thread::spawn(move || {
         let mut text = Vec::new();
         if let Some(stream) = stdout.as_mut() {
@@ -626,8 +627,7 @@ pub fn jcmd_thread_dump(home: &Path, pid: u32) -> Result<String, String> {
                 std::thread::sleep(Duration::from_millis(20));
             }
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                let _ = child.stop();
                 return Err(format!(
                     "jcmd did not answer in {} s",
                     JCMD_TIMEOUT.as_secs()
@@ -849,6 +849,7 @@ impl Provider<lang_api::DumpQuery, DumpAnswer> for StackService {
 
 #[cfg(test)]
 mod tests {
+    use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;

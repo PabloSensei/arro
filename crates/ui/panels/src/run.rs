@@ -202,11 +202,25 @@ pub struct RunPanel {
     session: Option<ProjectSession>,
     sync: Option<workspace_core::Subscription<SyncEvent>>,
     loading: bool,
+    /// The project may run its build tool and its configurations. A project that opens in
+    /// Safe Mode keeps its tool and starts it once the user trusts the project.
+    trusted: bool,
+    /// The stored configurations of a project and the state of the window, also for what
+    /// the import of another IDE remembers.
+    store: Option<Arc<store::Store>>,
     configs: Vec<RunConfig>,
     /// Configurations from `.arro/run.toml`, in the file order.
     saved: Vec<RunConfig>,
     /// Configurations the providers found in the project.
     discovered: Vec<RunConfig>,
+    /// The found configurations the list shows by itself, such as an application of a
+    /// framework that starts a server. They are marked as temporary: the project has no
+    /// configuration of that class yet.
+    suggested: Vec<RunConfig>,
+    /// The configurations of another IDE found in the project, as the last discovery read
+    /// them, and the names of the ones the offer already named.
+    foreign: Vec<runner::ForeignConfigs>,
+    foreign_offered: Option<String>,
     /// Temporary configurations: started from a place or the keyboard and not written to
     /// the file. The oldest goes first.
     temporary: Vec<RunConfig>,
@@ -570,7 +584,9 @@ impl RunPanel {
         root: PathBuf,
         setup: ProjectSetup,
         state_dir: PathBuf,
+        store: Option<Arc<store::Store>>,
         workspace: WeakEntity<Workspace>,
+        trusted: bool,
         cx: &mut App,
     ) -> Entity<Self> {
         cx.new(|cx| {
@@ -580,11 +596,11 @@ impl RunPanel {
                 .as_ref()
                 .map_or_else(BuildSelection::default, |tool| tool.selection(&root));
             let (session, sync) = match setup.tool.clone() {
-                Some(tool) => {
+                Some(tool) if trusted => {
                     let (session, sync) = open_project(tool, root, &setup.cache_root);
                     (Some(session), Some(sync))
                 }
-                None => (None, None),
+                _ => (None, None),
             };
             // The build tool window makes run configurations of its tasks on demand. The
             // provider writes none of them into the list by itself.
@@ -644,9 +660,14 @@ impl RunPanel {
                 loading: session.is_some(),
                 session,
                 sync,
+                trusted,
+                store,
                 configs: Vec::new(),
                 saved: Vec::new(),
                 discovered: Vec::new(),
+                suggested: Vec::new(),
+                foreign: Vec::new(),
+                foreign_offered: None,
                 temporary: Vec::new(),
                 store_broken: None,
                 selected: None,
@@ -904,8 +925,56 @@ impl RunPanel {
         }
     }
 
+    /// A configuration of the list that is not in the file: a temporary one, or a found
+    /// application the list offers until the project has its own configuration of it.
     fn is_temporary(&self, name: &str) -> bool {
         self.temporary.iter().any(|config| config.name == name)
+            || self.suggested.iter().any(|config| config.name == name)
+    }
+
+    /// Whether `config` is one of the found applications the list offers. An unchanged
+    /// one stays a finding when the dialog hands the list back, instead of becoming
+    /// temporary; an edited one is a configuration of the user now.
+    fn is_suggested(&self, config: &RunConfig) -> bool {
+        self.suggested
+            .iter()
+            .any(|suggested| suggested.name == config.name && suggested == config)
+    }
+
+    /// The found configurations the list shows by itself, from their providers.
+    fn suggestions(&self) -> Vec<RunConfig> {
+        let mut suggested = Vec::new();
+        for provider in &self.providers {
+            for config in provider.suggestions(&self.saved, &self.discovered) {
+                if !suggested
+                    .iter()
+                    .any(|known: &RunConfig| known.name == config.name)
+                {
+                    suggested.push(config);
+                }
+            }
+        }
+        suggested
+    }
+
+    /// The fully qualified entry classes the providers found in the project, for the
+    /// entry point choice of the configurations dialog. A class found twice is listed once.
+    pub fn discovered_main_classes(&self) -> Vec<String> {
+        let mut classes: Vec<String> = self
+            .discovered
+            .iter()
+            .filter_map(|config| {
+                self.providers
+                    .iter()
+                    .find(|provider| provider.id() == config.provider)
+                    .and_then(|provider| provider.main_class(config))
+            })
+            .map(|class| class.trim().to_owned())
+            .filter(|class| !class.is_empty())
+            .collect();
+        classes.sort();
+        classes.dedup();
+        classes
     }
 
     /// The name of the build tool, for the title of its tool window.
@@ -949,9 +1018,58 @@ impl RunPanel {
         self.loading
     }
 
+    /// Whether the project may run its build tool and its configurations.
+    pub fn trusted(&self) -> bool {
+        self.trusted
+    }
+
+    /// The user trusted the project: the build tool that Safe Mode held back starts now,
+    /// without a restart of the window.
+    pub fn trust_project(&mut self, cx: &mut Context<Self>) {
+        self.trusted = true;
+        if self.session.is_none()
+            && let Some(tool) = self.tool.clone()
+        {
+            let (session, sync) = open_project(tool, self.root.clone(), &self.cache_root);
+            self.session = Some(session);
+            self.sync = Some(sync);
+            self.loading = true;
+        }
+        self.changed(cx);
+    }
+
+    /// The user forgot the trust of the project: the model stops and no build or
+    /// configuration runs until the project is trusted again.
+    pub fn forget_trust(&mut self, cx: &mut Context<Self>) {
+        self.trusted = false;
+        self.stop(cx);
+        self.stop_build(cx);
+        self.session = None;
+        self.sync = None;
+        self.loading = false;
+        self.changed(cx);
+    }
+
+    /// False when the project is in Safe Mode: nothing of the project may run, and the
+    /// status bar and the Build window say how to trust it.
+    fn may_run_project_code(&self, what: &str, cx: &mut Context<Self>) -> bool {
+        if self.trusted {
+            return true;
+        }
+        self.tell_warning(
+            "Safe Mode",
+            format!("{what} is off while the project is not trusted. Trust the project first."),
+            cx,
+        );
+        false
+    }
+
     /// Reads the model again and publishes it when the tool answers, the way a change of
     /// a build file does. An old model stays readable meanwhile.
     pub fn reload_project(&mut self, cx: &mut Context<Self>) {
+        if !self.may_run_project_code("Reading the project", cx) {
+            return;
+        }
         let Some(tool) = self.tool.clone() else {
             self.tell_warning("Reload", "The project has no build tool", cx);
             return;
@@ -967,7 +1085,7 @@ impl RunPanel {
     /// changed: the project model may name other modules now. A batch of changes, as a
     /// branch switch makes, settles into one import after [`MODEL_RELOAD_DELAY`].
     pub fn model_file_changed(&mut self, cx: &mut Context<Self>) {
-        if self.tool.is_none() {
+        if self.tool.is_none() || !self.trusted {
             return;
         }
         self.model_reload = self.model_reload.wrapping_add(1);
@@ -1021,9 +1139,17 @@ impl RunPanel {
         self.live.clone()
     }
 
-    /// Every configuration the window lists, stored or discovered.
-    pub(crate) fn configurations(&self) -> &[RunConfig] {
-        &self.configs
+    /// Every configuration the Services window lists: the stored ones, every found one
+    /// with its service group, and the temporary ones, whatever the run list itself
+    /// shows. A found plain program keeps its group there.
+    pub(crate) fn service_configurations(&self) -> Vec<RunConfig> {
+        let mut configs = self.saved.clone();
+        for config in self.discovered.iter().chain(self.temporary.iter()) {
+            if !configs.iter().any(|known| known.name == config.name) {
+                configs.push(config.clone());
+            }
+        }
+        configs
     }
 
     /// The configuration whose console is in the window, and the state of its run, for
@@ -1203,11 +1329,22 @@ impl RunPanel {
     }
 
     pub fn select_named(&mut self, name: &str, cx: &mut Context<Self>) -> bool {
-        let found = self.configs.iter().position(|config| config.name == name);
-        if let Some(index) = found {
-            self.select(index, cx);
+        if let Some(found) = self.configs.iter().position(|config| config.name == name) {
+            self.select(found, cx);
+            return true;
         }
-        found.is_some()
+        // A configuration that only the Services window lists, such as a found program,
+        // becomes a temporary one of the list when a tool asks to run it.
+        let Some(config) = self
+            .discovered
+            .iter()
+            .find(|config| config.name == name)
+            .cloned()
+        else {
+            return false;
+        };
+        self.choose_configuration(config, cx);
+        true
     }
 
     /// Every configuration the dialog edits, with whether it lives in the file already
@@ -1220,6 +1357,12 @@ impl RunPanel {
                 (config.clone(), stored, self.is_temporary(&config.name))
             })
             .collect()
+    }
+
+    /// Every configuration the providers found, the plain programs included. The dialog
+    /// offers their entry points for the main class of a configuration.
+    pub(crate) fn discovered_configurations(&self) -> Vec<RunConfig> {
+        self.discovered.clone()
     }
 
     pub(crate) fn selected_configuration(&self) -> Option<usize> {
@@ -1309,21 +1452,30 @@ impl RunPanel {
         if changed && let Some(error) = &self.store_broken {
             return Err(format!("The configurations are not saved: {error}"));
         }
-        self.saved = items
+        let saved: Vec<RunConfig> = items
             .iter()
             .filter(|(_, stored, temporary)| *stored && !*temporary)
             .map(|(config, _, _)| config.clone())
             .collect();
-        self.discovered = items
+        // An unchanged found application stays a finding: the dialog did not make it a
+        // configuration of the project.
+        let temporary: Vec<RunConfig> = items
             .iter()
-            .filter(|(_, stored, temporary)| !*stored && !*temporary)
+            .filter(|(config, _, temporary)| *temporary && !self.is_suggested(config))
             .map(|(config, _, _)| config.clone())
             .collect();
-        self.temporary = items
+        let discovered: Vec<RunConfig> = items
             .iter()
-            .filter(|(_, _, temporary)| *temporary)
+            .filter(|(config, stored, temporary)| {
+                !*stored && (!*temporary || self.is_suggested(config))
+            })
             .map(|(config, _, _)| config.clone())
             .collect();
+        self.saved = saved;
+        self.temporary = temporary;
+        self.discovered = discovered;
+        self.suggested
+            .retain(|config| !self.saved.iter().any(|saved| saved.name == config.name));
         self.configs = items.into_iter().map(|(config, _, _)| config).collect();
         self.selected = selected
             .filter(|index| *index < self.configs.len())
@@ -1555,21 +1707,283 @@ impl RunPanel {
             .collect()
     }
 
-    /// The list of the window: the stored configurations, then the discovered ones whose
-    /// names are not stored, then the temporary ones that are not there already.
+    /// The configurations of another IDE that are not stored here and that the user has
+    /// not put away with Not Now.
+    fn foreign_pending(&self) -> Vec<runner::ForeignConfigs> {
+        let dismissed = self.foreign_dismissed();
+        let mut pending = Vec::new();
+        for source in &self.foreign {
+            let configs: Vec<RunConfig> = source
+                .configs
+                .iter()
+                .filter(|config| {
+                    !self.stored_config(config)
+                        && !dismissed.contains(&runner::foreign_identity(config))
+                })
+                .cloned()
+                .collect();
+            if configs.is_empty() {
+                continue;
+            }
+            pending.push(runner::ForeignConfigs {
+                source: source.source,
+                configs,
+                unsupported: source.unsupported.clone(),
+                warnings: source.warnings.clone(),
+            });
+        }
+        pending
+    }
+
+    fn stored_config(&self, config: &RunConfig) -> bool {
+        self.saved
+            .iter()
+            .any(|stored| stored.provider == config.provider && stored.name == config.name)
+    }
+
+    /// The configurations the user answered Not Now about, from the state folder of the
+    /// window rather than from a file of the project.
+    fn foreign_dismissed(&self) -> std::collections::HashSet<String> {
+        let Some(store) = &self.store else {
+            return std::collections::HashSet::new();
+        };
+        let key = self.foreign_dismissed_key();
+        store
+            .get(&key)
+            .ok()
+            .flatten()
+            .map(|text| text.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    fn foreign_dismissed_key(&self) -> String {
+        format!(
+            "run-foreign-configs:{}",
+            crate::project_state::project_key(&self.root)
+        )
+    }
+
+    /// Offers the configurations of another IDE the project holds, once for the names it
+    /// offers. A project in Safe Mode is never asked: nothing of it runs.
+    fn offer_foreign_configs(&mut self, cx: &mut Context<Self>) {
+        if !self.trusted {
+            return;
+        }
+        let pending = self.foreign_pending();
+        if pending.is_empty() {
+            self.foreign_offered = None;
+            return;
+        }
+        let signature = foreign_signature(&pending);
+        if self.foreign_offered.as_deref() == Some(signature.as_str()) {
+            return;
+        }
+        self.foreign_offered = Some(signature);
+        let count: usize = pending.iter().map(|source| source.configs.len()).sum();
+        let source = pending[0].source;
+        let title = format!("{source} run configurations found: {count}");
+        let text = "Import them into .arro/run.toml?";
+        let workspace = self.workspace.clone();
+        cx.defer(move |cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.notify_user_with_commands(
+                        title,
+                        text,
+                        vec![
+                            ("import", "Import".into(), "run.import_idea_configs"),
+                            ("not-now", "Not Now".into(), "run.dismiss_idea_configs"),
+                        ],
+                        cx,
+                    );
+                })
+                .ok();
+        });
+    }
+
+    /// Run | Import Run Configurations from IntelliJ IDEA: reads the files again and
+    /// stores every configuration whose kind and name are not in the file yet.
+    pub(crate) fn import_foreign_configs(&mut self, cx: &mut Context<Self>) {
+        if !self.may_run_project_code("Importing run configurations", cx) {
+            return;
+        }
+        if self.store_broken.is_some() {
+            let text = "The file of the run configurations cannot be read; fix it first";
+            self.tell_error("Import run configurations", text, cx);
+            return;
+        }
+        let Some(model) = self.session.as_ref().and_then(ProjectSession::model) else {
+            let text = "The project is still loading";
+            self.tell("Import run configurations", text, cx);
+            return;
+        };
+        let providers = self.providers.clone();
+        let found = cx
+            .background_executor()
+            .spawn(async move { foreign_sources(&providers, &model) });
+        cx.spawn(async move |this, cx| {
+            let sources = found.await;
+            this.update(cx, |this, cx| this.finish_import(sources, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    fn finish_import(&mut self, sources: Vec<runner::ForeignConfigs>, cx: &mut Context<Self>) {
+        let mut imported: Vec<String> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
+        let mut unsupported: Vec<(String, usize)> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+        for source in &sources {
+            for (kind, count) in &source.unsupported {
+                match unsupported.iter_mut().find(|(known, _)| known == kind) {
+                    Some((_, total)) => *total += count,
+                    None => unsupported.push((kind.clone(), *count)),
+                }
+            }
+            warnings.extend(source.warnings.iter().cloned());
+            for config in &source.configs {
+                if self.stored_config(config) {
+                    skipped.push(config.name.clone());
+                    continue;
+                }
+                self.saved.push(config.clone());
+                imported.push(config.name.clone());
+            }
+        }
+        if !imported.is_empty() {
+            self.foreign_offered = None;
+            self.merge_lists();
+            self.write_saved(cx);
+        }
+        let source = sources
+            .first()
+            .map_or("IntelliJ IDEA", |source| source.source);
+        let title = format!("Import {source} run configurations");
+        if sources.is_empty() {
+            self.tell(
+                &title,
+                format!("No {source} run configurations were found in the project."),
+                cx,
+            );
+            return;
+        }
+        let mut lines = vec![
+            format!("Imported {}: {}", imported.len(), names_list(&imported)),
+            format!(
+                "Skipped, exists {}: {}",
+                skipped.len(),
+                names_list(&skipped)
+            ),
+        ];
+        let unsupported_text = unsupported
+            .iter()
+            .map(|(kind, count)| format!("{kind} ({count})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!(
+            "Not supported {}: {}",
+            unsupported.iter().map(|(_, count)| count).sum::<usize>(),
+            if unsupported_text.is_empty() {
+                "none".to_owned()
+            } else {
+                unsupported_text
+            }
+        ));
+        if !warnings.is_empty() {
+            lines.push(format!("Warnings: {}", warnings.join("; ")));
+        }
+        self.tell(&title, lines.join("\n"), cx);
+        self.changed(cx);
+    }
+
+    /// Not Now: the configurations of this project stay out until new ones appear.
+    pub(crate) fn dismiss_foreign_configs(&mut self, cx: &mut Context<Self>) {
+        let mut keys: Vec<String> = self
+            .foreign
+            .iter()
+            .flat_map(|source| source.configs.iter())
+            .map(runner::foreign_identity)
+            .collect();
+        keys.sort();
+        keys.dedup();
+        if let Some(store) = &self.store {
+            let _ = store.put(&self.foreign_dismissed_key(), &keys.join("\n"));
+        }
+        self.foreign_offered = None;
+        self.changed(cx);
+    }
+
+    /// The list of the window: the stored configurations, then the found applications the
+    /// providers offer by themselves, then the temporary ones that are not there already.
+    /// A found program of the project is not in the list; its launch points and its
+    /// Services entry stay.
     fn merge_lists(&mut self) {
-        let name = self
+        let previous = self
             .selected
             .and_then(|index| self.configs.get(index))
             .map(|config| config.name.clone());
-        self.configs = runner::merge_configs(&self.saved, &self.discovered);
-        for config in &self.temporary {
-            if !self.configs.iter().any(|known| known.name == config.name) {
-                self.configs.push(config.clone());
+        // A found application that was selected and is now covered by a stored
+        // configuration of the same class, as after an import, hands the selection to it.
+        let covered = previous.as_deref().and_then(|name| {
+            let offered = self.suggested.iter().find(|config| config.name == name)?;
+            let class = self.main_class_of(offered)?;
+            self.saved
+                .iter()
+                .find(|saved| self.main_class_of(saved).as_deref() == Some(class.as_str()))
+                .map(|saved| saved.name.clone())
+        });
+        let previous = covered.or(previous);
+        self.suggested = self.suggestions();
+        // A stored configuration of the same name is the one the list shows.
+        self.suggested
+            .retain(|config| !self.saved.iter().any(|saved| saved.name == config.name));
+        let mut configs = self.saved.clone();
+        for config in self.suggested.iter().chain(self.temporary.iter()) {
+            if !configs.iter().any(|known| known.name == config.name) {
+                configs.push(config.clone());
             }
         }
-        let kept = name.and_then(|name| self.configs.iter().position(|config| config.name == name));
+        self.configs = configs;
+        let kept = previous
+            .as_deref()
+            .and_then(|name| self.configs.iter().position(|config| config.name == name));
+        // Before the list stopped showing every found program, a user could select one
+        // that has no configuration of its own. It stays selected as a temporary one.
+        if kept.is_none()
+            && let Some(name) = previous.as_deref()
+            && let Some(found) = self
+                .discovered
+                .iter()
+                .find(|config| config.name == name)
+                .cloned()
+        {
+            if !self
+                .temporary
+                .iter()
+                .any(|config| config.name == found.name)
+            {
+                self.temporary.push(found.clone());
+                while self.temporary.len() > MAX_TEMPORARY {
+                    self.temporary.remove(0);
+                }
+            }
+            if !self.configs.iter().any(|config| config.name == name) {
+                self.configs.push(found);
+            }
+        }
+        let kept = previous
+            .as_deref()
+            .and_then(|name| self.configs.iter().position(|config| config.name == name));
         self.selected = kept.or_else(|| (!self.configs.is_empty()).then_some(0));
+    }
+
+    /// The class a configuration starts, as its provider reads it.
+    fn main_class_of(&self, config: &RunConfig) -> Option<String> {
+        self.providers
+            .iter()
+            .find(|provider| provider.id() == config.provider)
+            .and_then(|provider| provider.main_class(config))
     }
 
     /// Something runs: a program, a task or tests.
@@ -1645,6 +2059,9 @@ impl RunPanel {
         if self.starting {
             return;
         }
+        if !self.may_run_project_code("Run", cx) {
+            return;
+        }
         if self.busy() {
             let config = self
                 .selected
@@ -1687,6 +2104,9 @@ impl RunPanel {
 
     /// Plans the selected configuration in the background and starts its console.
     fn start(&mut self, cx: &mut Context<Self>) {
+        if !self.may_run_project_code("Run", cx) {
+            return;
+        }
         let Some(selected) = self
             .selected
             .and_then(|index| self.configs.get(index))
@@ -1715,6 +2135,12 @@ impl RunPanel {
             self.tell_error("Cannot run", text, cx);
             return;
         };
+        // A configuration of tests takes the path of the Tests window instead of a
+        // program of its own, so its result lands in the tree of the last test run.
+        if let Some(request) = provider.test_request(&config) {
+            self.run_tests(request, cx);
+            return;
+        }
         if config.is_compound() {
             self.start_compound(config, model, cx);
             return;
@@ -1965,6 +2391,9 @@ impl RunPanel {
     /// Runs the selected configuration with the coverage agent. The old data goes at
     /// once; the new report replaces it when the run ends.
     pub fn run_coverage(&mut self, cx: &mut Context<Self>) {
+        if !self.may_run_project_code("Coverage", cx) {
+            return;
+        }
         if self.starting {
             return;
         }
@@ -2061,6 +2490,9 @@ impl RunPanel {
 
     /// Runs the tests through the build tool with the coverage agent in their JVM.
     pub fn run_tests_coverage(&mut self, request: TestRequest, cx: &mut Context<Self>) {
+        if !self.may_run_project_code("Tests", cx) {
+            return;
+        }
         if self.starting {
             return;
         }
@@ -2134,6 +2566,9 @@ impl RunPanel {
     /// Runs the tests of the last run with their JVMs recorded. The recordings are read
     /// when the run ends.
     pub fn run_tests_profile(&mut self, request: TestRequest, cx: &mut Context<Self>) {
+        if !self.may_run_project_code("Profiling", cx) {
+            return;
+        }
         if self.starting {
             return;
         }
@@ -2318,6 +2753,9 @@ impl RunPanel {
     /// Runs the selected configuration with its samples recorded. The old snapshot goes
     /// at once; the new one replaces it when the run ends.
     pub fn run_profile(&mut self, cx: &mut Context<Self>) {
+        if !self.may_run_project_code("Profiling", cx) {
+            return;
+        }
         if self.starting {
             return;
         }
@@ -2854,6 +3292,9 @@ impl RunPanel {
     /// classes go into the running program. A build during a debug test run gets a
     /// console of its own: the test run keeps its console and its tree.
     pub fn build_project(&mut self, cx: &mut Context<Self>) {
+        if !self.may_run_project_code("Build", cx) {
+            return;
+        }
         if self.starting || (self.build_console.is_some() && self.build_running) {
             self.tell_warning("Busy", "Stop what is running first", cx);
             return;
@@ -2907,6 +3348,9 @@ impl RunPanel {
         command: &str,
         cx: &mut Context<Self>,
     ) {
+        if !self.may_run_project_code(command, cx) {
+            return;
+        }
         if self.starting || self.busy() {
             self.tell_warning("Busy", "Stop what is running first", cx);
             return;
@@ -2949,6 +3393,9 @@ impl RunPanel {
 
     /// Rebuild Project: builds the whole project again from scratch.
     pub fn rebuild_project(&mut self, cx: &mut Context<Self>) {
+        if !self.may_run_project_code("Rebuild", cx) {
+            return;
+        }
         if self.starting || self.busy() {
             self.tell_warning("Busy", "Stop what is running first", cx);
             return;
@@ -2980,6 +3427,9 @@ impl RunPanel {
 
     /// Generate Sources and Update Folders: runs the source generator of the build tool.
     pub fn generate_sources(&mut self, cx: &mut Context<Self>) {
+        if !self.may_run_project_code("Generating sources", cx) {
+            return;
+        }
         if self.starting || self.busy() {
             self.tell_warning("Busy", "Stop what is running first", cx);
             return;
@@ -4349,6 +4799,9 @@ impl RunPanel {
 
     /// Shift+F9: starts the selected configuration under the debugger.
     pub fn debug(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.may_run_project_code("Debug", cx) {
+            return;
+        }
         let handle = window.window_handle();
         self.start_debug(Some(handle), None, cx);
     }
@@ -4454,6 +4907,13 @@ impl RunPanel {
             self.tell_warning("Cannot debug", "The configuration has no provider", cx);
             return;
         };
+        // A configuration of tests starts under the debugger through the test runner,
+        // which puts the debug agent into the JVM of the tests.
+        if let Some(request) = provider.test_request(&config) {
+            let handle = handle.or_else(|| cx.active_window());
+            self.debug_tests_with(request, handle, client, cx);
+            return;
+        }
         // The plan may look at every source file to see whether a build is due, so it is
         // made in the background.
         let provider = provider.clone();
@@ -5524,12 +5984,14 @@ impl RunPanel {
         let found = cx.background_executor().spawn(async move {
             let stored = read_store(&file);
             let (configs, problems) = discover(&providers, &model);
-            (stored, configs, problems)
+            let foreign = foreign_sources(&providers, &model);
+            (stored, configs, problems, foreign)
         });
         cx.spawn(async move |this, cx| {
-            let (stored, configs, mut problems) = found.await;
+            let (stored, configs, mut problems, foreign) = found.await;
             this.update(cx, |this, cx| {
                 this.discovered = configs;
+                this.foreign = foreign;
                 match stored.error {
                     Some(error) => {
                         this.saved.clear();
@@ -5545,6 +6007,7 @@ impl RunPanel {
                 for problem in problems {
                     this.tell_error("Run configurations", problem, cx);
                 }
+                this.offer_foreign_configs(cx);
                 this.changed(cx);
                 cx.emit(ConfigsChanged);
             })
@@ -6064,6 +6527,45 @@ fn discover(
     (configs, problems)
 }
 
+/// The configurations another IDE stored in the project, from every provider that reads
+/// such files. Cutting the files is I/O, so the callers run it in the background.
+fn foreign_sources(
+    providers: &[Arc<dyn RunConfigProvider>],
+    model: &ProjectModel,
+) -> Vec<runner::ForeignConfigs> {
+    providers
+        .iter()
+        .filter_map(|provider| provider.foreign_configs(model))
+        .filter(|found| !found.is_empty())
+        .collect()
+}
+
+/// What the offer already named, so the same configurations are not offered twice.
+fn foreign_signature(sources: &[runner::ForeignConfigs]) -> String {
+    let mut keys: Vec<String> = sources
+        .iter()
+        .flat_map(|source| source.configs.iter())
+        .map(runner::foreign_identity)
+        .collect();
+    keys.sort();
+    keys.join("\n")
+}
+
+/// The names of a summary, short enough for a notification.
+fn names_list(names: &[String]) -> String {
+    const SHOWN: usize = 8;
+    if names.is_empty() {
+        return "none".to_owned();
+    }
+    let shown = names.iter().take(SHOWN).cloned().collect::<Vec<_>>();
+    let rest = names.len().saturating_sub(SHOWN);
+    if rest == 0 {
+        shown.join(", ")
+    } else {
+        format!("{}, and {rest} more", shown.join(", "))
+    }
+}
+
 /// What `.arro/run.toml` held at one moment. Runs on a background thread.
 struct StoreRead {
     configs: Vec<RunConfig>,
@@ -6441,7 +6943,9 @@ impl Render for RunPanel {
                 window.defer(cx, move |window, cx| {
                     workspace
                         .update(cx, |workspace, cx| {
-                            crate::run_configs::RunConfigDialog::show(panel, workspace, window, cx)
+                            crate::run_configs::RunConfigDialog::show_add(
+                                panel, workspace, window, cx,
+                            )
                         })
                         .ok();
                 });

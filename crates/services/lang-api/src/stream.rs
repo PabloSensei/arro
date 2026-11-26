@@ -4,18 +4,19 @@
 //! `NativeThenLsp` needs nothing beyond this. The caller never waits on a provider: it
 //! polls [`Replies`] or awaits it on an executor. Dropping `Replies` cancels the request.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::{Context, Poll, Waker};
 
 use base::Cancel;
-use futures_channel::mpsc;
 use futures_core::Stream;
 
 use crate::Answer;
 
-/// Answers one request may send before the caller reads them. A later answer replaces an
-/// earlier one, so a request has no use for a long queue.
+/// Answers one request may hold before the caller reads them. A later answer replaces
+/// the oldest one, so a caller that fell behind still sees the newest state.
 const CAPACITY: usize = 4;
 
 /// One capability of a language. `start` must not block: work goes to the provider's own
@@ -33,17 +34,40 @@ pub fn ask<Q, T>(provider: &dyn Provider<Q, T>, query: Q) -> Replies<T> {
 
 pub fn channel<T>() -> (Reply<T>, Replies<T>) {
     let cancel = Cancel::new();
-    let (sender, receiver) = mpsc::channel(CAPACITY);
+    let shared = Arc::new(Shared {
+        answers: Mutex::new(Answers {
+            queue: VecDeque::new(),
+            waker: None,
+            receiver_gone: false,
+            sender_gone: false,
+        }),
+    });
     let reply = Reply {
-        sender,
+        shared: shared.clone(),
         cancel: cancel.clone(),
     };
-    (reply, Replies { receiver, cancel })
+    (reply, Replies { shared, cancel })
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+struct Shared<T> {
+    answers: Mutex<Answers<T>>,
+}
+
+struct Answers<T> {
+    queue: VecDeque<Answer<T>>,
+    /// The caller that waits for the next answer.
+    waker: Option<Waker>,
+    receiver_gone: bool,
+    sender_gone: bool,
 }
 
 /// The provider's end. The stream ends when this is dropped.
 pub struct Reply<T> {
-    sender: mpsc::Sender<Answer<T>>,
+    shared: Arc<Shared<T>>,
     cancel: Cancel,
 }
 
@@ -59,40 +83,87 @@ impl fmt::Display for ReplyClosed {
 impl std::error::Error for ReplyClosed {}
 
 impl<T> Reply<T> {
-    /// Never waits. A provider stops working on `ReplyClosed`.
+    /// Never waits. A provider stops working on `ReplyClosed`. The answer of a full
+    /// queue still replaces the oldest one before the failure is reported, so the
+    /// caller sees the latest state even when it reads only after the provider stopped.
     pub fn send(&mut self, answer: Answer<T>) -> Result<(), ReplyClosed> {
-        self.sender.try_send(answer).map_err(|_| ReplyClosed)
+        let (full, waker) = {
+            let mut answers = lock(&self.shared.answers);
+            if answers.receiver_gone {
+                return Err(ReplyClosed);
+            }
+            let full = answers.queue.len() >= CAPACITY;
+            if full {
+                answers.queue.pop_front();
+            }
+            answers.queue.push_back(answer);
+            (full, answers.waker.take())
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        if full { Err(ReplyClosed) } else { Ok(()) }
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancel.is_cancelled() || self.sender.is_closed()
+        self.cancel.is_cancelled() || lock(&self.shared.answers).receiver_gone
+    }
+}
+
+impl<T> Drop for Reply<T> {
+    fn drop(&mut self) {
+        let waker = {
+            let mut answers = lock(&self.shared.answers);
+            answers.sender_gone = true;
+            answers.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 }
 
 /// The caller's end, a stream of answers ending when the provider is done.
 pub struct Replies<T> {
-    receiver: mpsc::Receiver<Answer<T>>,
+    shared: Arc<Shared<T>>,
     cancel: Cancel,
 }
 
 impl<T> Replies<T> {
     /// The next answer if one is ready, for a caller that may not wait.
     pub fn poll_ready(&mut self) -> Option<Answer<T>> {
-        self.receiver.try_recv().ok()
+        lock(&self.shared.answers).queue.pop_front()
     }
 }
 
 impl<T> Stream for Replies<T> {
     type Item = Answer<T>;
 
-    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.receiver).poll_next(context)
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context) -> Poll<Option<Self::Item>> {
+        let mut answers = lock(&self.shared.answers);
+        if let Some(answer) = answers.queue.pop_front() {
+            return Poll::Ready(Some(answer));
+        }
+        if answers.sender_gone {
+            return Poll::Ready(None);
+        }
+        answers.waker = Some(context.waker().clone());
+        Poll::Pending
     }
 }
 
 impl<T> Drop for Replies<T> {
     fn drop(&mut self) {
         self.cancel.cancel();
+        let waker = {
+            let mut answers = lock(&self.shared.answers);
+            answers.receiver_gone = true;
+            answers.queue.clear();
+            answers.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 }
 

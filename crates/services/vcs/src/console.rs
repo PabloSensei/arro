@@ -99,8 +99,8 @@ impl CommandRecord {
             args,
             code,
             duration,
-            stdout: clipped(stdout, limit),
-            stderr: clipped(stderr, limit),
+            stdout: hide_urls_in_text(&clipped(stdout, limit)),
+            stderr: hide_urls_in_text(&clipped(stderr, limit)),
         }
     }
 
@@ -282,19 +282,70 @@ pub fn hidden_argument(argument: &str) -> String {
 
 /// `https://user:token@host/repo` with the whole user information hidden.
 fn hide_url_credentials(argument: &str) -> String {
-    let Some(scheme) = argument.find("://") else {
+    let Some(start) = argument.find("://").map(|scheme| scheme + 3) else {
         return argument.to_owned();
     };
-    let rest = &argument[scheme + 3..];
-    let Some(at) = rest.find('@') else {
-        return argument.to_owned();
-    };
-    // A name after the path is no user information: `https://host/a@b` has no secret.
-    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    if at > host_end {
-        return argument.to_owned();
+    match user_information_end(argument, start) {
+        Some(at) => format!("{}{HIDDEN}@{}", &argument[..start], &argument[at + 1..]),
+        None => argument.to_owned(),
     }
-    format!("{}{HIDDEN}@{}", &argument[..scheme + 3], &rest[at + 1..])
+}
+
+/// The address with its user information removed, `https://host/repo` for
+/// `https://user:token@host/repo`. A clone takes its credentials from git's own helper, so
+/// the address that is written into the configuration of the clone holds no secret. Only the
+/// web addresses change: an ssh user name selects the account and is no secret, and removing
+/// it would make ssh log in as the local user.
+pub fn url_without_credentials(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_owned();
+    };
+    let scheme = url[..scheme_end].to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https") {
+        return url.to_owned();
+    }
+    let start = scheme_end + 3;
+    match user_information_end(url, start) {
+        Some(at) => format!("{}{}", &url[..start], &url[at + 1..]),
+        None => url.to_owned(),
+    }
+}
+
+/// Whether `character` ends the host of a web address in a text.
+fn is_url_end(character: char) -> bool {
+    character.is_whitespace() || matches!(character, '/' | '?' | '#' | '\'' | '"' | '<' | '>')
+}
+
+/// The `@` that closes the user information of the address whose `://` ends before `start`:
+/// the last `@` of its host, so a password that holds an `@` is hidden whole. A name after
+/// the path is no user information: `https://host/a@b` has no secret. `None` when the
+/// address has none.
+fn user_information_end(text: &str, start: usize) -> Option<usize> {
+    let end = text[start..]
+        .find(is_url_end)
+        .map_or(text.len(), |offset| start + offset);
+    text[start..end].rfind('@').map(|offset| start + offset)
+}
+
+/// Every web address in a text with its user information hidden. Git writes the address of
+/// a remote into its messages as well as into its command line.
+fn hide_urls_in_text(text: &str) -> String {
+    let mut hidden = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("://").map(|scheme| scheme + 3) {
+        let (before, after) = rest.split_at(start);
+        hidden.push_str(before);
+        match user_information_end(after, 0) {
+            Some(at) => {
+                hidden.push_str(HIDDEN);
+                hidden.push('@');
+                rest = &after[at + 1..];
+            }
+            None => rest = after,
+        }
+    }
+    hidden.push_str(rest);
+    hidden
 }
 
 /// `--password=hunter2` with the value hidden; an option that names no secret stays. The
@@ -458,6 +509,61 @@ mod tests {
             "git@example.com:repo.git"
         );
         assert_eq!(hidden_argument("--depth=1"), "--depth=1");
+    }
+
+    #[test]
+    fn safety_a_password_in_the_output_is_hidden() {
+        let entry = CommandRecord::new(
+            Path::new("work"),
+            &["fetch"],
+            Some(128),
+            Duration::ZERO,
+            b"see https://user:token@example.com/a.git and https://other:pw@example.org/b\n",
+            b"fatal: unable to access 'https://user:token@example.com/a.git/': denied\n",
+        );
+
+        assert_eq!(
+            entry.stdout,
+            "see https://***@example.com/a.git and https://***@example.org/b\n"
+        );
+        assert_eq!(
+            entry.stderr,
+            "fatal: unable to access 'https://***@example.com/a.git/': denied\n"
+        );
+        assert!(!entry.text().contains("token"), "{}", entry.text());
+    }
+
+    #[test]
+    fn safety_a_password_with_an_at_sign_is_hidden_whole() {
+        assert_eq!(
+            hidden_argument("https://user:p@ss@example.com/repo.git"),
+            "https://***@example.com/repo.git"
+        );
+    }
+
+    #[test]
+    fn safety_a_clone_address_loses_its_user_information() {
+        assert_eq!(
+            url_without_credentials("https://user:s3cret@example.com/repo.git"),
+            "https://example.com/repo.git"
+        );
+        assert_eq!(
+            url_without_credentials("https://ghp_token@example.com/repo.git"),
+            "https://example.com/repo.git"
+        );
+        assert_eq!(
+            url_without_credentials("https://example.com/repo.git"),
+            "https://example.com/repo.git"
+        );
+        assert_eq!(
+            url_without_credentials("https://example.com/a@b"),
+            "https://example.com/a@b"
+        );
+        assert_eq!(
+            url_without_credentials("ssh://git@example.com/repo.git"),
+            "ssh://git@example.com/repo.git",
+            "the user name of ssh selects the account"
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ use ui_kit::*;
 use vcs::{ConflictSide, Hunk, Segment, SegmentKind, ThreeWay};
 use workspace::Workspace;
 
+use crate::conflict::accept_labels;
 use crate::diff_view::{line_starts, text_view};
 use crate::editor_tab::{options_of, style_of};
 use crate::git::{GitState, Kind, relative_of};
@@ -115,6 +116,8 @@ enum Outcome {
 /// What the background read of a conflicted file brings to the window.
 struct Snapshot {
     relative: String,
+    /// A rebase replays the user's commit onto the upstream, which the side names show.
+    rebase: bool,
     base: String,
     yours: String,
     theirs: String,
@@ -131,6 +134,7 @@ pub struct MergeView {
     workspace: WeakEntity<Workspace>,
     path: PathBuf,
     relative: String,
+    rebase: bool,
     focus: FocusHandle,
     yours: Entity<EditorView>,
     result: Entity<EditorView>,
@@ -237,6 +241,7 @@ impl MergeView {
         };
         let focus = result.read(cx).focus_handle(cx);
         let relative = snapshot.relative;
+        let rebase = snapshot.rebase;
         let opened = snapshot.opened;
         let missing = snapshot.missing;
         let format = snapshot.format;
@@ -251,6 +256,7 @@ impl MergeView {
                 workspace: weak,
                 path,
                 relative,
+                rebase,
                 focus: cx.focus_handle(),
                 yours,
                 result,
@@ -810,8 +816,10 @@ impl MergeView {
             }
             Outcome::Done(bytes) => {
                 self.opened = bytes;
+                // Only the merged file changed on disk: the other open files keep their text.
+                let path = self.path.clone();
                 self.git.update(cx, |git, cx| {
-                    git.reload_everything_from_disk(cx);
+                    git.reload_paths(&[path], cx);
                     git.refresh(cx);
                 });
                 self.close(window, cx);
@@ -1023,12 +1031,23 @@ fn chunks_of(three: &ThreeWay, base: &str, yours: &str, theirs: &str) -> Vec<Chu
     chunks
 }
 
+/// The titles of the two side panes: in a rebase Yours is the user's commit and Theirs the
+/// upstream, as the conflict versions read them.
+fn side_titles(rebase: bool) -> [&'static str; 2] {
+    if rebase {
+        ["Yours (your commit)", "Theirs (upstream)"]
+    } else {
+        ["Yours", "Theirs"]
+    }
+}
+
 /// The background read of a conflicted file: the three index stages, decoded to text, and
 /// the working file with its format.
 fn read_snapshot(repo: &vcs::Repository, path: &Path) -> std::io::Result<Snapshot> {
     let relative = relative_of(repo.root(), path);
     let mut blobs = repo.blobs()?;
     let versions = repo.conflict_versions(&mut blobs, &relative)?;
+    let rebase = repo.operation()? == vcs::Operation::Rebase;
     let missing = match (versions.yours.is_none(), versions.theirs.is_none()) {
         (true, false) => Some(ConflictSide::Yours),
         (false, true) => Some(ConflictSide::Theirs),
@@ -1066,6 +1085,7 @@ fn read_snapshot(repo: &vcs::Repository, path: &Path) -> std::io::Result<Snapsho
         .unwrap_or_default();
     Ok(Snapshot {
         relative,
+        rebase,
         base: base.text,
         yours: yours.text,
         theirs: theirs.text,
@@ -1172,6 +1192,8 @@ impl Render for MergeView {
         let height = viewport.height * 0.8;
         let left = (viewport.width - width) / 2.;
         let top = viewport.height * 0.1;
+        let [yours_title, theirs_title] = side_titles(self.rebase);
+        let (accept_yours, accept_theirs) = accept_labels(self.rebase);
         let ranges = self.drawn_ranges(cx);
         let current = self.result.read(cx).text().unwrap_or_default();
         let alignment = self.alignment();
@@ -1229,7 +1251,7 @@ impl Render for MergeView {
                             .on_click(cx.listener(|this, _, _, cx| this.next_conflict(cx))),
                     )
                     .child(
-                        Self::button(("merge-accept-all-yours", 0), "Accept Yours", false, &theme)
+                        Self::button(("merge-accept-all-yours", 0), accept_yours, false, &theme)
                             .debug_selector(|| "merge-accept-all-yours".to_owned())
                             .on_click(
                                 cx.listener(|this, _, _, cx| {
@@ -1238,16 +1260,11 @@ impl Render for MergeView {
                             ),
                     )
                     .child(
-                        Self::button(
-                            ("merge-accept-all-theirs", 0),
-                            "Accept Theirs",
-                            false,
-                            &theme,
-                        )
-                        .debug_selector(|| "merge-accept-all-theirs".to_owned())
-                        .on_click(
-                            cx.listener(|this, _, _, cx| this.take_all(ConflictSide::Theirs, cx)),
-                        ),
+                        Self::button(("merge-accept-all-theirs", 0), accept_theirs, false, &theme)
+                            .debug_selector(|| "merge-accept-all-theirs".to_owned())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.take_all(ConflictSide::Theirs, cx)
+                            })),
                     )
                     .child(
                         Self::button(
@@ -1319,7 +1336,7 @@ impl Render for MergeView {
                     .min_w_0()
                     .px(px(SPACE_M))
                     .truncate()
-                    .child("Yours"),
+                    .child(yours_title),
             )
             .child(div().w(px(STRIP_WIDTH)))
             .child(
@@ -1337,7 +1354,7 @@ impl Render for MergeView {
                     .min_w_0()
                     .px(px(SPACE_M))
                     .truncate()
-                    .child("Theirs"),
+                    .child(theirs_title),
             );
         let question = self
             .question
